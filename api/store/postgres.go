@@ -271,7 +271,7 @@ func (s *Store) GetStats(ctx context.Context) (*model.Stats, error) {
 	err := s.pool.QueryRow(ctx, `
 		SELECT
 		  (SELECT COUNT(*) FROM mailboxes)                         AS total_mailboxes,
-		  (SELECT COUNT(*) FROM mailboxes WHERE expires_at > NOW()) AS active_mailboxes,
+		  (SELECT COUNT(*) FROM mailboxes WHERE expires_at IS NULL OR expires_at > NOW()) AS active_mailboxes,
 		  (SELECT COUNT(*) FROM emails)                            AS total_emails,
 		  (SELECT COUNT(*) FROM domains WHERE is_active = TRUE)    AS active_domains,
 		  (SELECT COUNT(*) FROM domains WHERE status = 'pending')  AS pending_domains,
@@ -290,10 +290,17 @@ func (s *Store) GetStats(ctx context.Context) (*model.Stats, error) {
 // ==================== Mailbox ====================
 
 func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address string, domainID int, fullAddress string, ttlMinutes int) (*model.Mailbox, error) {
-	if ttlMinutes <= 0 {
-		ttlMinutes = 30
+	var expiresAt *time.Time
+	switch {
+	case ttlMinutes > 0:
+		t := time.Now().Add(time.Duration(ttlMinutes) * time.Minute)
+		expiresAt = &t
+	case ttlMinutes == 0:
+		expiresAt = nil
+	default:
+		t := time.Now().Add(30 * time.Minute)
+		expiresAt = &t
 	}
-	expiresAt := time.Now().Add(time.Duration(ttlMinutes) * time.Minute)
 	var m model.Mailbox
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO mailboxes (account_id, address, domain_id, full_address, expires_at)
@@ -373,7 +380,7 @@ func (s *Store) GetMailboxByFullAddress(ctx context.Context, fullAddress string)
 
 // DeleteExpiredMailboxes 刪除已过期的邮箱（及其所有邮件）
 func (s *Store) DeleteExpiredMailboxes(ctx context.Context) (int64, error) {
-	tag, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE expires_at < NOW()`)
+	tag, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE expires_at IS NOT NULL AND expires_at < NOW()`)
 	if err != nil {
 		return 0, err
 	}

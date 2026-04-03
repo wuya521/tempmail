@@ -516,6 +516,8 @@ function buildMailboxCard(mb) {
       const color = mins <= 5 ? 'var(--clr-danger)' : mins <= 15 ? 'var(--clr-warn,#e6a817)' : 'var(--text-muted)';
       expiryHtml = `<span style="color:${color};font-size:0.75rem">⏱ ${mins}分钟后删除</span>`;
     }
+  } else {
+    expiryHtml = '<span style="color:var(--text-muted);font-size:0.75rem">♾ 永不过期</span>';
   }
   return `
     <div class="mailbox-card" onclick="openInbox('${mb.id}','${escHtml(mb.full_address)}')">

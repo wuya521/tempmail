@@ -47,7 +47,7 @@ CREATE TABLE mailboxes (
     domain_id    INT          NOT NULL REFERENCES domains(id),
     full_address VARCHAR(320) NOT NULL,  -- 完整地址 "abc123@mail.xxx.xyz"
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    expires_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW() + INTERVAL '30 minutes'
+    expires_at   TIMESTAMPTZ  DEFAULT (NOW() + INTERVAL '30 minutes')  -- NULL = 永不过期（TTL=0）
 );
 
 -- 完整地址唯一索引（收件匹配热路径）

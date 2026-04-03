@@ -112,8 +112,12 @@ services:
       - internal
 
   # ==================== Go API 服务 ====================
+  # 使用本仓库 api/ 源码构建（与 GitHub 代码一致，不依赖第三方镜像）
   api:
-    image: 123nhh/tempmail-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    image: tempmail-api:local
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -152,8 +156,12 @@ services:
       - internal
 
   # ==================== Postfix 收件服务 ====================
+  # 使用本仓库 postfix/ 构建（构建上下文为项目根目录，因 Dockerfile 内 COPY postfix/...）
   postfix:
-    image: 123nhh/tempmail-postfix:latest
+    build:
+      context: .
+      dockerfile: postfix/Dockerfile
+    image: tempmail-postfix:local
     restart: unless-stopped
     ports:
       - "25:25"

@@ -37,13 +37,13 @@ type Stats struct {
 }
 
 type Mailbox struct {
-	ID          uuid.UUID `json:"id"`
-	AccountID   uuid.UUID `json:"account_id"`
-	Address     string    `json:"address"`
-	DomainID    int       `json:"domain_id"`
-	FullAddress string    `json:"full_address"`
-	CreatedAt   time.Time `json:"created_at"`
-	ExpiresAt   time.Time `json:"expires_at"`
+	ID          uuid.UUID  `json:"id"`
+	AccountID   uuid.UUID  `json:"account_id"`
+	Address     string     `json:"address"`
+	DomainID    int        `json:"domain_id"`
+	FullAddress string     `json:"full_address"`
+	CreatedAt   time.Time  `json:"created_at"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"` // nil = 永不过期
 }
 
 type Email struct {

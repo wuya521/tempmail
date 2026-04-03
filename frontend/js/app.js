@@ -1324,7 +1324,7 @@ async function renderAdminSettings(container) {
         <div class="divider"></div>
 
         <!-- 站点名称 -->
-        ${inputRow('input-site-title', '站点名称', siteTitle, '显示在标题栏和登录页', 'TempMail')}
+        ${inputRow('input-site-title', '站点名称', siteTitle, '保存后：浏览器标签标题、登录页大标题、侧栏 Logo 文案均来自 /public/settings 的 site_title；未设置时显示 TempMail', 'TempMail')}
         <div class="divider"></div>
 
         <!-- 公告 -->
@@ -1601,12 +1601,50 @@ function renderApiDocs(container) {
   const sections = [
     {
       title: '🔐 认证方式',
-      desc: '所有 /api/* 接口需要在 HTTP Header 中携带 API Key：',
-      code: `# Bearer Token 方式
+      desc: '仅 /api/* 下的接口需要 API Key（管理员接口须使用管理员 Key）。不支持 X-API-Key 头，请用下面两种方式之一：',
+      code: `# Bearer（推荐）
 curl -H "Authorization: Bearer ${key}" ${base}/api/me
 
-# Query 参数方式
+# Query
 curl "${base}/api/me?api_key=${key}"`,
+    },
+    {
+      title: '🌐 GET /public/settings（无需登录）',
+      desc: '返回站点名称 site_title、是否开放注册 registration_open、公告 announcement、SMTP 提示字段等。前端启动时用它刷新浏览器标题与登录页/侧栏站点名；后台「系统设置」里修改站点名称并保存后会通过此接口生效。',
+      code: `curl -s ${base}/public/settings | python3 -m json.tool
+
+# 字段说明：
+#   site_title      — 站点显示名（空则前端默认 TempMail）
+#   registration_open — 是否允许 POST /public/register
+#   announcement    — 登录后 Dashboard 顶部公告`,
+    },
+    {
+      title: '📝 POST /public/register（无需登录）',
+      desc: '仅创建平台账号并返回 api_key，不会自动创建邮箱。须先在后台开启「开放自行注册」。注册成功后用户需自行 POST /api/mailboxes 创建邮箱，或由管理员代为建号。',
+      code: `curl -s -X POST ${base}/public/register \\
+  -H "Content-Type: application/json" \\
+  -d '{"username":"new_user_01"}'
+
+# 成功 201：id, username, api_key, message
+# 失败：403 注册已关闭 / 409 用户名已存在`,
+    },
+    {
+      title: '🛡 POST /api/admin/accounts（须管理员 Key）',
+      desc: '管理员创建用户。可选字段 mailbox_domain：填写已激活的域名（如 yourdomain.com）时，会在该域名下自动创建一个「随机本地部分@域名」邮箱；若地址与全局已有邮箱冲突会自动换随机串重试。不传 mailbox_domain 则只建账号，不建邮箱。',
+      code: `# 仅账号
+curl -s -X POST ${base}/api/admin/accounts \\
+  -H "Authorization: Bearer <管理员API_Key>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"username":"buyer_001"}'
+
+# 账号 + 自动分配邮箱（随机前缀 @ 指定域名）
+curl -s -X POST ${base}/api/admin/accounts \\
+  -H "Authorization: Bearer <管理员API_Key>" \\
+  -H "Content-Type: application/json" \\
+  -d '{"username":"buyer_002","mailbox_domain":"yahoohh.chat"}'
+
+# 成功 201：id, username, api_key；若带了 mailbox_domain 且成功则另有 mailbox 对象（含 full_address 等）
+# 域名无效 400；用户名冲突 409`,
     },
     {
       title: '📫 1. 创建临时邮箱',
@@ -1702,7 +1740,7 @@ echo "✓ 邮箱: $MB_ADDR (主键: $MB_ID)"
 echo "将测试邮件发到: $MB_ADDR"
 sleep 5
 
-# 3. 查看收件筱
+# 3. 查看收件箱
 EMAILS=$(curl -s $BASE/api/mailboxes/$MB_ID/emails \\
   -H "Authorization: Bearer $KEY")
 echo "取到邮件: $EMAILS" | python3 -m json.tool

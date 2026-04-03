@@ -40,17 +40,7 @@ func (h *MailboxHandler) Create(c *gin.Context) {
 	}
 	address = strings.ToLower(address)
 
-	// 读取 TTL 设置：0 = 永不过期，>0 = 指定分钟数，未设置或解析失败 = 默认 30
-	ttlMinutes := 30
-	if ttlStr, err := h.store.GetSetting(c.Request.Context(), "mailbox_ttl_minutes"); err == nil {
-		if n, err := strconv.Atoi(strings.TrimSpace(ttlStr)); err == nil {
-			if n == 0 {
-				ttlMinutes = 0
-			} else if n > 0 {
-				ttlMinutes = n
-			}
-		}
-	}
+	ttlMinutes := mailboxTTLMinutesFromStore(c.Request.Context(), h.store)
 
 	// 确定域名：指定 or 随机
 	var domainRecord *model.Domain

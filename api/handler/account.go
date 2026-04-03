@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"log"
 	"net/http"
 	"strconv"
 
@@ -34,11 +35,21 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusCreated, gin.H{
+	ctx := c.Request.Context()
+	out := gin.H{
 		"id":       account.ID,
 		"username": account.Username,
 		"api_key":  account.APIKey,
-	})
+	}
+	if mb, err := TryCreateWelcomeMailbox(ctx, h.store, account.ID); err != nil {
+		log.Printf("[admin create account] welcome mailbox skipped for %s: %v", account.Username, err)
+		out["mailbox"] = nil
+		out["mailbox_note"] = "no welcome mailbox: ensure at least one active domain exists"
+	} else {
+		out["mailbox"] = mb
+	}
+
+	c.JSON(http.StatusCreated, out)
 }
 
 // GET /api/admin/accounts - 列出所有账号（管理员）

@@ -14,6 +14,8 @@ const state = {
   account:   JSON.parse(localStorage.getItem('tm_account') || 'null'),
   theme:     localStorage.getItem('tm_theme') || 'light',
   page:      'dashboard',
+  /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
+  siteTitle: 'TempMail',
   // 当前邮箱
   currentMailbox: null,
   currentEmail:   null,
@@ -122,6 +124,27 @@ const api = {
   },
 };
 
+/** 从公开接口同步站点名称（无需登录） */
+async function loadPublicSiteTitle() {
+  try {
+    const pub = await api.publicSettings();
+    const raw = pub.site_title;
+    state.siteTitle = (raw != null && String(raw).trim()) ? String(raw).trim() : 'TempMail';
+  } catch {
+    state.siteTitle = 'TempMail';
+  }
+}
+
+/** 将 state.siteTitle 应用到 document.title、登录页、侧栏（若节点已存在） */
+function applySiteBranding() {
+  const t = state.siteTitle || 'TempMail';
+  document.title = `${t} — 临时邮箱平台`;
+  const authH = $('brand-site-title');
+  if (authH) authH.textContent = t;
+  const side = $('sidebar-site-title');
+  if (side) side.textContent = t;
+}
+
 // ─── 主题 ────────────────────────────────────────────────────
 function applyTheme(t) {
   document.documentElement.dataset.theme = t;
@@ -191,7 +214,7 @@ function buildAuthPage() {
   card.innerHTML = `
     <div class="auth-logo">
       <div class="logo-icon">✉</div>
-      <h1>TempMail</h1>
+      <h1 id="brand-site-title">${escHtml(state.siteTitle)}</h1>
       <p>临时邮箱服务 · 安全隔离 · 按需分配</p>
     </div>
     <div class="auth-tabs">
@@ -308,7 +331,7 @@ function buildMainLayout() {
       <div class="sidebar-logo">
         <div class="logo-mark">✉</div>
         <div>
-          <span>TempMail</span>
+          <span id="sidebar-site-title">${escHtml(state.siteTitle)}</span>
           <small>临时邮箱服务</small>
         </div>
       </div>
@@ -1369,6 +1392,10 @@ window.saveSetting = async function(inputId, settingKey) {
   try {
     await api.admin.saveSettings({ [settingKey]: val });
     toast('已保存', 'success');
+    if (settingKey === 'site_title') {
+      state.siteTitle = val.trim() ? val.trim() : 'TempMail';
+      applySiteBranding();
+    }
   } catch(e) { toast('保存失败: ' + e.message, 'error'); }
 };
 
@@ -1751,18 +1778,23 @@ k6 run /tmp/test.js`,
 }
 
 // ─── 启动 ──────────────────────────────────────────────────
-function init() {
+async function init() {
   applyTheme(state.theme);
+  await loadPublicSiteTitle();
+  applySiteBranding();
 
   if (state.apiKey && state.account) {
     showMainLayout();
+    applySiteBranding();
     navigate('dashboard');
   } else if (state.apiKey) {
-    // 验证 key
-    tryLogin(state.apiKey);
+    await tryLogin(state.apiKey);
+    if (!state.apiKey) showAuthPage();
+    applySiteBranding();
   } else {
     showAuthPage();
+    applySiteBranding();
   }
 }
 
-document.addEventListener('DOMContentLoaded', init);
+document.addEventListener('DOMContentLoaded', () => { init().catch(() => { showAuthPage(); applySiteBranding(); }); });

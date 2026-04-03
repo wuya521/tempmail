@@ -27,15 +27,10 @@ func mailboxTTLMinutesFromStore(ctx context.Context, s *store.Store) int {
 	return ttlMinutes
 }
 
-// TryCreateWelcomeMailbox 为新账户自动创建首个邮箱（随机本地部分 + 随机激活域名）。
-// 若无激活域名或地址冲突耗尽重试，返回 nil 与错误。
-func TryCreateWelcomeMailbox(ctx context.Context, s *store.Store, accountID uuid.UUID) (*model.Mailbox, error) {
-	dom, err := s.GetRandomActiveDomain(ctx)
-	if err != nil {
-		return nil, err
-	}
+// TryCreateMailboxForDomain 在指定已激活域名下为新账户创建邮箱：本地部分随机生成；若 full_address 冲突则换随机串重试。
+func TryCreateMailboxForDomain(ctx context.Context, s *store.Store, accountID uuid.UUID, dom *model.Domain) (*model.Mailbox, error) {
 	ttl := mailboxTTLMinutesFromStore(ctx, s)
-	for attempts := 0; attempts < 8; attempts++ {
+	for attempts := 0; attempts < 24; attempts++ {
 		address := strings.ToLower(store.GenerateRandomAddress())
 		full := fmt.Sprintf("%s@%s", address, dom.Domain)
 		mb, err := s.CreateMailbox(ctx, accountID, address, dom.ID, full, ttl)
@@ -46,5 +41,5 @@ func TryCreateWelcomeMailbox(ctx context.Context, s *store.Store, accountID uuid
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("could not allocate unique mailbox address")
+	return nil, fmt.Errorf("could not allocate unique mailbox address under domain %s", dom.Domain)
 }

@@ -4,8 +4,10 @@ import (
 	"log"
 	"net/http"
 	"strconv"
+	"strings"
 
 	"tempmail/middleware"
+	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
@@ -20,33 +22,48 @@ func NewAccountHandler(s *store.Store) *AccountHandler {
 }
 
 // POST /api/admin/accounts - 创建账号（管理员）
+// 可选 mailbox_domain：指定已激活域名时，自动创建随机本地部分的邮箱（全局唯一冲突则换随机串重试）。
+// 不传 mailbox_domain 则仅创建账号，不创建邮箱。
 func (h *AccountHandler) Create(c *gin.Context) {
 	var req struct {
-		Username string `json:"username" binding:"required,min=2,max=64"`
+		Username      string `json:"username" binding:"required,min=2,max=64"`
+		MailboxDomain string `json:"mailbox_domain"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	account, err := h.store.CreateAccount(c.Request.Context(), req.Username)
+	ctx := c.Request.Context()
+	var dom *model.Domain
+	if d := strings.TrimSpace(strings.ToLower(req.MailboxDomain)); d != "" {
+		found, err := h.store.GetDomainByName(ctx, d)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "mailbox_domain: domain not found or not active: " + d})
+			return
+		}
+		dom = found
+	}
+
+	account, err := h.store.CreateAccount(ctx, req.Username)
 	if err != nil {
 		c.JSON(http.StatusConflict, gin.H{"error": "username already exists or db error: " + err.Error()})
 		return
 	}
 
-	ctx := c.Request.Context()
 	out := gin.H{
 		"id":       account.ID,
 		"username": account.Username,
 		"api_key":  account.APIKey,
 	}
-	if mb, err := TryCreateWelcomeMailbox(ctx, h.store, account.ID); err != nil {
-		log.Printf("[admin create account] welcome mailbox skipped for %s: %v", account.Username, err)
-		out["mailbox"] = nil
-		out["mailbox_note"] = "no welcome mailbox: ensure at least one active domain exists"
-	} else {
-		out["mailbox"] = mb
+	if dom != nil {
+		if mb, err := TryCreateMailboxForDomain(ctx, h.store, account.ID, dom); err != nil {
+			log.Printf("[admin create account] mailbox under %s failed for %s: %v", dom.Domain, account.Username, err)
+			out["mailbox"] = nil
+			out["mailbox_error"] = err.Error()
+		} else {
+			out["mailbox"] = mb
+		}
 	}
 
 	c.JSON(http.StatusCreated, out)

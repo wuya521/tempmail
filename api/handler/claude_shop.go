@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
+
+	_ "time/tzdata" // Docker/Alpine 等环境加载时区表，供 Asia/Shanghai 默认批次
 
 	"tempmail/middleware"
 	"tempmail/store"
@@ -364,16 +367,33 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "没有解析到有效行", "warnings": warns})
 		return
 	}
-	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs)
+	batch := strings.TrimSpace(c.Query("batch"))
+	if len(batch) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识最长 64 字符"})
+		return
+	}
+	if batch == "" {
+		loc, err := time.LoadLocation("Asia/Shanghai")
+		if err != nil {
+			loc = time.UTC
+		}
+		batch = time.Now().In(loc).Format("0102")
+	}
+	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs, batch)
 	if err != nil {
+		if err.Error() == "invalid_batch_label" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识无效"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
-		"recognized": len(pairs),
-		"inserted":   n,
-		"skipped":    len(warns),
-		"warnings":   warns,
+		"recognized":   len(pairs),
+		"inserted":     n,
+		"skipped":      len(warns),
+		"warnings":     warns,
+		"batch_label":  batch,
 	})
 }
 
@@ -388,7 +408,8 @@ func (h *ClaudeShopHandler) AdminListInventory(c *gin.Context) {
 	if size < 1 || size > 100 {
 		size = 30
 	}
-	list, total, err := h.store.ListClaudeInventory(c.Request.Context(), status, page, size)
+	batch := strings.TrimSpace(c.Query("batch"))
+	list, total, err := h.store.ListClaudeInventory(c.Request.Context(), status, batch, page, size)
 	if err != nil {
 		if err.Error() == "invalid_inventory_status" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid inventory status"})
@@ -413,6 +434,54 @@ func (h *ClaudeShopHandler) AdminListInventory(c *gin.Context) {
 		"size":    size,
 		"summary": summaryResp,
 	})
+}
+
+// GET /api/admin/shop/inventory/batches
+func (h *ClaudeShopHandler) AdminListInventoryBatches(c *gin.Context) {
+	list, unbatchedAvail, err := h.store.ListClaudeInventoryBatchSummaries(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": list, "unbatched_available": unbatchedAvail})
+}
+
+type purgeBatchBody struct {
+	BatchLabel string `json:"batch_label" binding:"required"`
+}
+
+// POST /api/admin/shop/inventory/purge-batch 仅删除该批次下「待售」记录
+func (h *ClaudeShopHandler) AdminPurgeInventoryBatch(c *gin.Context) {
+	var req purgeBatchBody
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "JSON 需提供 batch_label（无批次待售用 __none__）"})
+		return
+	}
+	key := strings.TrimSpace(req.BatchLabel)
+	if key == "" || len(key) > 64 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "batch_label 无效"})
+		return
+	}
+	n, err := h.store.PurgeClaudeInventoryBatchAvailable(c.Request.Context(), key)
+	if err != nil {
+		if err.Error() == "empty_batch" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "batch 无效"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": n})
+}
+
+// POST /api/admin/shop/inventory/purge-available 删除全部待售库存
+func (h *ClaudeShopHandler) AdminPurgeAllAvailableInventory(c *gin.Context) {
+	n, err := h.store.PurgeAllClaudeInventoryAvailable(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"deleted": n})
 }
 
 // DELETE /api/admin/shop/inventory/:id

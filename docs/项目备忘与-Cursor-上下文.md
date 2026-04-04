@@ -101,7 +101,9 @@ git pull origin main
 
 ```bash
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v5.sql
-# 以后若有 migrate_v6 等，按发布说明执行对应文件
+# 库存批次标签（claude_inventory.batch_label）
+docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v6.sql
+# 以后若有 migrate_v7 等，按发布说明执行对应文件
 ```
 
 ### 前端「改了不生效」

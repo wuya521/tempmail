@@ -140,12 +140,13 @@ CREATE INDEX idx_claude_orders_account ON claude_orders (account_id, created_at 
 CREATE INDEX idx_claude_orders_status ON claude_orders (status);
 
 CREATE TABLE claude_inventory (
-    id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    email      VARCHAR(320) NOT NULL,
-    api_key    VARCHAR(128) NOT NULL,
-    status     VARCHAR(24)  NOT NULL DEFAULT 'available',
-    order_id   UUID         REFERENCES claude_orders(id) ON DELETE SET NULL,
-    created_at TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    email        VARCHAR(320) NOT NULL,
+    api_key      VARCHAR(128) NOT NULL,
+    status       VARCHAR(24)  NOT NULL DEFAULT 'available',
+    order_id     UUID         REFERENCES claude_orders(id) ON DELETE SET NULL,
+    batch_label  VARCHAR(64)  NOT NULL DEFAULT '',
+    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_claude_inv_available ON claude_inventory (created_at ASC) WHERE status = 'available';
 

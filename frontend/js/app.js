@@ -20,6 +20,8 @@ const state = {
   adminAccountsQ: '',
   adminShopInventoryPage: 1,
   adminShopInventoryStatus: 'all',
+  /** 库存列表批次筛选：''=全部 '__none__'=无批次 其它=批次号 */
+  adminShopInventoryBatch: '',
   adminShopOrdersPage: 1,
   /** 管理端订单筛选：''=全部 awaiting_payment fulfilled */
   adminShopOrdersStatus: '',
@@ -34,6 +36,12 @@ const state = {
   mailboxes: [],
   emails:    [],
 };
+
+/** 导入库存时默认批次提示（月日，与留空时服务器默认规则接近） */
+function shopDefaultBatchMMDD() {
+  const d = new Date();
+  return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+}
 
 // ─── 工具函数 ───────────────────────────────────────────────
 const $ = id => document.getElementById(id);
@@ -306,7 +314,10 @@ const api = {
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
     shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
     shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
-    shopImportInventory: text => fetch(API_BASE + '/admin/shop/inventory/import', {
+    shopImportInventory: (text, batch) => {
+      let u = API_BASE + '/admin/shop/inventory/import';
+      if (batch) u += '?batch=' + encodeURIComponent(batch);
+      return fetch(u, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + state.apiKey, 'Content-Type': 'text/plain; charset=utf-8' },
       body: text,
@@ -314,7 +325,8 @@ const api = {
       const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.error || '导入失败');
       return data;
-    }),
+    });
+    },
     shopUploadQR: (formData) => fetch(API_BASE + '/admin/shop/qrcodes', {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + state.apiKey },
@@ -324,11 +336,18 @@ const api = {
       if (!res.ok) throw new Error(data.error || '上传失败');
       return data;
     }),
-    shopListInventory: (status='all', page=1, size=30) => {
+    shopListInventory: (status='all', page=1, size=30, batch='') => {
       let u = API_BASE + '/admin/shop/inventory?page=' + page + '&size=' + size;
       if (status && status !== 'all') u += '&status=' + encodeURIComponent(status);
+      if (batch) u += '&batch=' + encodeURIComponent(batch);
       return apiFetch(u);
     },
+    shopListInventoryBatches: () => apiFetch(API_BASE + '/admin/shop/inventory/batches'),
+    shopPurgeInventoryBatch: batchLabel => apiFetch(API_BASE + '/admin/shop/inventory/purge-batch', {
+      method: 'POST',
+      body: JSON.stringify({ batch_label: batchLabel }),
+    }),
+    shopPurgeAllAvailable: () => apiFetch(API_BASE + '/admin/shop/inventory/purge-available', { method: 'POST', body: '{}' }),
     shopDeleteInventory: id => apiFetch(API_BASE + '/admin/shop/inventory/' + id, { method: 'DELETE' }),
     shopListOrders: (status='', page=1, size=20) => {
       let u = API_BASE + '/admin/shop/orders?page='+page+'&size='+size;
@@ -2518,8 +2537,9 @@ window.runShopImport = async function() {
     toast('未识别到可导入数据', 'warn');
     return;
   }
+  const batchTag = ($('shop-import-batch')?.value || '').trim();
   try {
-    const r = await api.admin.shopImportInventory(t);
+    const r = await api.admin.shopImportInventory(t, batchTag);
     const recognized = Number.isFinite(r.recognized) ? r.recognized : preview.pairs.length;
     const skipped = Number.isFinite(r.skipped) ? r.skipped : ((r.warnings || []).length);
     let msg = `识别 ${recognized} 条，导入成功 ${r.inserted} 条`;
@@ -2549,9 +2569,49 @@ window.adminShopInventorySetStatus = function(status) {
   navigate('admin-shop-inventory');
 };
 
+window.adminShopInventorySetBatch = function(batch) {
+  state.adminShopInventoryBatch = batch || '';
+  state.adminShopInventoryPage = 1;
+  navigate('admin-shop-inventory');
+};
+
 window.adminShopInventoryGoPage = function(page) {
   state.adminShopInventoryPage = Math.max(1, parseInt(page, 10) || 1);
   navigate('admin-shop-inventory');
+};
+
+window.confirmPurgeShopInventoryBatch = function() {
+  const b = state.adminShopInventoryBatch;
+  if (!b) {
+    toast('请先在「批次」中选择具体批次（不能选「全部批次」）', 'warn');
+    return;
+  }
+  const name = b === '__none__' ? '无批次（未打标签）' : b;
+  showModal('确认删除该批次待售', `<p>将删除批次 <strong>${escHtml(name)}</strong> 下所有<strong>待售</strong>货物；已售出记录保留，不受影响。</p><p style="font-size:0.82rem;color:var(--clr-danger);margin-top:0.5rem">此操作不可恢复。</p>`, async () => {
+    try {
+      const r = await api.admin.shopPurgeInventoryBatch(b);
+      const n = Number(r.deleted) || 0;
+      toast(`已删除 ${n} 条待售`, n ? 'success' : 'warn');
+      navigate('admin-shop-inventory');
+    } catch (e) {
+      toast(e.message || '删除失败', 'error');
+      return false;
+    }
+  });
+};
+
+window.confirmPurgeAllShopAvailable = function() {
+  showModal('确认清空全部待售库存', `<p>将删除系统中<strong>所有待售</strong>货物（不限批次）。已售出记录保留。</p><p style="font-size:0.82rem;color:var(--clr-danger);margin-top:0.5rem"><strong>不可恢复</strong>，请确认无待发货订单缺货风险。</p>`, async () => {
+    try {
+      const r = await api.admin.shopPurgeAllAvailable();
+      const n = Number(r.deleted) || 0;
+      toast(`已清空 ${n} 条待售`, n ? 'success' : 'warn');
+      navigate('admin-shop-inventory');
+    } catch (e) {
+      toast(e.message || '操作失败', 'error');
+      return false;
+    }
+  });
 };
 
 window.deleteShopInventory = function(id, label) {
@@ -2704,9 +2764,11 @@ async function renderAdminShopInventory(container) {
   }
   const inventoryPage = state.adminShopInventoryPage || 1;
   const inventoryStatus = state.adminShopInventoryStatus || 'all';
-  const [cfg, inventoryRes] = await Promise.all([
+  const batchFilter = state.adminShopInventoryBatch || '';
+  const defBatch = shopDefaultBatchMMDD();
+  const [cfg, inventoryRes, batchesRes] = await Promise.all([
     api.admin.shopGetConfig(),
-    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30).catch(() => ({
+    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30, batchFilter).catch(() => ({
       data: [],
       total: 0,
       page: inventoryPage,
@@ -2717,6 +2779,7 @@ async function renderAdminShopInventory(container) {
         sold: 0,
       },
     })),
+    api.admin.shopListInventoryBatches().catch(() => ({ data: [], unbatched_available: 0 })),
   ]);
   const inventoryRows = inventoryRes.data || [];
   const inventoryTotal = inventoryRes.total ?? 0;
@@ -2726,6 +2789,15 @@ async function renderAdminShopInventory(container) {
   const totalStock = inventorySummary.total ?? cfg.stock_total ?? ((cfg.stock_available ?? 0) + (cfg.stock_sold ?? 0));
   const availableStock = inventorySummary.available ?? cfg.stock_available ?? 0;
   const soldStock = inventorySummary.sold ?? cfg.stock_sold ?? 0;
+  const unbatchedAvail = Number(batchesRes.unbatched_available) || 0;
+  const batchRows = batchesRes.data || [];
+  const batchOpts = batchRows.map(b => {
+    const sel = batchFilter === b.label ? 'selected' : '';
+    return `<option value="${escHtml(b.label)}" ${sel}>${escHtml(b.label)}（待售 ${b.available} / 共 ${b.total}）</option>`;
+  }).join('');
+  const noneOpt = unbatchedAvail > 0
+    ? `<option value="__none__" ${batchFilter === '__none__' ? 'selected' : ''}>无批次（待售 ${unbatchedAvail}）</option>`
+    : '';
 
   container.innerHTML = `
     <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
@@ -2735,6 +2807,11 @@ async function renderAdminShopInventory(container) {
           <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.55;margin-bottom:0.5rem">
             每行一件：<code>邮箱####登录key</code>、<code>----</code> 或 <code>====</code> 分隔；也支持 CSV 两列（自动识别邮箱列）。
           </p>
+          <div class="form-group">
+            <label class="form-label">本批批次标识</label>
+            <input class="form-input" id="shop-import-batch" placeholder="如 0404、1；留空则按服务器 Asia/Shanghai 当日 MMDD" style="max-width:280px" value="${escHtml(defBatch)}" />
+            <div class="form-hint">本次导入的所有行共用此标签，便于按批筛选、删除待售</div>
+          </div>
           <div class="form-group">
             <label class="form-label">文件导入</label>
             <input type="file" id="shop-import-file" accept=".txt,.csv,text/plain,text/csv" onchange="loadShopImportFile()" />
@@ -2749,44 +2826,60 @@ async function renderAdminShopInventory(container) {
         </div>
       </div>
       <div class="card">
-        <div class="card-header">
-          <div>
+        <div class="card-header" style="align-items:flex-start;flex-wrap:wrap;gap:0.75rem">
+          <div style="flex:1;min-width:200px">
             <div class="card-title">货物列表</div>
-            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">30 条/页，可查看售出状态并删除货物卡券</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">30 条/页 · 按状态与批次筛选 · 批量删除仅影响<strong>待售</strong></div>
           </div>
-          <div style="display:flex;gap:0.5rem;align-items:center">
+          <div style="display:flex;flex-wrap:wrap;gap:0.5rem;align-items:center">
             <span style="font-size:0.78rem;color:var(--text-muted)">状态</span>
-            <select class="form-input" style="min-width:140px" onchange="adminShopInventorySetStatus(this.value)">
+            <select class="form-input" style="min-width:120px" onchange="adminShopInventorySetStatus(this.value)">
               <option value="all" ${inventoryStatus === 'all' ? 'selected' : ''}>全部</option>
               <option value="available" ${inventoryStatus === 'available' ? 'selected' : ''}>未售出</option>
               <option value="sold" ${inventoryStatus === 'sold' ? 'selected' : ''}>已售出</option>
             </select>
+            <span style="font-size:0.78rem;color:var(--text-muted)">批次</span>
+            <select class="form-input" style="min-width:200px" onchange="adminShopInventorySetBatch(this.value)">
+              <option value="" ${batchFilter === '' ? 'selected' : ''}>全部批次</option>
+              ${noneOpt}
+              ${batchOpts}
+            </select>
+          </div>
+        </div>
+        <div class="card-body" style="padding-top:0">
+          <div style="display:flex;flex-wrap:wrap;gap:0.5rem;margin-bottom:0.85rem;align-items:center">
+            <button type="button" class="btn btn-danger btn-sm" ${batchFilter === '' ? 'disabled' : ''} onclick="confirmPurgeShopInventoryBatch()">删除本批次·全部待售</button>
+            <button type="button" class="btn btn-danger btn-sm" onclick="confirmPurgeAllShopAvailable()">一键清空·全部待售</button>
+            <span style="font-size:0.74rem;color:var(--text-muted)">须先选择具体批次才可「删除本批次」；两项操作均有二次确认</span>
           </div>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>邮箱 / Key</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
+            <thead><tr><th>邮箱 / Key</th><th>批次</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
             <tbody>
               ${inventoryRows.length ? inventoryRows.map(item => {
                 const emailJs = JSON.stringify(item.email || '');
                 const keyJs = JSON.stringify(item.api_key || '');
                 const labelJs = JSON.stringify(item.email || item.id || '');
+                const bl = (item.batch_label || '').trim();
+                const blShow = bl ? escHtml(bl) : '<span style="color:var(--text-muted)">—</span>';
                 return `
                 <tr data-shop-inventory-row>
                   <td>
                     <div class="code-box" style="font-size:0.72rem"><span>${escHtml(item.email || '')}</span><button type="button" class="copy-btn" onclick='copyText(${emailJs})'>⧉</button></div>
                     <div class="code-box" style="margin-top:0.35rem;font-size:0.72rem"><span>${escHtml(item.api_key || '')}</span><button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⧉</button></div>
                   </td>
+                  <td style="font-size:0.78rem;font-weight:600">${blShow}</td>
                   <td>${item.status === 'sold' ? '<span class="badge badge-gray">已售出</span>' : '<span class="badge badge-green">待售</span>'}</td>
                   <td style="font-size:0.72rem;font-family:var(--font-mono)">${item.order_id ? escHtml(item.order_id) : '<span style="color:var(--text-muted)">—</span>'}</td>
                   <td style="font-size:0.78rem">${formatDate(item.created_at)}</td>
                   <td><button type="button" class="btn btn-danger btn-sm" onclick='deleteShopInventory("${item.id}", ${labelJs})'>删除</button></td>
                 </tr>`;
-              }).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无货物</td></tr>'}
+              }).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1rem">暂无货物</td></tr>'}
             </tbody>
           </table>
         </div>
-        <div style="display:flex;gap:0.5rem;align-items:center;justify-content:space-between;margin-top:1rem;flex-wrap:wrap">
+        <div style="display:flex;gap:0.5rem;align-items:center;justify-content:space-between;margin-top:1rem;flex-wrap:wrap;padding:0 1.2rem 1.2rem">
           <div style="font-size:0.82rem;color:var(--text-muted)">共 ${inventoryTotal} 条 · 第 ${inventoryPage} / ${inventoryMaxPage} 页</div>
           <div style="display:flex;gap:0.5rem;align-items:center">
             <button class="btn btn-ghost btn-sm" ${inventoryPage <= 1 ? 'disabled' : ''} onclick="adminShopInventoryGoPage(${inventoryPage - 1})">上一页</button>

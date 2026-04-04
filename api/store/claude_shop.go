@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 var inventoryEmailRe = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
@@ -275,42 +276,48 @@ func normalizeClaudeInventoryStatusFilter(status string) (string, bool) {
 	}
 }
 
-func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter string, page, size int) ([]model.ClaudeInventoryItem, int, error) {
+func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilter string, page, size int) ([]model.ClaudeInventoryItem, int, error) {
 	filter, ok := normalizeClaudeInventoryStatusFilter(statusFilter)
 	if !ok {
 		return nil, 0, fmt.Errorf("invalid_inventory_status")
 	}
+	batchFilter = strings.TrimSpace(batchFilter)
+	offset := (page - 1) * size
+
+	conds := []string{"1=1"}
+	args := []interface{}{}
+	argI := 1
+	if filter != "" {
+		conds = append(conds, fmt.Sprintf("status = $%d", argI))
+		args = append(args, filter)
+		argI++
+	}
+	if batchFilter != "" {
+		if batchFilter == "__none__" {
+			conds = append(conds, "(batch_label IS NULL OR batch_label = '')")
+		} else {
+			conds = append(conds, fmt.Sprintf("batch_label = $%d", argI))
+			args = append(args, batchFilter)
+			argI++
+		}
+	}
+	whereSQL := strings.Join(conds, " AND ")
 
 	var total int
-	var rows pgx.Rows
-	var err error
-	offset := (page - 1) * size
-	if filter == "" {
-		err = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM claude_inventory`).Scan(&total)
-		if err != nil {
-			return nil, 0, err
-		}
-		rows, err = s.pool.Query(ctx, `
-			SELECT id, email, api_key, status, order_id::text, created_at
-			FROM claude_inventory
-			ORDER BY created_at DESC
-			LIMIT $1 OFFSET $2`,
-			size, offset,
-		)
-	} else {
-		err = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM claude_inventory WHERE status = $1`, filter).Scan(&total)
-		if err != nil {
-			return nil, 0, err
-		}
-		rows, err = s.pool.Query(ctx, `
-			SELECT id, email, api_key, status, order_id::text, created_at
-			FROM claude_inventory
-			WHERE status = $1
-			ORDER BY created_at DESC
-			LIMIT $2 OFFSET $3`,
-			filter, size, offset,
-		)
+	err := s.pool.QueryRow(ctx, "SELECT COUNT(*)::int FROM claude_inventory WHERE "+whereSQL, args...).Scan(&total)
+	if err != nil {
+		return nil, 0, err
 	}
+
+	dataArgs := append(append([]interface{}{}, args...), size, offset)
+	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
+		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), created_at
+		FROM claude_inventory
+		WHERE %s
+		ORDER BY created_at DESC
+		LIMIT $%d OFFSET $%d`, whereSQL, argI, argI+1),
+		dataArgs...,
+	)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -320,7 +327,7 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter string, pa
 	for rows.Next() {
 		var item model.ClaudeInventoryItem
 		var orderIDText *string
-		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &item.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		if orderIDText != nil && strings.TrimSpace(*orderIDText) != "" {
@@ -344,9 +351,13 @@ func (s *Store) DeleteClaudeInventory(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair) (int, error) {
+func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair, batchLabel string) (int, error) {
 	if len(pairs) == 0 {
 		return 0, nil
+	}
+	batchLabel = strings.TrimSpace(batchLabel)
+	if len(batchLabel) > 64 {
+		return 0, fmt.Errorf("invalid_batch_label")
 	}
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -355,7 +366,7 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 	defer tx.Rollback(ctx)
 	n := 0
 	for _, p := range pairs {
-		_, err := tx.Exec(ctx, `INSERT INTO claude_inventory (email, api_key) VALUES ($1, $2)`, p.Email, p.APIKey)
+		_, err := tx.Exec(ctx, `INSERT INTO claude_inventory (email, api_key, batch_label) VALUES ($1, $2, $3)`, p.Email, p.APIKey, batchLabel)
 		if err != nil {
 			return n, err
 		}
@@ -365,6 +376,66 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 		return 0, err
 	}
 	return n, nil
+}
+
+// ListClaudeInventoryBatchSummaries 非空批次汇总 + 无批次且仍为待售的数量
+func (s *Store) ListClaudeInventoryBatchSummaries(ctx context.Context) ([]model.ClaudeInventoryBatchInfo, int, error) {
+	var unbatchedAvail int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*)::int FROM claude_inventory WHERE status = 'available' AND (batch_label IS NULL OR batch_label = '')`,
+	).Scan(&unbatchedAvail); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT batch_label,
+			COUNT(*)::int AS total,
+			COUNT(*) FILTER (WHERE status = 'available')::int AS available
+		FROM claude_inventory
+		WHERE batch_label IS NOT NULL AND batch_label <> ''
+		GROUP BY batch_label
+		ORDER BY MAX(created_at) DESC
+	`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []model.ClaudeInventoryBatchInfo
+	for rows.Next() {
+		var b model.ClaudeInventoryBatchInfo
+		if err := rows.Scan(&b.Label, &b.Total, &b.Available); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, b)
+	}
+	return out, unbatchedAvail, rows.Err()
+}
+
+// PurgeClaudeInventoryBatchAvailable 删除指定批次下所有「待售」记录（已售出不动）
+func (s *Store) PurgeClaudeInventoryBatchAvailable(ctx context.Context, batchKey string) (int64, error) {
+	batchKey = strings.TrimSpace(batchKey)
+	if batchKey == "" {
+		return 0, fmt.Errorf("empty_batch")
+	}
+	var tag pgconn.CommandTag
+	var err error
+	if batchKey == "__none__" {
+		tag, err = s.pool.Exec(ctx, `DELETE FROM claude_inventory WHERE status = 'available' AND (batch_label IS NULL OR batch_label = '')`)
+	} else {
+		tag, err = s.pool.Exec(ctx, `DELETE FROM claude_inventory WHERE status = 'available' AND batch_label = $1`, batchKey)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// PurgeAllClaudeInventoryAvailable 删除全部待售库存
+func (s *Store) PurgeAllClaudeInventoryAvailable(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM claude_inventory WHERE status = 'available'`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 func (s *Store) SumFulfilledClaudeQuantityForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {

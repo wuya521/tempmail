@@ -40,12 +40,20 @@ type ClaudeOrderLine struct {
 }
 
 type ClaudeInventoryItem struct {
-	ID        uuid.UUID  `json:"id"`
-	Email     string     `json:"email"`
-	APIKey    string     `json:"api_key"`
-	Status    string     `json:"status"`
-	OrderID   *uuid.UUID `json:"order_id,omitempty"`
-	CreatedAt time.Time  `json:"created_at"`
+	ID         uuid.UUID  `json:"id"`
+	Email      string     `json:"email"`
+	APIKey     string     `json:"api_key"`
+	Status     string     `json:"status"`
+	OrderID    *uuid.UUID `json:"order_id,omitempty"`
+	BatchLabel string     `json:"batch_label"`
+	CreatedAt  time.Time  `json:"created_at"`
+}
+
+// ClaudeInventoryBatchInfo 非空 batch_label 的汇总（用于管理端筛选）
+type ClaudeInventoryBatchInfo struct {
+	Label     string `json:"label"`
+	Total     int    `json:"total"`
+	Available int    `json:"available"`
 }
 
 type ClaudeInventorySummary struct {

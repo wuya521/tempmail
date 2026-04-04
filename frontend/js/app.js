@@ -27,6 +27,8 @@ const state = {
   adminShopOrdersStatus: '',
   claudeHighlightOrderId: null,
   _claudeShopSummary: null,
+  /** 支付宝当面付订单轮询定时器 */
+  claudeAlipayPollTimer: null,
   /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
   siteTitle: 'TempMail',
   // 当前邮箱
@@ -2199,10 +2201,20 @@ async function buildClaudeShopHighlightHtml() {
           </div>
         </div>`;
       }).join('');
+    } else if (o.payment_channel === 'alipay_precreate') {
+      body += `<p style="font-size:0.95rem;margin-bottom:0.5rem;font-weight:700">订单号 <code style="font-size:0.85rem">${escHtml(o.id)}</code></p>`;
+      body += `<p style="font-size:0.95rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
+      body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.8rem">本单为 <strong>支付宝当面付</strong>：请打开支付宝完成支付。支付成功后系统将<strong>自动发货</strong>（若本页未刷新，请到「我的订单」查看）。</p>`;
+      if (pay.hint) {
+        body += `<p style="font-size:0.78rem;color:var(--clr-warn);margin-bottom:0.6rem">${escHtml(pay.hint)}</p>`;
+      }
+      if (pay.tutorial_url) {
+        body += `<p style="margin-top:0.5rem"><a class="shop-tutorial-link" href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>`;
+      }
     } else {
       body += `<p style="font-size:0.95rem;margin-bottom:0.5rem;font-weight:700">订单号 <code style="font-size:0.85rem">${escHtml(o.id)}</code></p>`;
       body += `<p style="font-size:0.95rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
-      body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.8rem">请使用微信或支付宝扫描下方二维码支付对应金额，支付完成后等待管理员确认。</p>`;
+      body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.8rem">请使用微信或支付宝扫描下方静态收款码支付对应金额，支付完成后等待管理员确认。</p>`;
       body += `<div class="shop-qr-row">`;
       body += shopBuildQrBlockFromUrls(pay.wechat_qr_url, pay.alipay_qr_url);
       body += `</div>`;
@@ -2255,8 +2267,102 @@ window.syncClaudeShopModalGate = function() {
   btn.disabled = !(cb && cb.checked);
 };
 
+function stopClaudeShopAlipayPoll() {
+  if (state.claudeAlipayPollTimer) {
+    clearInterval(state.claudeAlipayPollTimer);
+    state.claudeAlipayPollTimer = null;
+  }
+}
+
 window.closeClaudeShopPayModal = function() {
+  stopClaudeShopAlipayPoll();
   document.querySelector('.shop-pay-flow-overlay')?.remove();
+};
+
+/** 根据选购页的支付方式打开静态码弹窗或支付宝当面付 */
+window.openClaudeShopPayFlow = function() {
+  const s = state._claudeShopSummary;
+  if (!s) return;
+  const useAlipay = s.alipay_precreate_available && $('claude-shop-pay-mode-alipay')?.checked;
+  if (useAlipay) {
+    openClaudeShopAlipayPayModal();
+  } else {
+    openClaudeShopPayModal();
+  }
+};
+
+/** 支付宝 precreate：直接下单并展示动态码，轮询直到发货 */
+window.openClaudeShopAlipayPayModal = async function() {
+  const s = state._claudeShopSummary;
+  if (!s || !s.alipay_precreate_available) {
+    toast('支付宝当面付未启用', 'warn');
+    return;
+  }
+  const stock = s.stock_available ?? 0;
+  if (stock < 1) {
+    toast('暂时缺货', 'warn');
+    return;
+  }
+  const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
+  if (qty > stock) {
+    toast('购买数量超过当前库存', 'warn');
+    return;
+  }
+  closeClaudeShopPayModal();
+  const overlay = el('div', 'modal-overlay shop-pay-flow-overlay');
+  overlay.innerHTML = `
+    <div class="modal shop-pay-modal" style="max-width:480px">
+      <div class="modal-title">支付宝当面付</div>
+      <button type="button" class="modal-close" onclick="closeClaudeShopPayModal()">✕</button>
+      <p class="shop-pay-modal-amount">应付金额：<strong id="claude-shop-modal-total">—</strong></p>
+      <p id="claude-shop-alipay-status" style="font-size:0.88rem;color:var(--text-secondary);line-height:1.55">正在创建订单…</p>
+      <div id="claude-shop-alipay-qr-slot" style="min-height:120px;display:flex;align-items:center;justify-content:center;margin-top:0.75rem"></div>
+      <div class="modal-actions" style="margin-top:1rem;justify-content:flex-end">
+        <button type="button" class="btn btn-ghost" onclick="closeClaudeShopPayModal()">关闭</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeClaudeShopPayModal(); });
+  claudeShopPriceRefresh();
+  try {
+    const r = await api.shopCreateOrder({ quantity: qty, payment_method: 'alipay' });
+    const qr = r.payment && r.payment.alipay_qr_code;
+    const hint = (r.payment && r.payment.hint) || '请使用支付宝扫码支付。';
+    if (!qr) {
+      $('claude-shop-alipay-status').textContent = '未返回收款码，请稍后重试或改用静态收款码。';
+      toast('支付宝下单异常', 'error');
+      return;
+    }
+    const st = $('claude-shop-alipay-status');
+    if (st) st.textContent = hint;
+    const slot = $('claude-shop-alipay-qr-slot');
+    if (slot) {
+      const src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(qr);
+      slot.innerHTML = `<img class="shop-qr-img" src="${escHtml(src)}" alt="支付宝收款码" style="max-width:220px;height:auto" />`;
+    }
+    state.claudeHighlightOrderId = r.order.id;
+    state.claudeAlipayPollTimer = setInterval(async () => {
+      try {
+        const d = await api.shopGetOrder(r.order.id);
+        if (d.order && d.order.status === 'fulfilled') {
+          stopClaudeShopAlipayPoll();
+          toast('支付成功，已自动发货', 'success');
+          closeClaudeShopPayModal();
+          navigate(state.page === 'claude-shop-orders' ? 'claude-shop-orders' : 'claude-shop');
+        }
+      } catch (_) { /* 轮询忽略单次失败 */ }
+    }, 2500);
+  } catch (e) {
+    const elSt = $('claude-shop-alipay-status');
+    if (elSt) elSt.textContent = e.message || '下单失败';
+    if (e.status === 409) {
+      toast(e.message || '已有待支付订单', 'warn');
+      closeClaudeShopPayModal();
+      navigate('claude-shop-orders');
+    } else {
+      toast(e.message || '下单失败', 'error');
+    }
+  }
 };
 
 window.openClaudeShopPayModal = function() {
@@ -2317,10 +2423,11 @@ window.submitClaudeShopOrder = async function() {
   }
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   try {
-    const r = await api.shopCreateOrder({ quantity: qty });
+    const r = await api.shopCreateOrder({ quantity: qty, payment_method: 'static' });
     closeClaudeShopPayModal();
     state.claudeHighlightOrderId = r.order.id;
-    toast('订单已生成，请等待管理员核对到账后发货', 'success');
+    const done = r.order && r.order.status === 'fulfilled';
+    toast(done ? '订单已生成并已自动发货' : '订单已生成，请等待管理员核对到账后发货', 'success');
     navigate('claude-shop-orders');
   } catch (e) {
     if (e.status === 409) {
@@ -2376,8 +2483,22 @@ async function renderClaudeShop(container) {
           <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
           <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
           <p class="shop-checkout-total-line">应付金额：<span id="claude-shop-pay-total">—</span></p>
-          <button type="button" class="btn btn-primary" style="margin-top:0.25rem" onclick="openClaudeShopPayModal()">打开收款码并生成订单</button>
-          <p class="shop-checkout-hint">先弹出二维码完成支付，勾选确认后关闭弹窗并生成订单号；发货后请在「我的订单」查看账号。</p>
+          ${summary.alipay_precreate_available ? `
+          <div style="margin:0.65rem 0;font-size:0.86rem;line-height:1.55">
+            <span style="color:var(--text-muted);display:block;margin-bottom:0.35rem">支付方式</span>
+            <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer;margin-bottom:0.25rem">
+              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-alipay" value="alipay" checked />
+              <span><strong>支付宝当面付</strong>（官方动态码，付完自动发货）</span>
+            </label>
+            <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer">
+              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-static" value="static" />
+              <span>微信 / 支付宝静态收款码（备用，流程与原先一致）</span>
+            </label>
+          </div>` : ''}
+          <button type="button" class="btn btn-primary" style="margin-top:0.25rem" onclick="openClaudeShopPayFlow()">${summary.alipay_precreate_available ? '继续支付' : '打开收款码并生成订单'}</button>
+          <p class="shop-checkout-hint">${summary.alipay_precreate_available
+    ? '选「当面付」将直接生成订单并展示支付宝二维码；选「静态码」请先扫码付款，再勾选确认生成订单。'
+    : '先弹出二维码完成支付，勾选确认后关闭弹窗并生成订单号；发货后请在「我的订单」查看账号。'}</p>
         </div>
         `;
 
@@ -2440,7 +2561,7 @@ async function renderClaudeShopOrders(container) {
                 <td style="font-size:0.78rem">${formatDate(o.created_at)}</td>
                 <td>${o.quantity}</td>
                 <td>¥${(o.total_cents / 100).toFixed(2)}</td>
-                <td>${o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : '<span class="badge badge-gray">待确认收款</span>'}</td>
+                <td>${o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : (o.payment_channel === 'alipay_precreate' ? '<span class="badge badge-gray">待支付·支付宝</span>' : '<span class="badge badge-gray">待确认收款</span>')}</td>
                 <td><button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopViewOrder('${o.id}')">查看详情</button></td>
               </tr>
             `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
@@ -2466,6 +2587,7 @@ window.saveAdminShopConfig = async function() {
     show_tag_wholesale: $('shop-cfg-showws')?.checked !== false,
     tag_fan_welfare: ($('shop-cfg-fan')?.value || '').trim(),
     max_per_user: parseInt($('shop-cfg-maxuser')?.value || '0', 10) || 0,
+    static_payment_manual_confirm: $('shop-cfg-static-manual')?.checked !== false,
   };
   try {
     await api.admin.shopPutConfig(body);
@@ -2736,6 +2858,14 @@ async function renderAdminShopSettings(container) {
           </label>
           <div class="form-group"><label class="form-label">粉丝福利等自定义标签文案（留空不显示）</label>
             <input class="form-input" id="shop-cfg-fan" placeholder="如：粉丝福利" value="${escHtml(cfg.tag_fan_welfare || '')}" /></div>
+          <label style="display:flex;align-items:flex-start;gap:0.45rem;margin:0.75rem 0;cursor:pointer;line-height:1.45">
+            <input type="checkbox" id="shop-cfg-static-manual" style="margin-top:0.2rem" ${cfg.static_payment_manual_confirm !== false ? 'checked' : ''} />
+            <span><strong>静态收款码</strong>订单需管理员手动确认发货（推荐开启）。关闭后用户选静态码下单将<strong>立即自动发货</strong>，无法核实是否付款。</span>
+          </label>
+          <p style="font-size:0.78rem;color:var(--text-muted);margin:-0.35rem 0 0.6rem;line-height:1.45">
+            支付宝当面付订单不受此项影响，支付成功后会始终自动发货。
+            ${cfg.alipay_precreate_available ? '<span style="color:var(--clr-success)">当前：支付宝当面付已配置。</span>' : '<span>当面付：请在服务器配置 ALIPAY_* 环境变量。</span>'}
+          </p>
           <button type="button" class="btn btn-primary" onclick="saveAdminShopConfig()">保存配置</button>
         </div>
       </div>

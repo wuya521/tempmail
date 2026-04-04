@@ -28,6 +28,8 @@ type ClaudeOrder struct {
 	TotalCents     int        `json:"total_cents"`
 	IsWholesale    bool       `json:"is_wholesale"`
 	Status         string     `json:"status"`
+	PaymentChannel string     `json:"payment_channel"`
+	AlipayTradeNo  *string    `json:"alipay_trade_no,omitempty"`
 	CreatedAt      time.Time  `json:"created_at"`
 	FulfilledAt    *time.Time `json:"fulfilled_at,omitempty"`
 	Lines          []ClaudeOrderLine `json:"lines,omitempty"`

@@ -134,6 +134,12 @@ services:
       ADMIN_KEY_FILE: /data/admin.key
       # 收款码等文件目录（默认 /data/shop，已含在 ./data 卷内）
       SHOP_ASSET_DIR: /data/shop
+      # 支付宝当面付（可选，见 .env.example；私钥勿提交仓库）
+      ALIPAY_APP_ID: ${ALIPAY_APP_ID:-}
+      ALIPAY_PRIVATE_KEY: ${ALIPAY_PRIVATE_KEY:-}
+      ALIPAY_PUBLIC_KEY: ${ALIPAY_PUBLIC_KEY:-}
+      ALIPAY_NOTIFY_URL: ${ALIPAY_NOTIFY_URL:-}
+      ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
     depends_on:
       pgbouncer:
         condition: service_started

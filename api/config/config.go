@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -15,6 +16,24 @@ type Config struct {
 	SMTPServerIP  string // 仅从 SMTP_SERVER_IP 环境变量读取
 	SMTPHostname  string // 邮件服务器场指向的 hostname，不硬编码
 	ShopAssetDir  string // 收款码等静态文件目录
+
+	// 支付宝当面付（precreate + 异步通知）；密钥仅从环境变量读取，勿写入镜像或仓库
+	AlipayAppID       string
+	AlipayPrivateKey  string // PEM 或单行 Base64 正文，可用 \n 表示换行
+	AlipayPublicKey   string // 支付宝公钥，用于验签异步通知
+	AlipayNotifyURL   string // 须为外网可访问的 HTTPS，如 https://你的域名/public/alipay/notify
+	AlipayGateway     string // 默认正式网关
+}
+
+// AlipayPrecreateConfigured 是否具备发起 precreate 的最小配置（不含店铺开关）
+func (c *Config) AlipayPrecreateConfigured() bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.AlipayAppID) != "" &&
+		strings.TrimSpace(c.AlipayPrivateKey) != "" &&
+		strings.TrimSpace(c.AlipayPublicKey) != "" &&
+		strings.TrimSpace(c.AlipayNotifyURL) != ""
 }
 
 func Load() *Config {
@@ -40,6 +59,12 @@ func Load() *Config {
 		SMTPServerIP:  os.Getenv("SMTP_SERVER_IP"),
 		SMTPHostname:  os.Getenv("SMTP_HOSTNAME"),
 		ShopAssetDir:  getEnv("SHOP_ASSET_DIR", "/data/shop"),
+
+		AlipayAppID:      os.Getenv("ALIPAY_APP_ID"),
+		AlipayPrivateKey: os.Getenv("ALIPAY_PRIVATE_KEY"),
+		AlipayPublicKey:  os.Getenv("ALIPAY_PUBLIC_KEY"),
+		AlipayNotifyURL:  strings.TrimSpace(os.Getenv("ALIPAY_NOTIFY_URL")),
+		AlipayGateway:    getEnv("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
 	}
 }
 

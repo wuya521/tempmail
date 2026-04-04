@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"encoding/csv"
 	"fmt"
 	"regexp"
@@ -32,6 +33,8 @@ type ClaudeShopConfig struct {
 	MaxPerUser          int
 	WechatQRFile        string
 	AlipayQRFile        string
+	// StaticPaymentManualConfirm 为 false 时，静态收款路径下单后立即尝试自动发货（无支付凭证，请谨慎）
+	StaticPaymentManualConfirm bool
 }
 
 var inventorySplitTokens = []string{"####", "----", "===="}
@@ -202,13 +205,14 @@ func (s *Store) GetClaudeShopConfig(ctx context.Context) (*ClaudeShopConfig, err
 		SELECT enabled, title, subtitle, description, tutorial_url,
 		       retail_price_cents, wholesale_min_qty, wholesale_price_cents,
 		       tag_hot, show_tag_wholesale, tag_fan_welfare, max_per_user,
-		       wechat_qr_file, alipay_qr_file
+		       wechat_qr_file, alipay_qr_file,
+		       static_payment_manual_confirm
 		FROM claude_shop_config WHERE id = 1`,
 	).Scan(
 		&c.Enabled, &c.Title, &c.Subtitle, &c.Description, &c.TutorialURL,
 		&c.RetailPriceCents, &c.WholesaleMinQty, &c.WholesalePriceCents,
 		&c.TagHot, &c.ShowTagWholesale, &c.TagFanWelfare, &c.MaxPerUser,
-		&c.WechatQRFile, &c.AlipayQRFile,
+		&c.WechatQRFile, &c.AlipayQRFile, &c.StaticPaymentManualConfirm,
 	)
 	if err != nil {
 		return nil, err
@@ -222,12 +226,13 @@ func (s *Store) UpdateClaudeShopConfig(ctx context.Context, c *ClaudeShopConfig)
 		  enabled = $1, title = $2, subtitle = $3, description = $4, tutorial_url = $5,
 		  retail_price_cents = $6, wholesale_min_qty = $7, wholesale_price_cents = $8,
 		  tag_hot = $9, show_tag_wholesale = $10, tag_fan_welfare = $11, max_per_user = $12,
-		  wechat_qr_file = $13, alipay_qr_file = $14, updated_at = NOW()
+		  wechat_qr_file = $13, alipay_qr_file = $14,
+		  static_payment_manual_confirm = $15, updated_at = NOW()
 		WHERE id = 1`,
 		c.Enabled, c.Title, c.Subtitle, c.Description, c.TutorialURL,
 		c.RetailPriceCents, c.WholesaleMinQty, c.WholesalePriceCents,
 		c.TagHot, c.ShowTagWholesale, c.TagFanWelfare, c.MaxPerUser,
-		c.WechatQRFile, c.AlipayQRFile,
+		c.WechatQRFile, c.AlipayQRFile, c.StaticPaymentManualConfirm,
 	)
 	return err
 }
@@ -447,8 +452,8 @@ func (s *Store) SumFulfilledClaudeQuantityForAccount(ctx context.Context, accoun
 	return n, err
 }
 
-// CreateClaudeOrder 创建待支付订单（不预占库存）
-func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quantity int) (*model.ClaudeOrder, error) {
+// CreateClaudeOrder 创建待支付订单（不预占库存）。paymentChannel: static | alipay_precreate
+func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quantity int, paymentChannel string) (*model.ClaudeOrder, error) {
 	cfg, err := s.GetClaudeShopConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -485,6 +490,13 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 	if pendingN > 0 {
 		return nil, fmt.Errorf("pending_order_exists")
 	}
+	paymentChannel = strings.TrimSpace(strings.ToLower(paymentChannel))
+	if paymentChannel == "" {
+		paymentChannel = "static"
+	}
+	if paymentChannel != "static" && paymentChannel != "alipay_precreate" {
+		return nil, fmt.Errorf("invalid_payment_channel")
+	}
 	wholesale := quantity >= cfg.WholesaleMinQty
 	unit := cfg.RetailPriceCents
 	if wholesale {
@@ -494,10 +506,10 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 
 	var id uuid.UUID
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO claude_orders (account_id, quantity, unit_price_cents, total_cents, is_wholesale, status)
-		VALUES ($1, $2, $3, $4, $5, 'awaiting_payment')
+		INSERT INTO claude_orders (account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, payment_channel)
+		VALUES ($1, $2, $3, $4, $5, 'awaiting_payment', $6)
 		RETURNING id`,
-		accountID, quantity, unit, total, wholesale,
+		accountID, quantity, unit, total, wholesale, paymentChannel,
 	).Scan(&id)
 	if err != nil {
 		return nil, err
@@ -512,12 +524,19 @@ func (s *Store) GetClaudeOrderByID(ctx context.Context, id uuid.UUID) (*model.Cl
 
 func (s *Store) getClaudeOrderByID(ctx context.Context, id uuid.UUID) (*model.ClaudeOrder, error) {
 	var o model.ClaudeOrder
+	var alipayTN sql.NullString
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, created_at, fulfilled_at
+		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+		       payment_channel, alipay_trade_no, created_at, fulfilled_at
 		FROM claude_orders WHERE id = $1`, id,
-	).Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status, &o.CreatedAt, &o.FulfilledAt)
+	).Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
+		&o.PaymentChannel, &alipayTN, &o.CreatedAt, &o.FulfilledAt)
 	if err != nil {
 		return nil, err
+	}
+	if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
+		s := alipayTN.String
+		o.AlipayTradeNo = &s
 	}
 	if o.Status == "fulfilled" {
 		lines, err := s.listClaudeOrderLines(ctx, id)
@@ -568,7 +587,8 @@ func (s *Store) ListClaudeOrdersForAccount(ctx context.Context, accountID uuid.U
 		return nil, 0, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, created_at, fulfilled_at
+		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+		       payment_channel, alipay_trade_no, created_at, fulfilled_at
 		FROM claude_orders WHERE account_id = $1
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		accountID, size, (page-1)*size,
@@ -580,8 +600,14 @@ func (s *Store) ListClaudeOrdersForAccount(ctx context.Context, accountID uuid.U
 	var list []model.ClaudeOrder
 	for rows.Next() {
 		var o model.ClaudeOrder
-		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status, &o.CreatedAt, &o.FulfilledAt); err != nil {
+		var alipayTN sql.NullString
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
+			&o.PaymentChannel, &alipayTN, &o.CreatedAt, &o.FulfilledAt); err != nil {
 			return nil, 0, err
+		}
+		if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
+			s := alipayTN.String
+			o.AlipayTradeNo = &s
 		}
 		list = append(list, o)
 	}
@@ -598,7 +624,8 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 			return nil, 0, err
 		}
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, created_at, fulfilled_at
+			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+			       payment_channel, alipay_trade_no, created_at, fulfilled_at
 			FROM claude_orders WHERE status = $1
 			ORDER BY created_at ASC LIMIT $2 OFFSET $3`,
 			statusFilter, size, (page-1)*size,
@@ -609,7 +636,8 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 			return nil, 0, err
 		}
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, created_at, fulfilled_at
+			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+			       payment_channel, alipay_trade_no, created_at, fulfilled_at
 			FROM claude_orders ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
 			size, (page-1)*size,
 		)
@@ -621,12 +649,51 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 	var list []model.ClaudeOrder
 	for rows.Next() {
 		var o model.ClaudeOrder
-		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status, &o.CreatedAt, &o.FulfilledAt); err != nil {
+		var alipayTN sql.NullString
+		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
+			&o.PaymentChannel, &alipayTN, &o.CreatedAt, &o.FulfilledAt); err != nil {
 			return nil, 0, err
+		}
+		if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
+			s := alipayTN.String
+			o.AlipayTradeNo = &s
 		}
 		list = append(list, o)
 	}
 	return list, total, rows.Err()
+}
+
+// DeleteClaudeAwaitingPaymentOrder 删除仍处于待支付的订单（如 precreate 失败回滚）
+func (s *Store) DeleteClaudeAwaitingPaymentOrder(ctx context.Context, orderID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM claude_orders WHERE id = $1 AND status = 'awaiting_payment'`, orderID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// SetClaudeOrderAlipayTradeNo 在发货前写入支付宝交易号（幂等：已相同则跳过）
+func (s *Store) SetClaudeOrderAlipayTradeNo(ctx context.Context, orderID uuid.UUID, tradeNo string) error {
+	tradeNo = strings.TrimSpace(tradeNo)
+	if tradeNo == "" {
+		return fmt.Errorf("empty trade no")
+	}
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE claude_orders SET alipay_trade_no = $2
+		WHERE id = $1 AND status = 'awaiting_payment'
+		  AND (alipay_trade_no IS NULL OR alipay_trade_no = '' OR alipay_trade_no = $2)`,
+		orderID, tradeNo,
+	)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return fmt.Errorf("order_not_awaiting_or_trade_mismatch")
+	}
+	return nil
 }
 
 // FulfillClaudeOrder 管理员确认收款后扣库存并发货

@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"tempmail/alipay"
 	"tempmail/config"
 	"tempmail/handler"
 	"tempmail/middleware"
@@ -85,7 +86,29 @@ func main() {
 	settingH := handler.NewSettingHandler(db)
 	registerH := handler.NewRegisterHandler(db)
 	statsH   := handler.NewStatsHandler(db)
-	shopH    := handler.NewClaudeShopHandler(db, shopDir)
+	var ali *alipay.Client
+	var alipayNotifyURL, alipayAppID string
+	if cfg.AlipayPrecreateConfigured() {
+		priv, e1 := alipay.ParsePrivateKey(cfg.AlipayPrivateKey)
+		pub, e2 := alipay.ParsePublicKey(cfg.AlipayPublicKey)
+		if e1 != nil || e2 != nil {
+			log.Printf("[alipay] 密钥解析失败（请检查 ALIPAY_PRIVATE_KEY / ALIPAY_PUBLIC_KEY）: private=%v public=%v", e1, e2)
+		} else {
+			gw := strings.TrimSpace(cfg.AlipayGateway)
+			if gw == "" {
+				gw = "https://openapi.alipay.com/gateway.do"
+			}
+			alipayAppID = strings.TrimSpace(cfg.AlipayAppID)
+			ali = &alipay.Client{
+				AppID:      alipayAppID,
+				Gateway:    gw,
+				PrivateKey: priv,
+				PublicKey:  pub,
+			}
+			alipayNotifyURL = cfg.AlipayNotifyURL
+		}
+	}
+	shopH := handler.NewClaudeShopHandler(db, shopDir, ali, alipayNotifyURL, alipayAppID)
 
 	// 公开路由（无需认证）
 	public := r.Group("/public")
@@ -95,6 +118,7 @@ func main() {
 		public.GET("/stats", statsH.Get)
 		public.GET("/claude-shop", shopH.PublicSummary)
 		public.GET("/shop-assets/:filename", shopH.ServeShopAsset)
+		public.POST("/alipay/notify", shopH.AlipayNotify)
 	}
 
 	// API 路由组（需要认证 + 速率限制）

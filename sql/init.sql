@@ -121,6 +121,7 @@ CREATE TABLE claude_shop_config (
     max_per_user            INT          NOT NULL DEFAULT 0,
     wechat_qr_file          VARCHAR(255) NOT NULL DEFAULT '',
     alipay_qr_file          VARCHAR(255) NOT NULL DEFAULT '',
+    static_payment_manual_confirm BOOLEAN NOT NULL DEFAULT TRUE,
     updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 INSERT INTO claude_shop_config (id) VALUES (1);
@@ -133,6 +134,8 @@ CREATE TABLE claude_orders (
     total_cents      INT          NOT NULL,
     is_wholesale     BOOLEAN      NOT NULL DEFAULT FALSE,
     status           VARCHAR(32)  NOT NULL DEFAULT 'awaiting_payment',
+    payment_channel  VARCHAR(24)  NOT NULL DEFAULT 'static',
+    alipay_trade_no  VARCHAR(64),
     created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     fulfilled_at     TIMESTAMPTZ
 );

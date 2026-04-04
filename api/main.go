@@ -92,7 +92,7 @@ func main() {
 		priv, e1 := alipay.ParsePrivateKey(cfg.AlipayPrivateKey)
 		pub, e2 := alipay.ParsePublicKey(cfg.AlipayPublicKey)
 		if e1 != nil || e2 != nil {
-			log.Printf("[alipay] 密钥解析失败（请检查 ALIPAY_PRIVATE_KEY / ALIPAY_PUBLIC_KEY）: private=%v public=%v", e1, e2)
+			log.Printf("[alipay] 密钥解析失败（请检查 ALIPAY_PRIVATE_KEY / ALIPAY_PUBLIC_KEY，.env 勿含 \\r 或损坏的引号）: private=%v public=%v", e1, e2)
 		} else {
 			gw := strings.TrimSpace(cfg.AlipayGateway)
 			if gw == "" {
@@ -106,7 +106,10 @@ func main() {
 				PublicKey:  pub,
 			}
 			alipayNotifyURL = cfg.AlipayNotifyURL
+			log.Printf("[alipay] 当面付已初始化 app_id=%s notify=%s", alipayAppID, alipayNotifyURL)
 		}
+	} else if strings.TrimSpace(cfg.AlipayAppID) != "" || strings.TrimSpace(cfg.AlipayPrivateKey) != "" {
+		log.Printf("[alipay] 环境变量不完整，已跳过当面付（需同时配置 APP_ID、私钥、支付宝公钥、NOTIFY_URL）")
 	}
 	shopH := handler.NewClaudeShopHandler(db, shopDir, ali, alipayNotifyURL, alipayAppID)
 

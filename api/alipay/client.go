@@ -200,9 +200,19 @@ func encodeForm(params map[string]string) string {
 	return vals.Encode()
 }
 
+// normalizeKeyMaterial 去掉 BOM、\r（Windows 换行进 .env 时会导致 PEM/base64 解析失败）
+func normalizeKeyMaterial(s string) string {
+	s = strings.TrimSpace(s)
+	s = strings.TrimPrefix(s, "\ufeff")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "")
+	return strings.TrimSpace(s)
+}
+
 // ParsePrivateKey 支持 PEM 整段或仅 Base64 正文（支付宝控制台常见格式）
 func ParsePrivateKey(raw string) (*rsa.PrivateKey, error) {
-	raw = strings.TrimSpace(strings.ReplaceAll(raw, "\\n", "\n"))
+	raw = normalizeKeyMaterial(raw)
+	raw = strings.ReplaceAll(raw, "\\n", "\n")
 	pemBytes := []byte(raw)
 	if !strings.Contains(raw, "BEGIN") {
 		pemBytes = ensurePEM(raw, "PRIVATE KEY")
@@ -227,7 +237,8 @@ func ParsePrivateKey(raw string) (*rsa.PrivateKey, error) {
 
 // ParsePublicKey 支付宝公钥（PEM 或 Base64 正文）
 func ParsePublicKey(raw string) (*rsa.PublicKey, error) {
-	raw = strings.TrimSpace(strings.ReplaceAll(raw, "\\n", "\n"))
+	raw = normalizeKeyMaterial(raw)
+	raw = strings.ReplaceAll(raw, "\\n", "\n")
 	block := []byte(raw)
 	if !strings.Contains(raw, "BEGIN") {
 		block = ensurePEM(raw, "PUBLIC KEY")
@@ -247,7 +258,7 @@ func ensurePEM(raw, blockType string) []byte {
 	if strings.Contains(raw, "BEGIN") {
 		return []byte(raw)
 	}
-	b64 := strings.ReplaceAll(strings.ReplaceAll(raw, " ", ""), "\n", "")
+	b64 := strings.ReplaceAll(strings.ReplaceAll(strings.ReplaceAll(raw, " ", ""), "\n", ""), "\r", "")
 	var lines []string
 	for i := 0; i < len(b64); i += 64 {
 		end := i + 64

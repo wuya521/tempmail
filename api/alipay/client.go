@@ -55,6 +55,7 @@ func (c *Client) Precreate(notifyURL, outTradeNo, subject, totalAmount string) (
 	params := map[string]string{
 		"app_id":      c.AppID,
 		"method":      methodPrecreate,
+		"format":      "JSON",
 		"charset":     "utf-8",
 		"sign_type":   "RSA2",
 		"timestamp":   formatAlipayTimestamp(),
@@ -144,10 +145,14 @@ func (c *Client) VerifyNotify(params map[string]string) error {
 }
 
 func signRSA2(params map[string]string, key *rsa.PrivateKey) (string, error) {
-	// 拷贝并去掉 sign
+	// 网关请求验签：待签名字符串须与开放平台一致——除 sign 外非空参数均参与（含 sign_type、format）。
+	// 异步通知验签仍用 buildSignContent，那边按文档排除 sign、sign_type。
 	p := make(map[string]string, len(params))
 	for k, v := range params {
-		if k == "sign" || k == "sign_type" {
+		if k == "sign" {
+			continue
+		}
+		if strings.TrimSpace(v) == "" {
 			continue
 		}
 		p[k] = v

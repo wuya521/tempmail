@@ -21,7 +21,7 @@ nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。
 业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过；可选支付宝当面付 precreate + POST /public/alipay/notify 自动发货，静态收款码备用；店铺可配置 static_payment_manual_confirm）；库存 batch_label；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺三页；GET /api/admin/shop/orders/:id 订单详情。
 生产域名示例：Web https://mail.yahoohh.cloud/；支付宝异步通知须与 .env 一致：https://mail.yahoohh.cloud/public/alipay/notify（支付宝开放平台同址）。
-支付宝密钥：推荐 `.env` 设 `ALIPAY_PRIVATE_KEY_FILE=/data/alipay_private.pem`、`ALIPAY_PUBLIC_KEY_FILE=/data/alipay_public.pem`（文件在宿主机 `./data/`，容器内为 `/data`），避免宝塔/超长 env/CRLF；`isv.invalid-signature` 多为**应用私钥与开放平台上传的应用公钥不是一对**或 APPID 不对应；网关请求已带 `format=JSON`。
+支付宝：`api/alipay/client.go` 中 **网关下单签名 `signRSA2` 仅剔除 `sign`（`sign_type` 参与签名）**；**异步通知验签 `buildSignContent` 剔除 `sign` 与 `sign_type`**。推荐 `.env` 使用 `ALIPAY_*_KEY_FILE` 指向 `/data/*.pem`；`isv.invalid-signature` 多为应用私钥与开放平台「应用公钥」不成对；网关请求含 `format=JSON`。
 用户偏好：回复简体中文；代码改动聚焦需求；本机推送 GitHub：代理可用时 `git config --global http.https://github.com.proxy http://127.0.0.1:7890`（仅 github.com）；不用代理则 `git config --global --unset http.https://github.com.proxy`；或 `git -c http.proxy= -c https.proxy= push`。服务器 Git 勿设 127.0.0.1:7890 代理。
 ```
 
@@ -125,6 +125,76 @@ docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < s
 
 ### 支付宝当面付（可选）
 
+#### 接入成功教程（本仓库：`github.com/wuya521/tempmail`）
+
+| 环境 | 路径 |
+|------|------|
+| 本机开发 | `e:\AImail` |
+| 生产服务器（OpenCloudOS / 宝塔） | `/root/tempmail` |
+| 容器内 API 工作目录 | 二进制 `/usr/local/bin/api-server`；密钥若用文件则为 **`/data/`**（对应宿主机仓库下 **`./data`**） |
+
+**1）支付宝开放平台（网页）**
+
+1. 登录 [支付宝开放平台](https://open.alipay.com/)，创建/进入应用，记下 **APPID**（如 `2021003…`）。  
+2. **接口加签方式**：**RSA2**；用密钥工具生成 **应用密钥对**，将 **应用公钥** 上传到开放平台（不要与「支付宝公钥」混淆：后者用于你方验**异步通知**，在密钥工具/平台页面单独查看）。  
+3. 将 **应用私钥** 保存为服务器上的 **`/root/tempmail/data/alipay_private.pem`**（PEM，`-----BEGIN … PRIVATE KEY-----`）。  
+4. 将 **支付宝公钥**（不是应用公钥）保存为 **`/root/tempmail/data/alipay_public.pem`**。  
+5. **产品**：开通 **当面付** 等所需能力；**异步通知地址** 填与线上一致的 HTTPS，例如：  
+   `https://mail.yahoohh.cloud/public/alipay/notify`（域名换成你的；须与 `.env` 中 `ALIPAY_NOTIFY_URL` **完全一致**）。
+
+**2）数据库（仅未执行过时）**
+
+在 **`/root/tempmail`** 执行 `sql/migrate_v7.sql`（当面付订单字段等），命令见上文「首次或有大版本数据库变更」。
+
+**3）服务器 `.env`（勿提交 Git）**
+
+推荐使用文件密钥（避免宝塔单行 env 截断/CRLF）：
+
+```env
+ALIPAY_APP_ID=你的APPID
+ALIPAY_PRIVATE_KEY=
+ALIPAY_PUBLIC_KEY=
+ALIPAY_PRIVATE_KEY_FILE=/data/alipay_private.pem
+ALIPAY_PUBLIC_KEY_FILE=/data/alipay_public.pem
+ALIPAY_NOTIFY_URL=https://你的域名/public/alipay/notify
+ALIPAY_GATEWAY=https://openapi.alipay.com/gateway.do
+```
+
+执行 **`chmod 600 /root/tempmail/data/alipay_*.pem`**。若 `.env` 在 Windows 编过，可在服务器 **`sed -i 's/\r$//' .env`**。
+
+**4）拉代码、构建、启动 API**
+
+```bash
+cd /root/tempmail
+git pull origin main
+docker compose build api --no-cache
+docker compose up -d api --force-recreate
+docker compose logs api --tail 80
+```
+
+若出现 **容器名冲突**，见上文「日常更新 B」中的 `docker rm -f tempmail-api-1` 一段后再 `up -d api`。
+
+**5）Nginx / 前端**
+
+- **`docker compose ps`** 中须有 **`tempmail-frontend-1`**；否则 HTTPS 经宝塔易出现 **502**：执行 **`docker compose up -d frontend`**。  
+- 宝塔站点 **反向代理** 指向 Docker 映射端口（默认 **`127.0.0.1:8880`**，以 `docker-compose.yml` 为准）。  
+- 仓库内 `nginx/default.conf` 已用 **`^~ /public/`**、**`^~ /api/`** 反代到 **`http://api:8080`**，保证 **`POST /public/alipay/notify`** 到达 Go。
+
+**6）成功标志**
+
+- 日志：**`[alipay] 解析器 v5：私钥长度=… 公钥长度=…`** 与 **`[alipay] 当面付已初始化 app_id=… notify=…`**。  
+- 接口：`curl -sS 'https://你的域名/public/claude-shop' | grep alipay_precreate` 出现 **`alipay_precreate_available":true`**（**勿把两条命令粘成一行**，否则 `grep` 会报 `invalid option -- 'S'`）。  
+- 前端：Claude 售号页选 **当面付** 下单后，接口返回 **`payment.alipay_qr_code`**，页面展示 **支付宝二维码**；不再出现 **`isv.invalid-signature`**（若仍出现，优先核对 **应用私钥 ↔ 开放平台应用公钥** 是否同一对、**APPID** 是否一致）。
+
+**7）本仓库签名逻辑（勿随意改坏）**
+
+- 文件：`api/alipay/client.go`。  
+- **`signRSA2`（向支付宝网关发 `alipay.trade.precreate` 等请求前签名）**：参与拼接待签名字符串时 **只去掉 `sign`**，**`sign_type=RSA2` 等仍参与排序拼接**。  
+- **`buildSignContent`（校验 `POST /public/alipay/notify` 异步通知）**：去掉 **`sign` 与 `sign_type`** 后再排序拼接验签。  
+- 网关公共参数已包含 **`format=JSON`**；公钥 DER 回退解析使用 **`x509.ParsePKCS1PublicKey`**。
+
+---
+
 **密钥（推荐文件方式，少踩坑）**
 
 - `./data` 已挂载到容器 **`/data`**，不必改 compose。将**应用私钥**、**支付宝公钥**（开放平台「查看支付宝公钥」，非应用公钥）写成 PEM，例如：
@@ -151,8 +221,7 @@ docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < s
 
 **错误**
 
-- **`isv.invalid-signature`**：绝大多数是 **服务器应用私钥** 与开放平台 **该 APPID 下上传的应用公钥** 不是同一对；或 APPID 填错。与「支付宝公钥」（验异步通知）是两套概念。
-- 代码侧网关请求已包含 **`format=JSON`**；`api/alipay` 中公钥 DER 回退解析使用 **`x509.ParsePKCS1PublicKey`**（与 `crypto/rsa` 二选一在 Go 1.23 均可编译，仓库已统一为 x509）。
+- **`isv.invalid-signature`**：优先核对 **应用私钥** 与开放平台 **该 APP 上传的应用公钥** 为同一对、**APPID** 一致；与「支付宝公钥」（仅用于验异步通知）勿混用。签名逻辑见上文「本仓库签名逻辑」。
 
 **其余步骤**
 

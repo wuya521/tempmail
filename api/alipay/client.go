@@ -145,10 +145,10 @@ func (c *Client) VerifyNotify(params map[string]string) error {
 }
 
 func signRSA2(params map[string]string, key *rsa.PrivateKey) (string, error) {
-	// 与官方 SDK 一致：待签名字符串剔除 sign、sign_type；空值不参与。
+	// 网关下单（如 alipay.trade.precreate）：待签名字符串仅剔除 sign；sign_type、format、biz_content 等非空参数均参与排序拼接。
 	p := make(map[string]string, len(params))
 	for k, v := range params {
-		if k == "sign" || k == "sign_type" {
+		if k == "sign" {
 			continue
 		}
 		if strings.TrimSpace(v) == "" {
@@ -165,6 +165,7 @@ func signRSA2(params map[string]string, key *rsa.PrivateKey) (string, error) {
 	return base64.StdEncoding.EncodeToString(sig), nil
 }
 
+// buildSignContent 用于异步通知验签：剔除 sign 与 sign_type（与支付宝异步通知验签约定一致）。
 func buildSignContent(params map[string]string) string {
 	p := make(map[string]string, len(params))
 	for k, v := range params {

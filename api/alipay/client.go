@@ -9,6 +9,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net/http"
@@ -210,48 +211,89 @@ func normalizeKeyMaterial(s string) string {
 }
 
 // ParsePrivateKey 支持 PEM 整段或仅 Base64 正文（支付宝控制台常见格式）
+// 注意：x509.ParsePKCS8PrivateKey / ParsePKCS1PrivateKey 需要的是 PEM 解码后的 DER，不能传入含 -----BEGIN 的整段字符串。
 func ParsePrivateKey(raw string) (*rsa.PrivateKey, error) {
 	raw = normalizeKeyMaterial(raw)
+	raw = strings.Trim(raw, `"'`)
 	raw = strings.ReplaceAll(raw, "\\n", "\n")
-	pemBytes := []byte(raw)
-	if !strings.Contains(raw, "BEGIN") {
-		pemBytes = ensurePEM(raw, "PRIVATE KEY")
-	}
-	if key, err := x509.ParsePKCS8PrivateKey(pemBytes); err == nil {
-		if rk, ok := key.(*rsa.PrivateKey); ok {
-			return rk, nil
+
+	tryBlocks := func(pemData []byte) (*rsa.PrivateKey, error) {
+		rest := pemData
+		for len(rest) > 0 {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			if key, err := x509.ParsePKCS8PrivateKey(block.Bytes); err == nil {
+				if rk, ok := key.(*rsa.PrivateKey); ok {
+					return rk, nil
+				}
+				return nil, fmt.Errorf("private key is not RSA")
+			}
+			if key, err := x509.ParsePKCS1PrivateKey(block.Bytes); err == nil {
+				return key, nil
+			}
 		}
-		return nil, fmt.Errorf("private key is not RSA")
+		return nil, fmt.Errorf("no parseable private key block")
 	}
-	if !strings.Contains(raw, "BEGIN") {
-		pemBytes = ensurePEM(raw, "RSA PRIVATE KEY")
-	} else {
-		pemBytes = []byte(raw)
+
+	if strings.Contains(raw, "BEGIN") {
+		if k, err := tryBlocks([]byte(raw)); err == nil {
+			return k, nil
+		}
+		return nil, fmt.Errorf("parse private key: invalid PEM blocks")
 	}
-	key, err := x509.ParsePKCS1PrivateKey(pemBytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
+	// 仅 Base64 正文：先包成 PEM 再解码
+	armored := ensurePEM(raw, "PRIVATE KEY")
+	if k, err := tryBlocks(armored); err == nil {
+		return k, nil
 	}
-	return key, nil
+	armored = ensurePEM(raw, "RSA PRIVATE KEY")
+	if k, err := tryBlocks(armored); err == nil {
+		return k, nil
+	}
+	return nil, fmt.Errorf("parse private key: asn1 decode failed (check key is app private key, full copy)")
 }
 
 // ParsePublicKey 支付宝公钥（PEM 或 Base64 正文）
 func ParsePublicKey(raw string) (*rsa.PublicKey, error) {
 	raw = normalizeKeyMaterial(raw)
+	raw = strings.Trim(raw, `"'`)
 	raw = strings.ReplaceAll(raw, "\\n", "\n")
-	block := []byte(raw)
-	if !strings.Contains(raw, "BEGIN") {
-		block = ensurePEM(raw, "PUBLIC KEY")
+
+	tryBlocks := func(pemData []byte) (*rsa.PublicKey, error) {
+		rest := pemData
+		for len(rest) > 0 {
+			var block *pem.Block
+			block, rest = pem.Decode(rest)
+			if block == nil {
+				break
+			}
+			if pub, err := x509.ParsePKIXPublicKey(block.Bytes); err == nil {
+				if rk, ok := pub.(*rsa.PublicKey); ok {
+					return rk, nil
+				}
+				return nil, fmt.Errorf("public key is not RSA")
+			}
+			if pub, err := rsa.ParsePKCS1PublicKey(block.Bytes); err == nil {
+				return pub, nil
+			}
+		}
+		return nil, fmt.Errorf("no parseable public key block")
 	}
-	pub, err := x509.ParsePKIXPublicKey(block)
-	if err != nil {
-		return nil, fmt.Errorf("parse public key: %w", err)
+
+	if strings.Contains(raw, "BEGIN") {
+		if k, err := tryBlocks([]byte(raw)); err == nil {
+			return k, nil
+		}
+		return nil, fmt.Errorf("parse public key: invalid PEM blocks")
 	}
-	rk, ok := pub.(*rsa.PublicKey)
-	if !ok {
-		return nil, fmt.Errorf("public key is not RSA")
+	armored := ensurePEM(raw, "PUBLIC KEY")
+	if k, err := tryBlocks(armored); err == nil {
+		return k, nil
 	}
-	return rk, nil
+	return nil, fmt.Errorf("parse public key: asn1 decode failed (use 支付宝公钥 from open.alipay.com, not app public key)")
 }
 
 func ensurePEM(raw, blockType string) []byte {

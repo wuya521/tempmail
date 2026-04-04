@@ -17,10 +17,11 @@ api/Dockerfile 已内置 GOPROXY 与 GOSUMDB，勿在服务器手写改 Dockerfi
 docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码目录 data/shop）。
 nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location ~* \\.(png|jpg)$ 会抢走 /public/shop-assets/*.png 导致收款码 404。
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
-数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（如 migrate_v5 含 Claude 店铺与 accounts.last_seen_at）。
+数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm）。
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。
-业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过、人工确认收款发货）；库存有 batch_label（导入 query ?batch= 或留空默认 MMDD）；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺拆为三页；用户侧购物流程弹窗扫码后生成订单；GET /api/admin/shop/orders/:id 订单详情。
-用户偏好：回复简体中文；代码改动聚焦需求；推送 GitHub 时若 HTTPS 失败可用 git -c http.proxy= -c https.proxy= push 或改用 SSH。
+业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过；可选支付宝当面付 precreate + POST /public/alipay/notify 自动发货，静态收款码备用；店铺可配置 static_payment_manual_confirm）；库存 batch_label；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺三页；GET /api/admin/shop/orders/:id 订单详情。
+生产域名示例：Web https://mail.yahoohh.cloud/；支付宝异步通知须与 .env 一致：https://mail.yahoohh.cloud/public/alipay/notify（支付宝开放平台同址）。
+用户偏好：回复简体中文；代码改动聚焦需求；本机推送 GitHub：代理可用时 `git config --global http.https://github.com.proxy http://127.0.0.1:7890`（仅 github.com）；不用代理则 `git config --global --unset http.https://github.com.proxy`；或 `git -c http.proxy= -c https.proxy= push`。服务器 Git 勿设 127.0.0.1:7890 代理。
 ```
 
 ---
@@ -30,7 +31,7 @@ scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目
 | 项 | 说明 |
 |----|------|
 | 路径 | `e:\AImail` |
-| 推送 | `git push origin main`；代理异常时：`git -c http.proxy= -c https.proxy= push origin main` |
+| 推送 | `git push origin main`；仅 GitHub 走本机 Clash 7890：`git config --global http.https://github.com.proxy http://127.0.0.1:7890`；不用代理：`git config --global --unset http.https://github.com.proxy`；临时绕过坏代理：`git -c http.proxy= -c https.proxy= push origin main` |
 | 不提交 | `scripts/`、`.cursor/` 已在 `.gitignore` |
 
 ---
@@ -99,12 +100,34 @@ git pull origin main
 
 ### 首次或有大版本数据库变更
 
+**在仓库根目录执行**（`POSTGRES_USER` / `POSTGRES_DB` 若与 `.env` 不一致请改成你的）：
+
 ```bash
+cd /root/tempmail
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v5.sql
 # 库存批次标签（claude_inventory.batch_label）
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v6.sql
-# 以后若有 migrate_v7 等，按发布说明执行对应文件
+# 支付宝当面付 + 静态收款是否人工确认（claude_orders.payment_channel / alipay_trade_no；claude_shop_config.static_payment_manual_confirm）
+docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v7.sql
 ```
+
+若 `docker compose ps -q postgres` 为空，先 `docker compose up -d postgres` 再执行。**已执行过的 migrate 不要重复执行**（重复 ALTER IF NOT EXISTS 一般无害，但养成按版本核对习惯）。
+
+### 支付宝当面付（可选）
+
+1. 在服务器 **`/root/tempmail/.env`** 增加或填写（勿提交 Git）：
+
+   - `ALIPAY_APP_ID`
+   - `ALIPAY_PRIVATE_KEY`（应用私钥，PEM 或多行写成一行用 `\n`）
+   - `ALIPAY_PUBLIC_KEY`（支付宝公钥，用于验签异步通知）
+   - `ALIPAY_NOTIFY_URL=https://mail.yahoohh.cloud/public/alipay/notify`（域名随你实际站点修改）
+   - `ALIPAY_GATEWAY=https://openapi.alipay.com/gateway.do`（沙箱用 `https://openapi.alipaydev.com/gateway.do`）
+
+2. 改完后 **`docker compose build api && docker compose up -d api`**（`docker-compose.yml` 会把上述变量注入 `api` 容器）。
+
+3. [支付宝开放平台](https://open.alipay.com/) 应用里 **异步通知地址** 与 `ALIPAY_NOTIFY_URL` **完全一致**。
+
+4. 宝塔 / 外层 Nginx 须把带 `/public/`、`/api/` 的请求转到本项目的 `frontend` 容器（或等价反代），且 **POST** `/public/alipay/notify` 能到达 Go API（与仓库 `nginx/default.conf` 中 `^~ /public/` 一致）。
 
 ### 前端「改了不生效」
 

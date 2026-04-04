@@ -6,6 +6,18 @@ import (
 	"strings"
 )
 
+func alipayKeyFromEnvOrFile(envKey, fileKey string) string {
+	v := os.Getenv(envKey)
+	if fp := strings.TrimSpace(os.Getenv(fileKey)); fp != "" {
+		b, err := os.ReadFile(fp)
+		if err != nil {
+			return v
+		}
+		return string(b)
+	}
+	return v
+}
+
 type Config struct {
 	Port          string
 	DBDSN         string
@@ -61,8 +73,8 @@ func Load() *Config {
 		ShopAssetDir:  getEnv("SHOP_ASSET_DIR", "/data/shop"),
 
 		AlipayAppID:      os.Getenv("ALIPAY_APP_ID"),
-		AlipayPrivateKey: os.Getenv("ALIPAY_PRIVATE_KEY"),
-		AlipayPublicKey:  os.Getenv("ALIPAY_PUBLIC_KEY"),
+		AlipayPrivateKey: alipayKeyFromEnvOrFile("ALIPAY_PRIVATE_KEY", "ALIPAY_PRIVATE_KEY_FILE"),
+		AlipayPublicKey:  alipayKeyFromEnvOrFile("ALIPAY_PUBLIC_KEY", "ALIPAY_PUBLIC_KEY_FILE"),
 		AlipayNotifyURL:  strings.TrimSpace(os.Getenv("ALIPAY_NOTIFY_URL")),
 		AlipayGateway:    getEnv("ALIPAY_GATEWAY", "https://openapi.alipay.com/gateway.do"),
 	}

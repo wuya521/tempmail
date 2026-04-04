@@ -89,7 +89,10 @@ func main() {
 	var ali *alipay.Client
 	var alipayNotifyURL, alipayAppID string
 	if cfg.AlipayPrecreateConfigured() {
-		log.Printf("[alipay] 解析器 v4：pem.Decode + 原始 Base64→DER；部署后若仍失败请执行: docker compose build api --no-cache")
+		pk := strings.TrimSpace(cfg.AlipayPrivateKey)
+		pubk := strings.TrimSpace(cfg.AlipayPublicKey)
+		log.Printf("[alipay] 解析器 v5：私钥长度=%d（len%%4=%d）公钥长度=%d（len%%4=%d）；若长度与本地不一致说明 .env 未正确进容器或被截断；可改用 ALIPAY_*_KEY_FILE 挂载文件",
+			len(pk), len(pk)%4, len(pubk), len(pubk)%4)
 		priv, e1 := alipay.ParsePrivateKey(cfg.AlipayPrivateKey)
 		pub, e2 := alipay.ParsePublicKey(cfg.AlipayPublicKey)
 		if e1 != nil || e2 != nil {

@@ -207,21 +207,57 @@ func normalizeKeyMaterial(s string) string {
 	s = strings.TrimPrefix(s, "\ufeff")
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "")
+	s = stripInvisibleForBase64(s)
 	return strings.TrimSpace(s)
 }
 
-// decodeBase64DER 支付宝常见「一行 Base64」→ DER：先去换行，再尝试标准解码；失败则把空格当作被替换的 +
+// stripInvisibleForBase64 去掉复制/面板常见的零宽字符与不间断空格（不改变可见 ASCII，但会破坏 Base64）
+func stripInvisibleForBase64(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff', '\u00a0':
+			continue
+		default:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func base64Pad4(s string) string {
+	if m := len(s) % 4; m != 0 {
+		return s + strings.Repeat("=", 4-m)
+	}
+	return s
+}
+
+// decodeBase64DER 支付宝常见「一行 Base64」→ DER：先去换行，再尝试标准解码；失败则把空格当作被替换的 +；再试 URL-safe（-、_）
 func decodeBase64DER(s string) ([]byte, error) {
 	s = strings.TrimSpace(s)
 	s = strings.ReplaceAll(s, "\r", "")
 	s = strings.ReplaceAll(s, "\n", "")
 	s = strings.ReplaceAll(s, "\t", "")
+	s = stripInvisibleForBase64(s)
 	noSpace := strings.ReplaceAll(s, " ", "")
-	if der, err := base64.StdEncoding.DecodeString(noSpace); err == nil {
+	try := func(b64 string) ([]byte, error) {
+		return base64.StdEncoding.DecodeString(base64Pad4(b64))
+	}
+	if der, err := try(noSpace); err == nil {
 		return der, nil
 	}
 	withPlus := strings.ReplaceAll(s, " ", "+")
-	return base64.StdEncoding.DecodeString(withPlus)
+	if der, err := try(withPlus); err == nil {
+		return der, nil
+	}
+	urlToStd := strings.ReplaceAll(strings.ReplaceAll(noSpace, "-", "+"), "_", "/")
+	if urlToStd != noSpace {
+		if der, err := try(urlToStd); err == nil {
+			return der, nil
+		}
+	}
+	return nil, fmt.Errorf("invalid base64")
 }
 
 // ParsePrivateKey 支持 PEM 整段或仅 Base64 正文（支付宝控制台常见格式）

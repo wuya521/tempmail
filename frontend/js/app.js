@@ -20,6 +20,9 @@ const state = {
   adminAccountsQ: '',
   adminShopInventoryPage: 1,
   adminShopInventoryStatus: 'all',
+  adminShopOrdersPage: 1,
+  /** 管理端订单筛选：''=全部 awaiting_payment fulfilled */
+  adminShopOrdersStatus: '',
   claudeHighlightOrderId: null,
   _claudeShopSummary: null,
   /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
@@ -333,6 +336,7 @@ const api = {
       return apiFetch(u);
     },
     shopConfirmOrder: id => apiFetch(API_BASE + '/admin/shop/orders/' + id + '/confirm', { method: 'POST' }),
+    shopGetOrderAdmin: id => apiFetch(API_BASE + '/admin/shop/orders/' + id),
     addDomain:   body => apiFetch(API_BASE + '/admin/domains', { method: 'POST', body: JSON.stringify(body) }),
     deleteDomain:  id => apiFetch(API_BASE + '/admin/domains/' + id, { method: 'DELETE' }),
     toggleDomain:  (id, active) => apiFetch(API_BASE + '/admin/domains/' + id + '/toggle', { method: 'PUT', body: JSON.stringify({ active }) }),
@@ -443,7 +447,8 @@ async function refreshClaudeShopNav() {
   if (!wrap) return;
   if (state.claudeShopEnabled) {
     wrap.innerHTML = `<div class="nav-section">商城</div>
-      <button class="nav-item" data-page="claude-shop" onclick="navigate('claude-shop')"><span class="nav-icon">🛒</span><span>自助 Claude 账号</span></button>`;
+      <button class="nav-item" data-page="claude-shop" onclick="navigate('claude-shop')"><span class="nav-icon">🛒</span><span>自助 Claude 账号</span></button>
+      <button class="nav-item" data-page="claude-shop-orders" onclick="navigate('claude-shop-orders')"><span class="nav-icon">📋</span><span>我的订单</span></button>`;
   } else {
     wrap.innerHTML = '';
   }
@@ -598,8 +603,14 @@ function buildMainLayout() {
         <button class="nav-item" data-page="admin-domains" onclick="navigate('admin-domains')">
           <span class="nav-icon">🌐</span><span>域名管理</span>
         </button>
-        <button class="nav-item" data-page="admin-claude-shop" onclick="navigate('admin-claude-shop')">
-          <span class="nav-icon">🏷</span><span>店铺配置</span>
+        <button class="nav-item" data-page="admin-shop-settings" onclick="navigate('admin-shop-settings')">
+          <span class="nav-icon">🏷</span><span>商品与收款</span>
+        </button>
+        <button class="nav-item" data-page="admin-shop-inventory" onclick="navigate('admin-shop-inventory')">
+          <span class="nav-icon">📦</span><span>库存与货物</span>
+        </button>
+        <button class="nav-item" data-page="admin-shop-orders" onclick="navigate('admin-shop-orders')">
+          <span class="nav-icon">🧾</span><span>订单与发货</span>
         </button>
         <button class="nav-item" data-page="admin-settings" onclick="navigate('admin-settings')">
           <span class="nav-icon">⚙</span><span>系统设置</span>
@@ -678,8 +689,11 @@ async function renderPage(page) {
     'admin-accounts': ['账户管理', '创建和管理用户账户'],
     'admin-domains':  ['域名管理', '管理域名池'],
     'admin-settings': ['系统设置', ''],
-    'claude-shop':    ['自助 Claude 账号', '选购与订单'],
-    'admin-claude-shop': ['店铺配置', '商品、库存、收款码与订单核销'],
+    'claude-shop':    ['自助 Claude 账号', '选购商品'],
+    'claude-shop-orders': ['我的订单', '记录与发货信息'],
+    'admin-shop-settings': ['商品与收款', '文案、价格、收款码'],
+    'admin-shop-inventory': ['库存与货物', '导入与货物列表'],
+    'admin-shop-orders': ['订单与发货', '待确认与历史订单'],
     'apikey-show':    ['API Key', ''],
     'api-docs':       ['API 接口文档', '查看所有可用 API 及调用示例'],
   };
@@ -698,7 +712,10 @@ async function renderPage(page) {
       case 'admin-domains':  await renderAdminDomains(container); break;
       case 'admin-settings': await renderAdminSettings(container); break;
       case 'claude-shop':    await renderClaudeShop(container); break;
-      case 'admin-claude-shop': await renderAdminClaudeShop(container); break;
+      case 'claude-shop-orders': await renderClaudeShopOrders(container); break;
+      case 'admin-shop-settings': await renderAdminShopSettings(container); break;
+      case 'admin-shop-inventory': await renderAdminShopInventory(container); break;
+      case 'admin-shop-orders': await renderAdminShopOrders(container); break;
       case 'apikey-show':    renderApiKeyShow(container); break;
       case 'api-docs':       renderApiDocs(container); break;
       default: container.innerHTML = '<div class="page"><p>页面未找到</p></div>';
@@ -2121,6 +2138,75 @@ k6 run /tmp/test.js`,
 }
 
 // ─── Claude 自助购号（用户）──────────────────────────────────
+function shopBuildQrBlockFromUrls(wechatUrl, alipayUrl) {
+  let h = '';
+  if (wechatUrl) {
+    h += `<div><div class="form-hint" style="margin-bottom:0.3rem">微信收款</div>
+      <img class="shop-qr-img" src="${escHtml(wechatUrl)}" alt="微信收款码" loading="lazy" /></div>`;
+  }
+  if (alipayUrl) {
+    h += `<div><div class="form-hint" style="margin-bottom:0.3rem">支付宝收款</div>
+      <img class="shop-qr-img" src="${escHtml(alipayUrl)}" alt="支付宝收款码" loading="lazy" /></div>`;
+  }
+  if (!wechatUrl && !alipayUrl) {
+    h += `<p style="color:var(--clr-warn);font-size:0.85rem">管理员尚未上传收款码，请联系店主。</p>`;
+  }
+  return h;
+}
+
+async function buildClaudeShopHighlightHtml() {
+  if (!state.claudeHighlightOrderId) return '';
+  try {
+    const d = await api.shopGetOrder(state.claudeHighlightOrderId);
+    const o = d.order;
+    const pay = d.payment || {};
+    const totalY = (o.total_cents / 100).toFixed(2);
+    let body = '';
+    if (o.status === 'fulfilled' && (o.lines || []).length) {
+      body += `<div class="shop-deliver-banner" role="status">⚠️ 请立即复制保存以下账号信息；页面关闭后仍可在「我的订单」中查看。</div>`;
+      body += (o.lines || []).map(ln => {
+        const em = String(ln.email || '');
+        const ky = String(ln.api_key || '');
+        return `<div class="shop-credential-card">
+          <span class="shop-credential-label">邮箱</span>
+          <div class="shop-credential-value-row">
+            <span class="shop-credential-value" dir="ltr">${escHtml(em)}</span>
+            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(em)})'>复制</button>
+          </div>
+          <span class="shop-credential-label" style="margin-top:0.9rem;display:block">登录 Key</span>
+          <div class="shop-credential-value-row">
+            <span class="shop-credential-value" dir="ltr">${escHtml(ky)}</span>
+            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(ky)})'>复制</button>
+          </div>
+        </div>`;
+      }).join('');
+    } else {
+      body += `<p style="font-size:0.95rem;margin-bottom:0.5rem;font-weight:700">订单号 <code style="font-size:0.85rem">${escHtml(o.id)}</code></p>`;
+      body += `<p style="font-size:0.95rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
+      body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.8rem">请使用微信或支付宝扫描下方二维码支付对应金额，支付完成后等待管理员确认。</p>`;
+      body += `<div class="shop-qr-row">`;
+      body += shopBuildQrBlockFromUrls(pay.wechat_qr_url, pay.alipay_qr_url);
+      body += `</div>`;
+      if (pay.tutorial_url) {
+        body += `<p style="margin-top:0.5rem"><a class="shop-tutorial-link" href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>`;
+      }
+    }
+    return `
+      <div class="card shop-order-highlight" style="max-width:720px;margin-bottom:1rem;border-left:4px solid var(--clr-accent)">
+        <div class="card-header" style="align-items:flex-start">
+          <div>
+            <div class="card-title">订单详情</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">#${escHtml(o.id)}</div>
+          </div>
+          <button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopDismissHighlight()">收起</button>
+        </div>
+        <div class="card-body">${body}</div>
+      </div>`;
+  } catch {
+    return '';
+  }
+}
+
 window.claudeShopPriceRefresh = function() {
   const s = state._claudeShopSummary;
   if (!s) return;
@@ -2129,39 +2215,99 @@ window.claudeShopPriceRefresh = function() {
   const isWs = qty >= minW;
   const unit = isWs ? Number(s.wholesale_price_yuan) : Number(s.retail_price_yuan);
   const total = unit * qty;
+  const txt = '¥' + total.toFixed(2);
   const el = $('claude-shop-pay-total');
-  if (el) el.textContent = '¥' + total.toFixed(2);
+  if (el) el.textContent = txt;
+  const mel = $('claude-shop-modal-total');
+  if (mel) mel.textContent = txt;
   const el2 = $('claude-shop-unit-hint');
   if (el2) {
     el2.textContent = isWs
       ? `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`
       : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${Number(s.wholesale_price_yuan).toFixed(2)} / 件`;
   }
-  syncClaudeShopSubmitGate();
+  syncClaudeShopModalGate();
 };
 
-window.syncClaudeShopSubmitGate = function() {
-  const btn = $('claude-shop-submit-btn');
-  const cb = $('claude-shop-pay-done');
+window.syncClaudeShopModalGate = function() {
+  const btn = $('claude-shop-modal-submit');
+  const cb = $('claude-shop-modal-pay-done');
   if (!btn) return;
   btn.disabled = !(cb && cb.checked);
 };
 
+window.closeClaudeShopPayModal = function() {
+  document.querySelector('.shop-pay-flow-overlay')?.remove();
+};
+
+window.openClaudeShopPayModal = function() {
+  const s = state._claudeShopSummary;
+  if (!s) return;
+  const stock = s.stock_available ?? 0;
+  if (stock < 1) {
+    toast('暂时缺货', 'warn');
+    return;
+  }
+  const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
+  if (qty > stock) {
+    toast('购买数量超过当前库存', 'warn');
+    return;
+  }
+  if (!s.wechat_qr_url && !s.alipay_qr_url) {
+    toast('管理员尚未上传收款码，请联系店主', 'warn');
+    return;
+  }
+  closeClaudeShopPayModal();
+  const qrBlock = shopBuildQrBlockFromUrls(s.wechat_qr_url, s.alipay_qr_url);
+  const tut = s.tutorial_url
+    ? `<p style="margin-top:0.5rem;text-align:center"><a class="shop-tutorial-link" href="${escHtml(s.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>`
+    : '';
+  const overlay = el('div', 'modal-overlay shop-pay-flow-overlay');
+  overlay.innerHTML = `
+    <div class="modal shop-pay-modal" style="max-width:520px">
+      <div class="modal-title">扫码支付</div>
+      <button type="button" class="modal-close" onclick="closeClaudeShopPayModal()">✕</button>
+      <p class="shop-pay-modal-amount">应付金额：<strong id="claude-shop-modal-total">—</strong></p>
+      <p style="font-size:0.82rem;color:var(--text-secondary);line-height:1.5;margin-bottom:0.5rem">
+        请使用微信或支付宝扫描下方二维码，支付金额须与上方一致。付款完成后勾选确认，系统将关闭本窗口并<strong>生成订单号</strong>（待管理员核对到账后发货）。
+      </p>
+      <div class="shop-qr-row">${qrBlock}</div>
+      ${tut}
+      <label style="display:flex;align-items:flex-start;gap:0.5rem;cursor:pointer;font-size:0.88rem;line-height:1.45;margin-top:1rem">
+        <input type="checkbox" id="claude-shop-modal-pay-done" style="margin-top:0.2rem" onchange="syncClaudeShopModalGate()" />
+        <span>我确认已按上述金额完成扫码支付</span>
+      </label>
+      <div class="modal-actions" style="margin-top:1rem;justify-content:flex-end">
+        <button type="button" class="btn btn-ghost" onclick="closeClaudeShopPayModal()">取消</button>
+        <button type="button" class="btn btn-primary" id="claude-shop-modal-submit" disabled onclick="submitClaudeShopOrder()">确认并生成订单</button>
+      </div>
+      <p style="font-size:0.72rem;color:var(--text-muted);margin-top:0.65rem;line-height:1.45">同一账号仅允许一笔「待确认收款」订单。</p>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) closeClaudeShopPayModal(); });
+  claudeShopPriceRefresh();
+  syncClaudeShopModalGate();
+};
+
 window.submitClaudeShopOrder = async function() {
-  if (!$('claude-shop-pay-done')?.checked) {
-    toast('请先完成扫码支付，并勾选「我确认已按上述金额完成扫码支付」', 'warn');
+  const overlay = document.querySelector('.shop-pay-flow-overlay');
+  if (!overlay || !$('claude-shop-modal-pay-done')?.checked) {
+    toast('请先完成扫码支付，并在弹窗中勾选确认', 'warn');
     return;
   }
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   try {
     const r = await api.shopCreateOrder({ quantity: qty });
+    closeClaudeShopPayModal();
     state.claudeHighlightOrderId = r.order.id;
     toast('订单已生成，请等待管理员核对到账后发货', 'success');
-    navigate('claude-shop');
+    navigate('claude-shop-orders');
   } catch (e) {
     if (e.status === 409) {
+      closeClaudeShopPayModal();
       toast(e.message || '已有待确认订单', 'warn');
-      navigate('claude-shop');
+      navigate('claude-shop-orders');
       return;
     }
     toast(e.message || '下单失败', 'error');
@@ -2170,12 +2316,12 @@ window.submitClaudeShopOrder = async function() {
 
 window.claudeShopViewOrder = function(id) {
   state.claudeHighlightOrderId = id;
-  navigate('claude-shop');
+  navigate('claude-shop-orders');
 };
 
 window.claudeShopDismissHighlight = function() {
   state.claudeHighlightOrderId = null;
-  navigate('claude-shop');
+  navigate(state.page === 'claude-shop-orders' ? 'claude-shop-orders' : 'claude-shop');
 };
 
 async function renderClaudeShop(container) {
@@ -2188,60 +2334,7 @@ async function renderClaudeShop(container) {
     return;
   }
 
-  let highlightHtml = '';
-  if (state.claudeHighlightOrderId) {
-    try {
-      const d = await api.shopGetOrder(state.claudeHighlightOrderId);
-      const o = d.order;
-      const pay = d.payment || {};
-      const totalY = (o.total_cents / 100).toFixed(2);
-      let body = '';
-      if (o.status === 'fulfilled' && (o.lines || []).length) {
-        body += `<div style="background:rgba(39,174,96,0.12);padding:0.6rem 0.8rem;border-radius:var(--radius-sm);font-size:0.82rem;margin-bottom:0.8rem">
-          ⚠ 请立即复制保存以下信息，页面关闭后仍可在「我的购买记录」中查看。</div>`;
-        body += (o.lines || []).map(ln => `
-          <div class="code-box" style="margin-top:0.45rem;font-size:0.78rem">
-            <div><b>邮箱</b> ${escHtml(ln.email)}
-              <button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(ln.email)})'>⎘</button></div>
-            <div style="margin-top:0.25rem"><b>登录 Key</b> ${escHtml(ln.api_key)}
-              <button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(ln.api_key)})'>⎘</button></div>
-          </div>
-        `).join('');
-      } else {
-        body += `<p style="font-size:0.9rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
-        body += `<p style="font-size:0.78rem;color:var(--text-muted);margin-bottom:0.8rem">请使用微信或支付宝扫描下方二维码支付对应金额，支付完成后等待管理员确认。</p>`;
-        body += `<div class="shop-qr-row">`;
-        if (pay.wechat_qr_url) {
-          body += `<div><div class="form-hint" style="margin-bottom:0.3rem">微信收款</div>
-            <img class="shop-qr-img" src="${escHtml(pay.wechat_qr_url)}" alt="微信收款码" loading="lazy" /></div>`;
-        }
-        if (pay.alipay_qr_url) {
-          body += `<div><div class="form-hint" style="margin-bottom:0.3rem">支付宝收款</div>
-            <img class="shop-qr-img" src="${escHtml(pay.alipay_qr_url)}" alt="支付宝收款码" loading="lazy" /></div>`;
-        }
-        if (!pay.wechat_qr_url && !pay.alipay_qr_url) {
-          body += `<p style="color:var(--clr-warn)">管理员尚未上传收款二维码，请联系店主。</p>`;
-        }
-        body += `</div>`;
-        if (pay.tutorial_url) {
-          body += `<p style="margin-top:0.5rem"><a class="shop-tutorial-link" href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>`;
-        }
-      }
-      highlightHtml = `
-        <div class="card shop-order-highlight" style="max-width:720px;margin-bottom:1rem;border-left:4px solid var(--clr-accent)">
-          <div class="card-header" style="align-items:flex-start">
-            <div>
-              <div class="card-title">订单详情</div>
-              <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">#${escHtml(o.id)}</div>
-            </div>
-            <button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopDismissHighlight()">收起</button>
-          </div>
-          <div class="card-body">${body}</div>
-        </div>`;
-    } catch {
-      highlightHtml = '';
-    }
-  }
+  const highlightHtml = await buildClaudeShopHighlightHtml();
 
   const tags = [];
   if (summary.tag_hot) tags.push('<span class="shop-tag shop-tag-hot">🔥 爆火</span>');
@@ -2253,49 +2346,19 @@ async function renderClaudeShop(container) {
   const orders = myOrders.data || [];
   const pendingOrder = orders.find(o => o.status === 'awaiting_payment');
 
-  const qrBlock = (() => {
-    let h = '';
-    if (summary.wechat_qr_url) {
-      h += `<div><div class="form-hint" style="margin-bottom:0.3rem">微信收款</div>
-        <img class="shop-qr-img" src="${escHtml(summary.wechat_qr_url)}" alt="微信收款码" loading="lazy" /></div>`;
-    }
-    if (summary.alipay_qr_url) {
-      h += `<div><div class="form-hint" style="margin-bottom:0.3rem">支付宝收款</div>
-        <img class="shop-qr-img" src="${escHtml(summary.alipay_qr_url)}" alt="支付宝收款码" loading="lazy" /></div>`;
-    }
-    if (!summary.wechat_qr_url && !summary.alipay_qr_url) {
-      h += `<p style="color:var(--clr-warn);font-size:0.85rem">管理员尚未上传收款码，请联系店主。</p>`;
-    }
-    return h;
-  })();
-
   const purchaseSection = pendingOrder ? `
-        <div style="margin-top:1.2rem;padding:1rem;background:rgba(230,126,34,0.12);border-radius:var(--radius);border:1px solid var(--border-light)">
+        <div class="shop-checkout-panel" style="margin-top:0.5rem;padding:1rem;background:rgba(230,126,34,0.12);border-radius:var(--radius);border:1px solid var(--border-light)">
           <p style="font-size:0.9rem;line-height:1.55;margin-bottom:0.65rem">您有 <strong>一笔</strong> 订单正在等待管理员确认收款。为避免重复付款，需处理完成后再下单。</p>
-          <button type="button" class="btn btn-primary btn-sm" onclick="claudeShopViewOrder('${pendingOrder.id}')">查看该订单与收款码</button>
+          <button type="button" class="btn btn-primary btn-sm" onclick="claudeShopViewOrder('${pendingOrder.id}')">前往我的订单 · 查看收款码</button>
         </div>
         ` : `
-        <div style="margin-top:1.2rem;padding:1rem;background:var(--bg-card);border-radius:var(--radius);border:1px solid var(--border-light)">
+        <div class="shop-checkout-panel" style="margin-top:0.5rem;padding:1rem 0 0">
           <label class="form-label">购买数量</label>
           <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
           <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
-          <p style="font-size:1.12rem;font-weight:700;color:var(--clr-primary);margin:0.35rem 0">
-            应付金额：<span id="claude-shop-pay-total">—</span>
-          </p>
-          <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border-light)">
-            <div class="form-label" style="margin-bottom:0.45rem">① 请先扫码支付</div>
-            <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.5;margin-bottom:0.65rem">请向下方二维码支付与上方「应付金额」一致的金额。系统无法在扫码瞬间自动建单，付款后再进行第 ② 步。</p>
-            <div class="shop-qr-row">${qrBlock}</div>
-            ${summary.tutorial_url ? `<p style="margin-top:0.45rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
-          </div>
-          <div style="margin-top:1rem">
-            <label style="display:flex;align-items:flex-start;gap:0.5rem;cursor:pointer;font-size:0.88rem;line-height:1.45">
-              <input type="checkbox" id="claude-shop-pay-done" style="margin-top:0.2rem" onchange="syncClaudeShopSubmitGate()" />
-              <span>② 我确认已按上述金额完成扫码支付</span>
-            </label>
-            <button type="button" class="btn btn-primary" style="margin-top:0.7rem" id="claude-shop-submit-btn" disabled onclick="submitClaudeShopOrder()">生成订单（待管理员核对）</button>
-            <p style="font-size:0.74rem;color:var(--text-muted);margin-top:0.45rem;line-height:1.45">同一账号仅允许一笔「待确认收款」订单；管理员确认后将自动发货。</p>
-          </div>
+          <p class="shop-checkout-total-line">应付金额：<span id="claude-shop-pay-total">—</span></p>
+          <button type="button" class="btn btn-primary" style="margin-top:0.25rem" onclick="openClaudeShopPayModal()">打开收款码并生成订单</button>
+          <p class="shop-checkout-hint">先弹出二维码完成支付，勾选确认后关闭弹窗并生成订单号；发货后请在「我的订单」查看账号。</p>
         </div>
         `;
 
@@ -2309,19 +2372,46 @@ async function renderClaudeShop(container) {
         </div>
       </div>
       <div class="card-body">
-        <div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>
-        <p style="font-size:0.88rem;line-height:1.65;color:var(--text-secondary);white-space:pre-wrap">${escHtml(summary.description || '')}</p>
-        ${summary.tutorial_url ? `<p style="margin-top:0.55rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
-        <div style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:1.1rem;align-items:center;font-size:0.88rem">
-          <div><span style="color:var(--text-muted)">库存</span> <strong>${summary.stock_available ?? 0}</strong> 件</div>
-          <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>
-          <div><span style="color:var(--text-muted)">批发</span> <strong>¥${Number(summary.wholesale_price_yuan).toFixed(2)}</strong> / 件（${summary.wholesale_min_qty || 5} 件起）</div>
+        <section class="shop-product-panel" aria-label="商品信息">
+          <div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>
+          <p style="font-size:0.88rem;line-height:1.65;color:var(--text-secondary);white-space:pre-wrap">${escHtml(summary.description || '')}</p>
+          ${summary.tutorial_url ? `<p style="margin-top:0.55rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
+          <div style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:1.1rem;align-items:center;font-size:0.88rem">
+            <div><span style="color:var(--text-muted)">库存</span> <strong>${summary.stock_available ?? 0}</strong> 件</div>
+            <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>
+            <div><span style="color:var(--text-muted)">批发</span> <strong>¥${Number(summary.wholesale_price_yuan).toFixed(2)}</strong> / 件（${summary.wholesale_min_qty || 5} 件起）</div>
+          </div>
+        </section>
+        <section class="shop-checkout-panel" aria-label="购买">
+          ${purchaseSection}
+        </section>
+        <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border-light)">
+          <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('claude-shop-orders')">📋 我的订单（记录与发货信息）</button>
         </div>
-        ${purchaseSection}
       </div>
     </div>
-    <div class="card" style="max-width:720px;margin-top:1rem">
-      <div class="card-header"><div class="card-title">我的购买记录</div></div>
+  `;
+  claudeShopPriceRefresh();
+}
+
+async function renderClaudeShopOrders(container) {
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('claude-shop')">← 返回选购</button>`;
+  }
+  const summary = await api.publicClaudeShop().catch(() => ({}));
+  state._claudeShopSummary = summary && summary.enabled ? summary : state._claudeShopSummary;
+  if (!summary || !summary.enabled) {
+    container.innerHTML = `<div class="card" style="max-width:560px"><p>店主暂未开放自助购号。</p></div>`;
+    return;
+  }
+  const highlightHtml = await buildClaudeShopHighlightHtml();
+  const myOrders = await api.shopListOrders(1, 50).catch(() => ({ data: [] }));
+  const orders = myOrders.data || [];
+  container.innerHTML = `
+    ${highlightHtml}
+    <div class="card" style="max-width:720px">
+      <div class="card-header"><div class="card-title">我的订单</div></div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>时间</th><th>数量</th><th>应付</th><th>状态</th><th></th></tr></thead>
@@ -2332,7 +2422,7 @@ async function renderClaudeShop(container) {
                 <td>${o.quantity}</td>
                 <td>¥${(o.total_cents / 100).toFixed(2)}</td>
                 <td>${o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : '<span class="badge badge-gray">待确认收款</span>'}</td>
-                <td><button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopViewOrder('${o.id}')">查看</button></td>
+                <td><button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopViewOrder('${o.id}')">查看详情</button></td>
               </tr>
             `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
           </tbody>
@@ -2340,7 +2430,6 @@ async function renderClaudeShop(container) {
       </div>
     </div>
   `;
-  claudeShopPriceRefresh();
 }
 
 // ─── Claude 店铺（管理员）────────────────────────────────────
@@ -2363,7 +2452,7 @@ window.saveAdminShopConfig = async function() {
     await api.admin.shopPutConfig(body);
     toast('已保存', 'success');
     await refreshClaudeShopNav();
-    navigate('admin-claude-shop');
+    navigate('admin-shop-settings');
   } catch (e) {
     toast(e.message || '保存失败', 'error');
   }
@@ -2391,7 +2480,7 @@ window.uploadShopQR = async function() {
       ? res.updated.map(v => v === 'wechat' ? '微信' : (v === 'alipay' ? '支付宝' : v)).join('、')
       : '收款码';
     toast(`${updated} 收款码已更新`, 'success');
-    navigate('admin-claude-shop');
+    navigate('admin-shop-settings');
   } catch (e) {
     toast(e.message || '上传失败', 'error');
   }
@@ -2436,7 +2525,7 @@ window.runShopImport = async function() {
     let msg = `识别 ${recognized} 条，导入成功 ${r.inserted} 条`;
     if (skipped > 0) msg += `，跳过 ${skipped} 条`;
     toast(msg, skipped > 0 ? 'warn' : 'success');
-    navigate('admin-claude-shop');
+    navigate('admin-shop-inventory');
   } catch (e) {
     toast(e.message || '导入失败', 'error');
   }
@@ -2447,7 +2536,7 @@ window.confirmShopOrderPaid = function(id) {
     try {
       await api.admin.shopConfirmOrder(id);
       toast('已确认并发货', 'success');
-      navigate('admin-claude-shop');
+      navigate('admin-shop-orders');
     } catch (e) {
       toast(e.message || '操作失败', 'error');
     }
@@ -2457,12 +2546,12 @@ window.confirmShopOrderPaid = function(id) {
 window.adminShopInventorySetStatus = function(status) {
   state.adminShopInventoryStatus = status || 'all';
   state.adminShopInventoryPage = 1;
-  navigate('admin-claude-shop');
+  navigate('admin-shop-inventory');
 };
 
 window.adminShopInventoryGoPage = function(page) {
   state.adminShopInventoryPage = Math.max(1, parseInt(page, 10) || 1);
-  navigate('admin-claude-shop');
+  navigate('admin-shop-inventory');
 };
 
 window.deleteShopInventory = function(id, label) {
@@ -2474,43 +2563,79 @@ window.deleteShopInventory = function(id, label) {
         state.adminShopInventoryPage -= 1;
       }
       toast('货物已删除', 'success');
-      navigate('admin-claude-shop');
+      navigate('admin-shop-inventory');
     } catch (e) {
       toast(e.message || '删除失败', 'error');
     }
   });
 };
 
-async function renderAdminClaudeShop(container) {
-  const actions = $('topbar-actions');
-  if (actions) actions.innerHTML = '';
-  const inventoryPage = state.adminShopInventoryPage || 1;
-  const inventoryStatus = state.adminShopInventoryStatus || 'all';
-  const [cfg, pending, inventoryRes] = await Promise.all([
-    api.admin.shopGetConfig(),
-    api.admin.shopListOrders('awaiting_payment', 1, 50).catch(() => ({ data: [] })),
-    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30).catch(() => ({
-      data: [],
-      total: 0,
-      page: inventoryPage,
-      size: 30,
-      summary: {
-        total: 0,
-        available: 0,
-        sold: 0,
-      },
-    })),
-  ]);
-  const pendRows = pending.data || [];
-  const inventoryRows = inventoryRes.data || [];
-  const inventoryTotal = inventoryRes.total ?? 0;
-  const inventorySize = inventoryRes.size || 30;
-  const inventoryMaxPage = Math.max(1, Math.ceil(inventoryTotal / inventorySize) || 1);
-  const inventorySummary = inventoryRes.summary || {};
-  const totalStock = inventorySummary.total ?? cfg.stock_total ?? ((cfg.stock_available ?? 0) + (cfg.stock_sold ?? 0));
-  const availableStock = inventorySummary.available ?? cfg.stock_available ?? 0;
-  const soldStock = inventorySummary.sold ?? cfg.stock_sold ?? 0;
+window.adminShopOrdersSetStatus = function(status) {
+  state.adminShopOrdersStatus = status === 'all' ? '' : (status || '');
+  state.adminShopOrdersPage = 1;
+  navigate('admin-shop-orders');
+};
 
+window.adminShopOrdersGoPage = function(page) {
+  state.adminShopOrdersPage = Math.max(1, parseInt(page, 10) || 1);
+  navigate('admin-shop-orders');
+};
+
+window.showAdminShopOrderDetail = async function(id) {
+  try {
+    const d = await api.admin.shopGetOrderAdmin(id);
+    const o = d.order;
+    const stLabel = o.status === 'fulfilled' ? '已发货' : (o.status === 'awaiting_payment' ? '待确认收款' : o.status);
+    let body = `<p style="font-size:0.85rem"><strong>状态</strong> ${stLabel}</p>`;
+    body += `<p style="font-size:0.85rem"><strong>买家账号</strong> <code style="font-size:0.78rem">${escHtml(o.account_id)}</code></p>`;
+    body += `<p style="font-size:0.85rem"><strong>数量</strong> ${o.quantity} · <strong>应付</strong> ¥${(o.total_cents / 100).toFixed(2)}</p>`;
+    if ((o.lines || []).length) {
+      body += `<p class="form-label" style="margin-top:0.85rem">已发货账号</p>`;
+      body += (o.lines || []).map(ln => {
+        const em = String(ln.email || '');
+        const ky = String(ln.api_key || '');
+        return `<div class="shop-credential-card" style="margin-top:0.5rem">
+          <span class="shop-credential-label">邮箱</span>
+          <div class="shop-credential-value-row">
+            <span class="shop-credential-value" dir="ltr">${escHtml(em)}</span>
+            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(em)})'>复制</button>
+          </div>
+          <span class="shop-credential-label" style="margin-top:0.75rem;display:block">登录 Key</span>
+          <div class="shop-credential-value-row">
+            <span class="shop-credential-value" dir="ltr">${escHtml(ky)}</span>
+            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(ky)})'>复制</button>
+          </div>
+        </div>`;
+      }).join('');
+    } else {
+      body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-top:0.65rem">暂无发货明细（订单待确认或未扣库存发货）。</p>`;
+    }
+    document.querySelector('.admin-shop-detail-overlay')?.remove();
+    const overlay = el('div', 'modal-overlay admin-shop-detail-overlay');
+    overlay.innerHTML = `
+      <div class="modal" style="max-width:580px">
+        <div class="modal-title">订单详情</div>
+        <button type="button" class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
+        <div style="font-size:0.76rem;color:var(--text-muted);margin-bottom:0.65rem;font-family:var(--font-mono);word-break:break-all">#${escHtml(o.id)}</div>
+        ${body}
+        <div class="modal-actions" style="margin-top:1rem;justify-content:flex-end">
+          <button type="button" class="btn btn-primary" onclick="this.closest('.modal-overlay').remove()">关闭</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+  } catch (e) {
+    toast(e.message || '加载失败', 'error');
+  }
+};
+
+async function renderAdminShopSettings(container) {
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
+  }
+  const cfg = await api.admin.shopGetConfig();
   container.innerHTML = `
     <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
       <div class="card">
@@ -2567,6 +2692,43 @@ async function renderAdminClaudeShop(container) {
           <button type="button" class="btn btn-success btn-sm" onclick="uploadShopQR()">上传所选图片</button>
         </div>
       </div>
+    </div>
+  `;
+}
+
+async function renderAdminShopInventory(container) {
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-settings')">商品与收款</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
+  }
+  const inventoryPage = state.adminShopInventoryPage || 1;
+  const inventoryStatus = state.adminShopInventoryStatus || 'all';
+  const [cfg, inventoryRes] = await Promise.all([
+    api.admin.shopGetConfig(),
+    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30).catch(() => ({
+      data: [],
+      total: 0,
+      page: inventoryPage,
+      size: 30,
+      summary: {
+        total: 0,
+        available: 0,
+        sold: 0,
+      },
+    })),
+  ]);
+  const inventoryRows = inventoryRes.data || [];
+  const inventoryTotal = inventoryRes.total ?? 0;
+  const inventorySize = inventoryRes.size || 30;
+  const inventoryMaxPage = Math.max(1, Math.ceil(inventoryTotal / inventorySize) || 1);
+  const inventorySummary = inventoryRes.summary || {};
+  const totalStock = inventorySummary.total ?? cfg.stock_total ?? ((cfg.stock_available ?? 0) + (cfg.stock_sold ?? 0));
+  const availableStock = inventorySummary.available ?? cfg.stock_available ?? 0;
+  const soldStock = inventorySummary.sold ?? cfg.stock_sold ?? 0;
+
+  container.innerHTML = `
+    <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
       <div class="card">
         <div class="card-header"><div class="card-title">导入库存</div></div>
         <div class="card-body">
@@ -2632,32 +2794,79 @@ async function renderAdminClaudeShop(container) {
           </div>
         </div>
       </div>
+    </div>
+  `;
+  updateShopImportStats($('shop-import-ta')?.value || '');
+}
+
+async function renderAdminShopOrders(container) {
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-settings')">商品与收款</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>`;
+  }
+  const status = state.adminShopOrdersStatus || '';
+  const page = state.adminShopOrdersPage || 1;
+  const size = 25;
+  const res = await api.admin.shopListOrders(status, page, size).catch(() => ({ data: [], total: 0, page: 1, size }));
+  const rows = res.data || [];
+  const total = res.total ?? 0;
+  const maxPage = Math.max(1, Math.ceil(total / size) || 1);
+  const statusSel = !status ? 'all' : status;
+
+  container.innerHTML = `
+    <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
       <div class="card">
-        <div class="card-header">
-          <div class="card-title">待确认收款订单</div>
-          <div style="font-size:0.75rem;color:var(--text-muted)">核对到账后点击确认，将自动发货</div>
+        <div class="card-header" style="align-items:flex-start;flex-wrap:wrap;gap:0.75rem">
+          <div>
+            <div class="card-title">订单列表</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">筛选后可查看详情；待确认订单可在此确认收款并发货</div>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center;flex-wrap:wrap">
+            <span style="font-size:0.78rem;color:var(--text-muted)">状态</span>
+            <select class="form-input" style="min-width:160px" onchange="adminShopOrdersSetStatus(this.value)">
+              <option value="all" ${statusSel === 'all' ? 'selected' : ''}>全部</option>
+              <option value="awaiting_payment" ${statusSel === 'awaiting_payment' ? 'selected' : ''}>待确认收款</option>
+              <option value="fulfilled" ${statusSel === 'fulfilled' ? 'selected' : ''}>已发货</option>
+            </select>
+          </div>
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>订单号</th><th>买家账号ID</th><th>数量</th><th>应付</th><th>时间</th><th></th></tr></thead>
+            <thead><tr><th>订单号</th><th>买家账号ID</th><th>数量</th><th>应付</th><th>状态</th><th>时间</th><th></th></tr></thead>
             <tbody>
-              ${pendRows.length ? pendRows.map(o => `
+              ${rows.length ? rows.map(o => {
+                const st = o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : '<span class="badge badge-gray">待确认</span>';
+                const confirmBtn = o.status === 'awaiting_payment'
+                  ? `<button type="button" class="btn btn-success btn-sm" onclick='confirmShopOrderPaid("${o.id}")'>确认发货</button>`
+                  : '';
+                return `
                 <tr>
-                  <td style="font-size:0.72rem;font-family:var(--font-mono)">${escHtml(o.id)}</td>
-                  <td style="font-size:0.72rem;font-family:var(--font-mono)">${escHtml(o.account_id)}</td>
+                  <td style="font-size:0.7rem;font-family:var(--font-mono);max-width:120px;word-break:break-all">${escHtml(o.id)}</td>
+                  <td style="font-size:0.7rem;font-family:var(--font-mono);max-width:100px;word-break:break-all">${escHtml(o.account_id)}</td>
                   <td>${o.quantity}</td>
                   <td>¥${(o.total_cents / 100).toFixed(2)}</td>
+                  <td>${st}</td>
                   <td style="font-size:0.78rem">${formatDate(o.created_at)}</td>
-                  <td><button type="button" class="btn btn-success btn-sm" onclick='confirmShopOrderPaid("${o.id}")'>确认收款并发货</button></td>
-                </tr>
-              `).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1rem">暂无待处理订单</td></tr>'}
+                  <td style="display:flex;flex-wrap:wrap;gap:0.35rem">
+                    <button type="button" class="btn btn-ghost btn-sm" onclick='showAdminShopOrderDetail("${o.id}")'>详情</button>
+                    ${confirmBtn}
+                  </td>
+                </tr>`;
+              }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
             </tbody>
           </table>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;justify-content:space-between;margin-top:1rem;flex-wrap:wrap">
+          <div style="font-size:0.82rem;color:var(--text-muted)">共 ${total} 条 · 第 ${page} / ${maxPage} 页</div>
+          <div style="display:flex;gap:0.5rem;align-items:center">
+            <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminShopOrdersGoPage(${page - 1})">上一页</button>
+            <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminShopOrdersGoPage(${page + 1})">下一页</button>
+          </div>
         </div>
       </div>
     </div>
   `;
-  updateShopImportStats($('shop-import-ta')?.value || '');
 }
 
 // ─── 启动 ──────────────────────────────────────────────────

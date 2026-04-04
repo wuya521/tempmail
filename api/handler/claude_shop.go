@@ -452,6 +452,25 @@ func (h *ClaudeShopHandler) AdminListOrders(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": list, "total": total, "page": page, "size": size})
 }
 
+// GET /api/admin/shop/orders/:id 管理端订单详情（含发货后的 lines）
+func (h *ClaudeShopHandler) AdminGetOrder(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid order id"})
+		return
+	}
+	o, err := h.store.GetClaudeOrderByID(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "order not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"order": o})
+}
+
 // POST /api/admin/shop/orders/:id/confirm
 func (h *ClaudeShopHandler) AdminConfirmOrder(c *gin.Context) {
 	id, err := parseUUID(c.Param("id"))

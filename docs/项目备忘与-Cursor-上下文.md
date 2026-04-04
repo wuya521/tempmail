@@ -19,7 +19,7 @@ nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
 数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（如 migrate_v5 含 Claude 店铺与 accounts.last_seen_at）。
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。
-业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过、人工确认收款发货）；店铺配置仅管理员。
+业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过、人工确认收款发货）；管理员侧店铺拆为「商品与收款」「库存与货物」「订单与发货」三页；用户侧「自助 Claude 账号」与「我的订单」分栏；购物流程为弹窗扫码→勾选确认→关闭弹窗并 POST 生成订单；GET /api/admin/shop/orders/:id 供管理端订单详情。
 用户偏好：回复简体中文；代码改动聚焦需求；推送 GitHub 时若 HTTPS 失败可用 git -c http.proxy= -c https.proxy= push 或改用 SSH。
 ```
 

@@ -141,6 +141,7 @@ func main() {
 			admin.GET("/shop/inventory", shopH.AdminListInventory)
 			admin.DELETE("/shop/inventory/:id", shopH.AdminDeleteInventory)
 			admin.GET("/shop/orders", shopH.AdminListOrders)
+			admin.GET("/shop/orders/:id", shopH.AdminGetOrder)
 			admin.POST("/shop/orders/:id/confirm", shopH.AdminConfirmOrder)
 
 			admin.POST("/domains", domainH.Add)

@@ -1016,6 +1016,92 @@ tr:hover td { background: rgba(184,92,56,0.04); }
   }
 }
 
+/* 自助购号 — 商品区 / 结算区 / 支付弹窗 */
+.shop-product-panel {
+  padding: 0.15rem 0 1rem;
+  border-bottom: 1px solid var(--border-light);
+  margin-bottom: 1.25rem;
+}
+.shop-checkout-panel {
+  padding-top: 0.25rem;
+}
+.shop-checkout-total-line {
+  font-size: 1.2rem;
+  font-weight: 800;
+  color: var(--clr-primary);
+  margin: 0.5rem 0 1rem;
+}
+.shop-checkout-hint {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin-top: 0.55rem;
+  line-height: 1.45;
+}
+.shop-pay-modal .modal-title {
+  margin-bottom: 0.5rem;
+}
+.shop-pay-modal-amount {
+  font-size: 1.15rem;
+  margin: 0.35rem 0 0.65rem;
+}
+.shop-pay-modal-amount strong {
+  color: var(--clr-primary);
+  font-size: 1.35rem;
+  font-weight: 800;
+}
+.shop-pay-modal .shop-qr-row {
+  justify-content: center;
+  margin: 0.75rem 0;
+}
+
+/* 发货凭证 — 大号醒目 */
+.shop-deliver-banner {
+  background: rgba(39, 174, 96, 0.14);
+  border: 1px solid rgba(39, 174, 96, 0.35);
+  padding: 0.75rem 1rem;
+  border-radius: var(--radius-sm);
+  font-size: 0.88rem;
+  font-weight: 600;
+  margin-bottom: 1rem;
+  line-height: 1.5;
+}
+.shop-credential-card {
+  background: var(--bg-secondary);
+  border: 2px solid rgba(184, 92, 56, 0.35);
+  border-radius: var(--radius);
+  padding: 1rem 1.15rem;
+  margin-top: 0.85rem;
+}
+.shop-credential-label {
+  display: block;
+  font-size: 0.82rem;
+  font-weight: 700;
+  color: var(--clr-primary);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  margin-bottom: 0.45rem;
+}
+.shop-credential-value-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.shop-credential-value {
+  flex: 1;
+  min-width: 0;
+  font-size: clamp(1.05rem, 2.8vw, 1.35rem);
+  font-weight: 800;
+  font-family: var(--font-mono, ui-monospace, monospace);
+  color: var(--text-primary);
+  line-height: 1.35;
+  word-break: break-all;
+}
+.shop-credential-copy {
+  flex-shrink: 0;
+  font-weight: 600;
+}
+
 /* 装饰纹路 (国风) */
 .grain-bg {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='4' height='4'%3E%3Crect width='1' height='1' fill='%23000' opacity='.03'/%3E%3C/svg%3E");

@@ -138,6 +138,8 @@ func main() {
 			admin.PUT("/shop/config", shopH.AdminPutConfig)
 			admin.POST("/shop/qrcodes", shopH.AdminUploadQR)
 			admin.POST("/shop/inventory/import", shopH.AdminImportInventory)
+			admin.GET("/shop/inventory", shopH.AdminListInventory)
+			admin.DELETE("/shop/inventory/:id", shopH.AdminDeleteInventory)
 			admin.GET("/shop/orders", shopH.AdminListOrders)
 			admin.POST("/shop/orders/:id/confirm", shopH.AdminConfirmOrder)
 

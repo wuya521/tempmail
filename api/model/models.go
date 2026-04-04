@@ -39,6 +39,21 @@ type ClaudeOrderLine struct {
 	APIKey    string `json:"api_key"`
 }
 
+type ClaudeInventoryItem struct {
+	ID        uuid.UUID  `json:"id"`
+	Email     string     `json:"email"`
+	APIKey    string     `json:"api_key"`
+	Status    string     `json:"status"`
+	OrderID   *uuid.UUID `json:"order_id,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+type ClaudeInventorySummary struct {
+	Total     int `json:"total"`
+	Available int `json:"available"`
+	Sold      int `json:"sold"`
+}
+
 type Domain struct {
 	ID           int        `json:"id"`
 	Domain       string     `json:"domain"`

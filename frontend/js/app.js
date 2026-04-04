@@ -18,6 +18,8 @@ const state = {
   claudeShopEnabled: false,
   adminAccountsPage: 1,
   adminAccountsQ: '',
+  adminShopInventoryPage: 1,
+  adminShopInventoryStatus: 'all',
   claudeHighlightOrderId: null,
   _claudeShopSummary: null,
   /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
@@ -78,6 +80,174 @@ async function copyText(text) {
 }
 
 // ─── API 客户端 ─────────────────────────────────────────────
+const INVENTORY_SPLIT_TOKENS = ['####', '----', '===='];
+const INVENTORY_QR_EXTS = ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.jfif'];
+const INVENTORY_HEADER_EMAIL_TOKENS = ['邮箱账号', '邮箱', '邮箱地址', 'email', 'mail', 'mailbox', 'account'];
+const INVENTORY_HEADER_KEY_TOKENS = ['邮箱apikey', 'apikey', 'api_key', 'api key', 'key', '登录key', '登录密钥', '密钥', 'token'];
+
+function looksLikeInventoryEmail(value) {
+  const s = String(value || '').trim();
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(s);
+}
+
+function classifyInventoryEmailKey(a, b) {
+  const left = String(a || '').trim();
+  const right = String(b || '').trim();
+  const leftEmail = looksLikeInventoryEmail(left);
+  const rightEmail = looksLikeInventoryEmail(right);
+  if (leftEmail && !rightEmail) return { email: left, apiKey: right, ok: true };
+  if (rightEmail && !leftEmail) return { email: right, apiKey: left, ok: true };
+  if (left.includes('@') && !right.includes('@')) return { email: left, apiKey: right, ok: true };
+  if (right.includes('@') && !left.includes('@')) return { email: right, apiKey: left, ok: true };
+  return { email: '', apiKey: '', ok: false };
+}
+
+function parseSimpleCSVLine(line) {
+  const out = [];
+  let buf = '';
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        buf += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+    if (ch === ',' && !inQuotes) {
+      out.push(buf);
+      buf = '';
+      continue;
+    }
+    buf += ch;
+  }
+  out.push(buf);
+  return out;
+}
+
+function normalizeInventoryHeaderToken(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^["']|["']$/g, '')
+    .replace(/[\s_\-\u3000]+/g, '')
+    .toLowerCase();
+}
+
+function firstTwoNonEmptyInventoryFields(fields) {
+  const out = [];
+  for (const field of fields || []) {
+    if (!normalizeInventoryHeaderToken(field)) continue;
+    out.push(String(field || '').trim().replace(/^["']|["']$/g, ''));
+    if (out.length === 2) break;
+  }
+  return out;
+}
+
+function containsAnyInventoryToken(value, tokens) {
+  const normalized = normalizeInventoryHeaderToken(value);
+  return tokens.some(token => normalized === normalizeInventoryHeaderToken(token));
+}
+
+function isInventoryHeaderLine(line) {
+  let cells = firstTwoNonEmptyInventoryFields(String(line || '').split('\t'));
+  if (cells.length < 2) {
+    cells = firstTwoNonEmptyInventoryFields(parseSimpleCSVLine(String(line || '')));
+  }
+  if (cells.length < 2) return false;
+  const [a, b] = cells;
+  return (
+    containsAnyInventoryToken(a, INVENTORY_HEADER_EMAIL_TOKENS) &&
+    containsAnyInventoryToken(b, INVENTORY_HEADER_KEY_TOKENS)
+  ) || (
+    containsAnyInventoryToken(b, INVENTORY_HEADER_EMAIL_TOKENS) &&
+    containsAnyInventoryToken(a, INVENTORY_HEADER_KEY_TOKENS)
+  );
+}
+
+function splitInventoryLineLocal(line) {
+  for (const token of INVENTORY_SPLIT_TOKENS) {
+    if (!line.includes(token)) continue;
+    const idx = line.indexOf(token);
+    return classifyInventoryEmailKey(line.slice(0, idx), line.slice(idx + token.length));
+  }
+  if (line.includes('\t')) {
+    const rec = firstTwoNonEmptyInventoryFields(line.split('\t'));
+    if (rec.length >= 2) return classifyInventoryEmailKey(rec[0], rec[1]);
+  }
+  const rec = firstTwoNonEmptyInventoryFields(parseSimpleCSVLine(line));
+  if (rec.length < 2) return { email: '', apiKey: '', ok: false };
+  return classifyInventoryEmailKey(rec[0], rec[1]);
+}
+
+function parseInventoryImportLocal(raw) {
+  const pairs = [];
+  const warnings = [];
+  const seen = new Set();
+  const lines = String(raw || '').replace(/\r\n/g, '\n').replace(/^\uFEFF/, '').split('\n');
+  lines.forEach((rawLine, idx) => {
+    const lineNo = idx + 1;
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) return;
+    if (isInventoryHeaderLine(line)) return;
+    const { email, apiKey, ok } = splitInventoryLineLocal(line);
+    if (!ok) {
+      warnings.push(`第 ${lineNo} 行：无法识别格式`);
+      return;
+    }
+    if (!email || !apiKey) {
+      warnings.push(`第 ${lineNo} 行：邮箱或 Key 为空`);
+      return;
+    }
+    if (email.length > 320) {
+      warnings.push(`第 ${lineNo} 行：邮箱长度超过 320`);
+      return;
+    }
+    if (apiKey.length > 128) {
+      warnings.push(`第 ${lineNo} 行：Key 长度超过 128`);
+      return;
+    }
+    const dedupeKey = `${email.toLowerCase()}\u0000${apiKey}`;
+    if (seen.has(dedupeKey)) {
+      warnings.push(`第 ${lineNo} 行：重复数据已跳过`);
+      return;
+    }
+    seen.add(dedupeKey);
+    pairs.push({ email, apiKey });
+  });
+  return { pairs, warnings };
+}
+
+function updateShopImportStats(raw = '', sourceLabel = '') {
+  const box = $('shop-import-stats');
+  const parsed = parseInventoryImportLocal(raw);
+  if (!box) return parsed;
+  const parts = [];
+  if (sourceLabel) parts.push(`来源：${escHtml(sourceLabel)}`);
+  parts.push(`识别到 <strong>${parsed.pairs.length}</strong> 条`);
+  parts.push(`跳过 <strong>${parsed.warnings.length}</strong> 条`);
+  const warningsHtml = parsed.warnings.length
+    ? `<div style="margin-top:0.35rem;color:var(--clr-warn)">${escHtml(parsed.warnings.slice(0, 3).join('；'))}${parsed.warnings.length > 3 ? ' ...' : ''}</div>`
+    : '';
+  box.innerHTML = `<div>${parts.join(' · ')}</div>${warningsHtml}`;
+  return parsed;
+}
+
+function validateShopQRFile(file) {
+  if (!file) return null;
+  const name = String(file.name || '');
+  const ext = name.includes('.') ? `.${name.split('.').pop().toLowerCase()}` : '';
+  if (!INVENTORY_QR_EXTS.includes(ext)) {
+    return '仅支持 png / jpg / jpeg / webp / gif / bmp / jfif';
+  }
+  if (file.size > (8 << 20)) {
+    return '单张图片不能超过 8MB';
+  }
+  return null;
+}
+
 async function apiFetch(path, opts = {}) {
   const headers = { 'Content-Type': 'application/json', ...(opts.headers || {}) };
   if (state.apiKey) headers['Authorization'] = `Bearer ${state.apiKey}`;
@@ -151,6 +321,12 @@ const api = {
       if (!res.ok) throw new Error(data.error || '上传失败');
       return data;
     }),
+    shopListInventory: (status='all', page=1, size=30) => {
+      let u = API_BASE + '/admin/shop/inventory?page=' + page + '&size=' + size;
+      if (status && status !== 'all') u += '&status=' + encodeURIComponent(status);
+      return apiFetch(u);
+    },
+    shopDeleteInventory: id => apiFetch(API_BASE + '/admin/shop/inventory/' + id, { method: 'DELETE' }),
     shopListOrders: (status='', page=1, size=20) => {
       let u = API_BASE + '/admin/shop/orders?page='+page+'&size='+size;
       if (status) u += '&status=' + encodeURIComponent(status);
@@ -2142,18 +2318,48 @@ window.uploadShopQR = async function() {
   const fd = new FormData();
   const w = $('shop-qr-wechat')?.files?.[0];
   const a = $('shop-qr-alipay')?.files?.[0];
+  const wErr = validateShopQRFile(w);
+  const aErr = validateShopQRFile(a);
   if (w) fd.append('wechat', w);
   if (a) fd.append('alipay', a);
   if (!w && !a) {
     toast('请选择至少一张图片', 'warn');
     return;
   }
+  if (wErr || aErr) {
+    toast(wErr || aErr, 'warn');
+    return;
+  }
   try {
-    await api.admin.shopUploadQR(fd);
-    toast('收款码已更新', 'success');
+    const res = await api.admin.shopUploadQR(fd);
+    const updated = Array.isArray(res.updated) && res.updated.length
+      ? res.updated.map(v => v === 'wechat' ? '微信' : (v === 'alipay' ? '支付宝' : v)).join('、')
+      : '收款码';
+    toast(`${updated} 收款码已更新`, 'success');
     navigate('admin-claude-shop');
   } catch (e) {
     toast(e.message || '上传失败', 'error');
+  }
+};
+
+window.handleShopImportInput = function() {
+  updateShopImportStats($('shop-import-ta')?.value || '');
+};
+
+window.loadShopImportFile = async function() {
+  const file = $('shop-import-file')?.files?.[0];
+  if (!file) {
+    updateShopImportStats($('shop-import-ta')?.value || '');
+    return;
+  }
+  try {
+    const text = await file.text();
+    const ta = $('shop-import-ta');
+    if (ta) ta.value = text;
+    updateShopImportStats(text, file.name);
+    toast(`已载入 ${file.name}`, 'success');
+  } catch (e) {
+    toast(e.message || '读取文件失败', 'error');
   }
 };
 
@@ -2163,11 +2369,18 @@ window.runShopImport = async function() {
     toast('请粘贴 .txt / .csv 内容', 'warn');
     return;
   }
+  const preview = updateShopImportStats(t);
+  if (!preview.pairs.length) {
+    toast('未识别到可导入数据', 'warn');
+    return;
+  }
   try {
     const r = await api.admin.shopImportInventory(t);
-    let msg = `成功导入 ${r.inserted} 条`;
-    if (r.warnings && r.warnings.length) msg += `（${r.warnings.length} 行跳过）`;
-    toast(msg, 'success');
+    const recognized = Number.isFinite(r.recognized) ? r.recognized : preview.pairs.length;
+    const skipped = Number.isFinite(r.skipped) ? r.skipped : ((r.warnings || []).length);
+    let msg = `识别 ${recognized} 条，导入成功 ${r.inserted} 条`;
+    if (skipped > 0) msg += `，跳过 ${skipped} 条`;
+    toast(msg, skipped > 0 ? 'warn' : 'success');
     navigate('admin-claude-shop');
   } catch (e) {
     toast(e.message || '导入失败', 'error');
@@ -2186,15 +2399,65 @@ window.confirmShopOrderPaid = function(id) {
   });
 };
 
+window.adminShopInventorySetStatus = function(status) {
+  state.adminShopInventoryStatus = status || 'all';
+  state.adminShopInventoryPage = 1;
+  navigate('admin-claude-shop');
+};
+
+window.adminShopInventoryGoPage = function(page) {
+  state.adminShopInventoryPage = Math.max(1, parseInt(page, 10) || 1);
+  navigate('admin-claude-shop');
+};
+
+window.deleteShopInventory = function(id, label) {
+  showModal('删除货物', `<p>确定删除货物 <strong>${escHtml(label || id)}</strong> 吗？已售出的记录也会从库存列表移除，但不会影响已发货订单内容。</p>`, async () => {
+    try {
+      await api.admin.shopDeleteInventory(id);
+      const rows = document.querySelectorAll('[data-shop-inventory-row]').length;
+      if (rows <= 1 && (state.adminShopInventoryPage || 1) > 1) {
+        state.adminShopInventoryPage -= 1;
+      }
+      toast('货物已删除', 'success');
+      navigate('admin-claude-shop');
+    } catch (e) {
+      toast(e.message || '删除失败', 'error');
+    }
+  });
+};
+
 async function renderAdminClaudeShop(container) {
   const actions = $('topbar-actions');
   if (actions) actions.innerHTML = '';
-  const cfg = await api.admin.shopGetConfig();
-  const pending = await api.admin.shopListOrders('awaiting_payment', 1, 50).catch(() => ({ data: [] }));
+  const inventoryPage = state.adminShopInventoryPage || 1;
+  const inventoryStatus = state.adminShopInventoryStatus || 'all';
+  const [cfg, pending, inventoryRes] = await Promise.all([
+    api.admin.shopGetConfig(),
+    api.admin.shopListOrders('awaiting_payment', 1, 50).catch(() => ({ data: [] })),
+    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30).catch(() => ({
+      data: [],
+      total: 0,
+      page: inventoryPage,
+      size: 30,
+      summary: {
+        total: 0,
+        available: 0,
+        sold: 0,
+      },
+    })),
+  ]);
   const pendRows = pending.data || [];
+  const inventoryRows = inventoryRes.data || [];
+  const inventoryTotal = inventoryRes.total ?? 0;
+  const inventorySize = inventoryRes.size || 30;
+  const inventoryMaxPage = Math.max(1, Math.ceil(inventoryTotal / inventorySize) || 1);
+  const inventorySummary = inventoryRes.summary || {};
+  const totalStock = inventorySummary.total ?? cfg.stock_total ?? ((cfg.stock_available ?? 0) + (cfg.stock_sold ?? 0));
+  const availableStock = inventorySummary.available ?? cfg.stock_available ?? 0;
+  const soldStock = inventorySummary.sold ?? cfg.stock_sold ?? 0;
 
   container.innerHTML = `
-    <div style="max-width:820px;display:flex;flex-direction:column;gap:1rem">
+    <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
       <div class="card">
         <div class="card-header"><div class="card-title">店铺开关与文案</div></div>
         <div class="card-body">
@@ -2239,7 +2502,7 @@ async function renderAdminClaudeShop(container) {
       <div class="card">
         <div class="card-header"><div class="card-title">收款二维码（原图存储，前端自适应显示）</div></div>
         <div class="card-body">
-          <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.6rem">支持 png / jpg / webp / gif，单张最大 8MB。</p>
+          <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.6rem">支持 png / jpg / jpeg / webp / gif / bmp / jfif，单张最大 8MB。</p>
           <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.8rem">
             ${cfg.wechat_qr_url ? `<div><div class="form-hint">当前微信</div><img class="shop-qr-img" src="${escHtml(cfg.wechat_qr_url)}" alt="" /></div>` : ''}
             ${cfg.alipay_qr_url ? `<div><div class="form-hint">当前支付宝</div><img class="shop-qr-img" src="${escHtml(cfg.alipay_qr_url)}" alt="" /></div>` : ''}
@@ -2253,11 +2516,65 @@ async function renderAdminClaudeShop(container) {
         <div class="card-header"><div class="card-title">导入库存</div></div>
         <div class="card-body">
           <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.55;margin-bottom:0.5rem">
-            每行一件：<code>邮箱####登录key</code>、<code>----</code> 或 <code>====</code> 分隔；也支持 CSV 两列（自动识别含 @ 的为邮箱）。
+            每行一件：<code>邮箱####登录key</code>、<code>----</code> 或 <code>====</code> 分隔；也支持 CSV 两列（自动识别邮箱列）。
           </p>
-          <textarea class="form-input" id="shop-import-ta" rows="8" style="resize:vertical;font-family:var(--font-mono);font-size:0.78rem" placeholder="user@mail.com####tm_xxx"></textarea>
-          <button type="button" class="btn btn-primary btn-sm" style="margin-top:0.5rem" onclick="runShopImport()">导入到待售池</button>
-          <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.45rem">当前可售库存：<strong>${cfg.stock_available ?? 0}</strong> 件</p>
+          <div class="form-group">
+            <label class="form-label">文件导入</label>
+            <input type="file" id="shop-import-file" accept=".txt,.csv,text/plain,text/csv" onchange="loadShopImportFile()" />
+            <div class="form-hint">支持 txt / csv，载入后会自动统计识别条数</div>
+          </div>
+          <textarea class="form-input" id="shop-import-ta" rows="8" style="resize:vertical;font-family:var(--font-mono);font-size:0.78rem" placeholder="user@mail.com####tm_xxx" oninput="handleShopImportInput()"></textarea>
+          <div id="shop-import-stats" class="form-hint" style="margin-top:0.5rem"></div>
+          <div style="display:flex;flex-wrap:wrap;gap:0.6rem;align-items:center;margin-top:0.6rem">
+            <button type="button" class="btn btn-primary btn-sm" onclick="runShopImport()">导入到待售池</button>
+            <span style="font-size:0.75rem;color:var(--text-muted)">当前可售库存：<strong>${availableStock}</strong> 件 / 已售 <strong>${soldStock}</strong> 件 / 总计 <strong>${totalStock}</strong> 件</span>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">货物列表</div>
+            <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">30 条/页，可查看售出状态并删除货物卡券</div>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center">
+            <span style="font-size:0.78rem;color:var(--text-muted)">状态</span>
+            <select class="form-input" style="min-width:140px" onchange="adminShopInventorySetStatus(this.value)">
+              <option value="all" ${inventoryStatus === 'all' ? 'selected' : ''}>全部</option>
+              <option value="available" ${inventoryStatus === 'available' ? 'selected' : ''}>未售出</option>
+              <option value="sold" ${inventoryStatus === 'sold' ? 'selected' : ''}>已售出</option>
+            </select>
+          </div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>邮箱 / Key</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
+            <tbody>
+              ${inventoryRows.length ? inventoryRows.map(item => {
+                const emailJs = JSON.stringify(item.email || '');
+                const keyJs = JSON.stringify(item.api_key || '');
+                const labelJs = JSON.stringify(item.email || item.id || '');
+                return `
+                <tr data-shop-inventory-row>
+                  <td>
+                    <div class="code-box" style="font-size:0.72rem"><span>${escHtml(item.email || '')}</span><button type="button" class="copy-btn" onclick='copyText(${emailJs})'>⧉</button></div>
+                    <div class="code-box" style="margin-top:0.35rem;font-size:0.72rem"><span>${escHtml(item.api_key || '')}</span><button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⧉</button></div>
+                  </td>
+                  <td>${item.status === 'sold' ? '<span class="badge badge-gray">已售出</span>' : '<span class="badge badge-green">待售</span>'}</td>
+                  <td style="font-size:0.72rem;font-family:var(--font-mono)">${item.order_id ? escHtml(item.order_id) : '<span style="color:var(--text-muted)">—</span>'}</td>
+                  <td style="font-size:0.78rem">${formatDate(item.created_at)}</td>
+                  <td><button type="button" class="btn btn-danger btn-sm" onclick='deleteShopInventory("${item.id}", ${labelJs})'>删除</button></td>
+                </tr>`;
+              }).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无货物</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;justify-content:space-between;margin-top:1rem;flex-wrap:wrap">
+          <div style="font-size:0.82rem;color:var(--text-muted)">共 ${inventoryTotal} 条 · 第 ${inventoryPage} / ${inventoryMaxPage} 页</div>
+          <div style="display:flex;gap:0.5rem;align-items:center">
+            <button class="btn btn-ghost btn-sm" ${inventoryPage <= 1 ? 'disabled' : ''} onclick="adminShopInventoryGoPage(${inventoryPage - 1})">上一页</button>
+            <button class="btn btn-ghost btn-sm" ${inventoryPage >= inventoryMaxPage ? 'disabled' : ''} onclick="adminShopInventoryGoPage(${inventoryPage + 1})">下一页</button>
+          </div>
         </div>
       </div>
       <div class="card">
@@ -2285,6 +2602,7 @@ async function renderAdminClaudeShop(container) {
       </div>
     </div>
   `;
+  updateShopImportStats($('shop-import-ta')?.value || '');
 }
 
 // ─── 启动 ──────────────────────────────────────────────────

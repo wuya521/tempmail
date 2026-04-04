@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/csv"
 	"fmt"
+	"regexp"
 	"strings"
 
 	"tempmail/model"
@@ -11,6 +12,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 )
+
+var inventoryEmailRe = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 
 // ClaudeShopConfig 店铺配置（单行 id=1）
 type ClaudeShopConfig struct {
@@ -31,6 +34,8 @@ type ClaudeShopConfig struct {
 }
 
 var inventorySplitTokens = []string{"####", "----", "===="}
+var inventoryHeaderEmailTokens = []string{"邮箱账号", "邮箱", "邮箱地址", "email", "mail", "mailbox", "account"}
+var inventoryHeaderKeyTokens = []string{"邮箱apikey", "apikey", "api_key", "api key", "key", "登录key", "登录密钥", "密钥", "token"}
 
 // InventoryPair 导入的一行库存
 type InventoryPair struct {
@@ -42,7 +47,8 @@ type InventoryPair struct {
 func ParseInventoryImport(raw string) ([]InventoryPair, []string) {
 	var pairs []InventoryPair
 	var warnings []string
-	text := strings.ReplaceAll(raw, "\r\n", "\n")
+	seen := make(map[string]struct{})
+	text := strings.TrimPrefix(strings.ReplaceAll(raw, "\r\n", "\n"), "\ufeff")
 	lines := strings.Split(text, "\n")
 	for i, rawLine := range lines {
 		lineNo := i + 1
@@ -51,6 +57,9 @@ func ParseInventoryImport(raw string) ([]InventoryPair, []string) {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		if isInventoryHeaderLine(line) {
 			continue
 		}
 		email, key, ok := splitInventoryLine(line)
@@ -62,6 +71,20 @@ func ParseInventoryImport(raw string) ([]InventoryPair, []string) {
 			warnings = append(warnings, fmt.Sprintf("第 %d 行：邮箱或 Key 为空", lineNo))
 			continue
 		}
+		if len(email) > 320 {
+			warnings = append(warnings, fmt.Sprintf("第 %d 行：邮箱长度超过 320", lineNo))
+			continue
+		}
+		if len(key) > 128 {
+			warnings = append(warnings, fmt.Sprintf("第 %d 行：Key 长度超过 128", lineNo))
+			continue
+		}
+		dedupeKey := strings.ToLower(email) + "\x00" + key
+		if _, ok := seen[dedupeKey]; ok {
+			warnings = append(warnings, fmt.Sprintf("第 %d 行：重复数据已跳过", lineNo))
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
 		pairs = append(pairs, InventoryPair{Email: email, APIKey: key})
 	}
 	return pairs, warnings
@@ -78,19 +101,37 @@ func splitInventoryLine(line string) (email, apiKey string, ok bool) {
 			return classifyEmailKey(a, b)
 		}
 	}
+	if strings.Contains(line, "\t") {
+		fields := firstTwoNonEmptyFields(strings.Split(line, "\t"))
+		if len(fields) >= 2 {
+			return classifyEmailKey(fields[0], fields[1])
+		}
+	}
 	r := csv.NewReader(strings.NewReader(line))
 	r.TrimLeadingSpace = true
 	rec, err := r.Read()
 	if err != nil || len(rec) < 2 {
 		return "", "", false
 	}
-	return classifyEmailKey(strings.TrimSpace(rec[0]), strings.TrimSpace(rec[1]))
+	fields := firstTwoNonEmptyFields(rec)
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	return classifyEmailKey(fields[0], fields[1])
 }
 
 func classifyEmailKey(a, b string) (email, apiKey string, ok bool) {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	aEmail := isLikelyInventoryEmail(a)
+	bEmail := isLikelyInventoryEmail(b)
 	aAt := strings.Contains(a, "@")
 	bAt := strings.Contains(b, "@")
 	switch {
+	case aEmail && !bEmail:
+		return a, b, true
+	case bEmail && !aEmail:
+		return b, a, true
 	case aAt && !bAt:
 		return a, b, true
 	case bAt && !aAt:
@@ -100,6 +141,58 @@ func classifyEmailKey(a, b string) (email, apiKey string, ok bool) {
 	default:
 		return "", "", false
 	}
+}
+
+func isLikelyInventoryEmail(value string) bool {
+	return inventoryEmailRe.MatchString(strings.TrimSpace(value))
+}
+
+func firstTwoNonEmptyFields(fields []string) []string {
+	out := make([]string, 0, 2)
+	for _, field := range fields {
+		v := normalizeInventoryHeaderToken(field)
+		if v == "" {
+			continue
+		}
+		out = append(out, strings.TrimSpace(strings.Trim(field, `"'`)))
+		if len(out) == 2 {
+			break
+		}
+	}
+	return out
+}
+
+func isInventoryHeaderLine(line string) bool {
+	cells := firstTwoNonEmptyFields(strings.Split(line, "\t"))
+	if len(cells) < 2 {
+		r := csv.NewReader(strings.NewReader(line))
+		r.TrimLeadingSpace = true
+		if rec, err := r.Read(); err == nil {
+			cells = firstTwoNonEmptyFields(rec)
+		}
+	}
+	if len(cells) < 2 {
+		return false
+	}
+	a := normalizeInventoryHeaderToken(cells[0])
+	b := normalizeInventoryHeaderToken(cells[1])
+	return (containsAnyToken(a, inventoryHeaderEmailTokens) && containsAnyToken(b, inventoryHeaderKeyTokens)) ||
+		(containsAnyToken(b, inventoryHeaderEmailTokens) && containsAnyToken(a, inventoryHeaderKeyTokens))
+}
+
+func normalizeInventoryHeaderToken(value string) string {
+	s := strings.TrimSpace(strings.Trim(value, `"'`))
+	replacer := strings.NewReplacer(" ", "", "_", "", "-", "", "\u3000", "", "\t", "")
+	return strings.ToLower(replacer.Replace(s))
+}
+
+func containsAnyToken(value string, tokens []string) bool {
+	for _, token := range tokens {
+		if value == normalizeInventoryHeaderToken(token) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) GetClaudeShopConfig(ctx context.Context) (*ClaudeShopConfig, error) {
@@ -154,6 +247,101 @@ func (s *Store) CountClaudeInventoryAvailable(ctx context.Context) (int, error) 
 	var n int
 	err := s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM claude_inventory WHERE status = 'available'`).Scan(&n)
 	return n, err
+}
+
+func (s *Store) GetClaudeInventorySummary(ctx context.Context) (*model.ClaudeInventorySummary, error) {
+	var summary model.ClaudeInventorySummary
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+			COUNT(*)::int AS total,
+			COUNT(*) FILTER (WHERE status = 'available')::int AS available,
+			COUNT(*) FILTER (WHERE status = 'sold')::int AS sold
+		FROM claude_inventory`,
+	).Scan(&summary.Total, &summary.Available, &summary.Sold)
+	if err != nil {
+		return nil, err
+	}
+	return &summary, nil
+}
+
+func normalizeClaudeInventoryStatusFilter(status string) (string, bool) {
+	switch strings.TrimSpace(strings.ToLower(status)) {
+	case "", "all":
+		return "", true
+	case "available", "sold":
+		return strings.TrimSpace(strings.ToLower(status)), true
+	default:
+		return "", false
+	}
+}
+
+func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter string, page, size int) ([]model.ClaudeInventoryItem, int, error) {
+	filter, ok := normalizeClaudeInventoryStatusFilter(statusFilter)
+	if !ok {
+		return nil, 0, fmt.Errorf("invalid_inventory_status")
+	}
+
+	var total int
+	var rows pgx.Rows
+	var err error
+	offset := (page - 1) * size
+	if filter == "" {
+		err = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM claude_inventory`).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.pool.Query(ctx, `
+			SELECT id, email, api_key, status, order_id::text, created_at
+			FROM claude_inventory
+			ORDER BY created_at DESC
+			LIMIT $1 OFFSET $2`,
+			size, offset,
+		)
+	} else {
+		err = s.pool.QueryRow(ctx, `SELECT COUNT(*)::int FROM claude_inventory WHERE status = $1`, filter).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+		rows, err = s.pool.Query(ctx, `
+			SELECT id, email, api_key, status, order_id::text, created_at
+			FROM claude_inventory
+			WHERE status = $1
+			ORDER BY created_at DESC
+			LIMIT $2 OFFSET $3`,
+			filter, size, offset,
+		)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+
+	var list []model.ClaudeInventoryItem
+	for rows.Next() {
+		var item model.ClaudeInventoryItem
+		var orderIDText *string
+		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.CreatedAt); err != nil {
+			return nil, 0, err
+		}
+		if orderIDText != nil && strings.TrimSpace(*orderIDText) != "" {
+			if orderID, err := uuid.Parse(*orderIDText); err == nil {
+				item.OrderID = &orderID
+			}
+		}
+		list = append(list, item)
+	}
+	return list, total, rows.Err()
+}
+
+func (s *Store) DeleteClaudeInventory(ctx context.Context, id uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx, `DELETE FROM claude_inventory WHERE id = $1`, id)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
 }
 
 func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair) (int, error) {

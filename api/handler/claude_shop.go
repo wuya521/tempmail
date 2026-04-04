@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -184,7 +185,15 @@ func (h *ClaudeShopHandler) AdminGetConfig(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	stock, _ := h.store.CountClaudeInventoryAvailable(c.Request.Context())
+	summary, _ := h.store.GetClaudeInventorySummary(c.Request.Context())
+	available := 0
+	sold := 0
+	total := 0
+	if summary != nil {
+		available = summary.Available
+		sold = summary.Sold
+		total = summary.Total
+	}
 	c.JSON(http.StatusOK, gin.H{
 		"enabled":                 cfg.Enabled,
 		"title":                   cfg.Title,
@@ -200,7 +209,9 @@ func (h *ClaudeShopHandler) AdminGetConfig(c *gin.Context) {
 		"show_tag_wholesale":      cfg.ShowTagWholesale,
 		"tag_fan_welfare":         cfg.TagFanWelfare,
 		"max_per_user":            cfg.MaxPerUser,
-		"stock_available":         stock,
+		"stock_available":         available,
+		"stock_sold":              sold,
+		"stock_total":             total,
 		"wechat_qr_url":           h.qrURL(cfg.WechatQRFile),
 		"alipay_qr_url":           h.qrURL(cfg.AlipayQRFile),
 	})
@@ -290,6 +301,11 @@ func (h *ClaudeShopHandler) AdminPutConfig(c *gin.Context) {
 func (h *ClaudeShopHandler) AdminUploadQR(c *gin.Context) {
 	ctx := c.Request.Context()
 	any := false
+	updated := make([]string, 0, 2)
+	if err := os.MkdirAll(h.assetDir, 0755); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
 	for _, field := range []string{"wechat", "alipay"} {
 		fh, err := c.FormFile(field)
 		if err != nil || fh == nil {
@@ -297,8 +313,8 @@ func (h *ClaudeShopHandler) AdminUploadQR(c *gin.Context) {
 		}
 		any = true
 		ext := strings.ToLower(filepath.Ext(fh.Filename))
-		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".gif" {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "仅支持 png / jpg / jpeg / webp / gif"})
+		if ext != ".png" && ext != ".jpg" && ext != ".jpeg" && ext != ".webp" && ext != ".gif" && ext != ".bmp" && ext != ".jfif" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "仅支持 png / jpg / jpeg / webp / gif / bmp / jfif"})
 			return
 		}
 		if fh.Size > 8<<20 {
@@ -315,12 +331,23 @@ func (h *ClaudeShopHandler) AdminUploadQR(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		updated = append(updated, field)
 	}
 	if !any {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "请选择微信或支付宝收款码图片"})
 		return
 	}
-	h.AdminGetConfig(c)
+	cfg, err := h.store.GetClaudeShopConfig(ctx)
+	if err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "upload ok", "updated": updated})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        "upload ok",
+		"updated":        updated,
+		"wechat_qr_url":  h.qrURL(cfg.WechatQRFile),
+		"alipay_qr_url":  h.qrURL(cfg.AlipayQRFile),
+	})
 }
 
 // POST /api/admin/shop/inventory/import  Content-Type: text/plain
@@ -340,7 +367,68 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"inserted": n, "warnings": warns})
+	c.JSON(http.StatusOK, gin.H{
+		"recognized": len(pairs),
+		"inserted":   n,
+		"skipped":    len(warns),
+		"warnings":   warns,
+	})
+}
+
+// GET /api/admin/shop/inventory?status=available&page=1&size=30
+func (h *ClaudeShopHandler) AdminListInventory(c *gin.Context) {
+	status := c.DefaultQuery("status", "all")
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "30"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 100 {
+		size = 30
+	}
+	list, total, err := h.store.ListClaudeInventory(c.Request.Context(), status, page, size)
+	if err != nil {
+		if err.Error() == "invalid_inventory_status" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid inventory status"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	summary, _ := h.store.GetClaudeInventorySummary(c.Request.Context())
+	summaryResp := gin.H{"total": 0, "available": 0, "sold": 0}
+	if summary != nil {
+		summaryResp = gin.H{
+			"total":     summary.Total,
+			"available": summary.Available,
+			"sold":      summary.Sold,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":    list,
+		"total":   total,
+		"page":    page,
+		"size":    size,
+		"summary": summaryResp,
+	})
+}
+
+// DELETE /api/admin/shop/inventory/:id
+func (h *ClaudeShopHandler) AdminDeleteInventory(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid inventory id"})
+		return
+	}
+	if err := h.store.DeleteClaudeInventory(c.Request.Context(), id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "inventory not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "deleted"})
 }
 
 // GET /api/admin/shop/orders?status=awaiting_payment&page=1&size=20
@@ -388,4 +476,3 @@ func (h *ClaudeShopHandler) AdminConfirmOrder(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已发货", "order": o})
 }
-

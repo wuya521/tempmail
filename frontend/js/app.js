@@ -2224,7 +2224,7 @@ async function renderClaudeShop(container) {
         }
         body += `</div>`;
         if (pay.tutorial_url) {
-          body += `<p style="margin-top:0.6rem"><a href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">使用教程</a></p>`;
+          body += `<p style="margin-top:0.5rem"><a class="shop-tutorial-link" href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>`;
         }
       }
       highlightHtml = `
@@ -2286,7 +2286,7 @@ async function renderClaudeShop(container) {
             <div class="form-label" style="margin-bottom:0.45rem">① 请先扫码支付</div>
             <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.5;margin-bottom:0.65rem">请向下方二维码支付与上方「应付金额」一致的金额。系统无法在扫码瞬间自动建单，付款后再进行第 ② 步。</p>
             <div class="shop-qr-row">${qrBlock}</div>
-            ${summary.tutorial_url ? `<p style="margin-top:0.55rem;font-size:0.85rem"><a href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></p>` : ''}
+            ${summary.tutorial_url ? `<p style="margin-top:0.45rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
           </div>
           <div style="margin-top:1rem">
             <label style="display:flex;align-items:flex-start;gap:0.5rem;cursor:pointer;font-size:0.88rem;line-height:1.45">
@@ -2311,7 +2311,7 @@ async function renderClaudeShop(container) {
       <div class="card-body">
         <div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>
         <p style="font-size:0.88rem;line-height:1.65;color:var(--text-secondary);white-space:pre-wrap">${escHtml(summary.description || '')}</p>
-        ${summary.tutorial_url ? `<p style="margin-top:0.65rem"><a href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></p>` : ''}
+        ${summary.tutorial_url ? `<p style="margin-top:0.55rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
         <div style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:1.1rem;align-items:center;font-size:0.88rem">
           <div><span style="color:var(--text-muted)">库存</span> <strong>${summary.stock_available ?? 0}</strong> 件</div>
           <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>

@@ -210,6 +210,20 @@ func normalizeKeyMaterial(s string) string {
 	return strings.TrimSpace(s)
 }
 
+// decodeBase64DER 支付宝常见「一行 Base64」→ DER：先去换行，再尝试标准解码；失败则把空格当作被替换的 +
+func decodeBase64DER(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	s = strings.ReplaceAll(s, "\r", "")
+	s = strings.ReplaceAll(s, "\n", "")
+	s = strings.ReplaceAll(s, "\t", "")
+	noSpace := strings.ReplaceAll(s, " ", "")
+	if der, err := base64.StdEncoding.DecodeString(noSpace); err == nil {
+		return der, nil
+	}
+	withPlus := strings.ReplaceAll(s, " ", "+")
+	return base64.StdEncoding.DecodeString(withPlus)
+}
+
 // ParsePrivateKey 支持 PEM 整段或仅 Base64 正文（支付宝控制台常见格式）
 // 注意：x509.ParsePKCS8PrivateKey / ParsePKCS1PrivateKey 需要的是 PEM 解码后的 DER，不能传入含 -----BEGIN 的整段字符串。
 func ParsePrivateKey(raw string) (*rsa.PrivateKey, error) {
@@ -253,6 +267,17 @@ func ParsePrivateKey(raw string) (*rsa.PrivateKey, error) {
 	if k, err := tryBlocks(armored); err == nil {
 		return k, nil
 	}
+	// 直接 Base64→DER（绕过 PEM 行宽等差异）
+	if der, derr := decodeBase64DER(raw); derr == nil {
+		if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+			if rk, ok := key.(*rsa.PrivateKey); ok {
+				return rk, nil
+			}
+		}
+		if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+			return key, nil
+		}
+	}
 	return nil, fmt.Errorf("parse private key: asn1 decode failed (check key is app private key, full copy)")
 }
 
@@ -292,6 +317,16 @@ func ParsePublicKey(raw string) (*rsa.PublicKey, error) {
 	armored := ensurePEM(raw, "PUBLIC KEY")
 	if k, err := tryBlocks(armored); err == nil {
 		return k, nil
+	}
+	if der, derr := decodeBase64DER(raw); derr == nil {
+		if pub, err := x509.ParsePKIXPublicKey(der); err == nil {
+			if rk, ok := pub.(*rsa.PublicKey); ok {
+				return rk, nil
+			}
+		}
+		if pub, err := rsa.ParsePKCS1PublicKey(der); err == nil {
+			return pub, nil
+		}
 	}
 	return nil, fmt.Errorf("parse public key: asn1 decode failed (use 支付宝公钥 from open.alipay.com, not app public key)")
 }

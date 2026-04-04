@@ -89,6 +89,7 @@ func main() {
 	var ali *alipay.Client
 	var alipayNotifyURL, alipayAppID string
 	if cfg.AlipayPrecreateConfigured() {
+		log.Printf("[alipay] 解析器 v4：pem.Decode + 原始 Base64→DER；部署后若仍失败请执行: docker compose build api --no-cache")
 		priv, e1 := alipay.ParsePrivateKey(cfg.AlipayPrivateKey)
 		pub, e2 := alipay.ParsePublicKey(cfg.AlipayPublicKey)
 		if e1 != nil || e2 != nil {

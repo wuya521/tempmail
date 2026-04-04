@@ -404,6 +404,16 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 			return nil, fmt.Errorf("exceeds_purchase_limit")
 		}
 	}
+	var pendingN int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*)::int FROM claude_orders WHERE account_id = $1 AND status = 'awaiting_payment'`,
+		accountID,
+	).Scan(&pendingN); err != nil {
+		return nil, err
+	}
+	if pendingN > 0 {
+		return nil, fmt.Errorf("pending_order_exists")
+	}
 	wholesale := quantity >= cfg.WholesaleMinQty
 	unit := cfg.RetailPriceCents
 	if wholesale {

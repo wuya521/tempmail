@@ -2137,16 +2137,33 @@ window.claudeShopPriceRefresh = function() {
       ? `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`
       : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${Number(s.wholesale_price_yuan).toFixed(2)} / 件`;
   }
+  syncClaudeShopSubmitGate();
+};
+
+window.syncClaudeShopSubmitGate = function() {
+  const btn = $('claude-shop-submit-btn');
+  const cb = $('claude-shop-pay-done');
+  if (!btn) return;
+  btn.disabled = !(cb && cb.checked);
 };
 
 window.submitClaudeShopOrder = async function() {
+  if (!$('claude-shop-pay-done')?.checked) {
+    toast('请先完成扫码支付，并勾选「我确认已按上述金额完成扫码支付」', 'warn');
+    return;
+  }
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   try {
     const r = await api.shopCreateOrder({ quantity: qty });
     state.claudeHighlightOrderId = r.order.id;
-    toast('订单已创建，请按应付金额扫码付款', 'success');
+    toast('订单已生成，请等待管理员核对到账后发货', 'success');
     navigate('claude-shop');
   } catch (e) {
+    if (e.status === 409) {
+      toast(e.message || '已有待确认订单', 'warn');
+      navigate('claude-shop');
+      return;
+    }
     toast(e.message || '下单失败', 'error');
   }
 };
@@ -2234,6 +2251,53 @@ async function renderClaudeShop(container) {
 
   const myOrders = await api.shopListOrders(1, 20).catch(() => ({ data: [] }));
   const orders = myOrders.data || [];
+  const pendingOrder = orders.find(o => o.status === 'awaiting_payment');
+
+  const qrBlock = (() => {
+    let h = '';
+    if (summary.wechat_qr_url) {
+      h += `<div><div class="form-hint" style="margin-bottom:0.3rem">微信收款</div>
+        <img class="shop-qr-img" src="${escHtml(summary.wechat_qr_url)}" alt="微信收款码" loading="lazy" /></div>`;
+    }
+    if (summary.alipay_qr_url) {
+      h += `<div><div class="form-hint" style="margin-bottom:0.3rem">支付宝收款</div>
+        <img class="shop-qr-img" src="${escHtml(summary.alipay_qr_url)}" alt="支付宝收款码" loading="lazy" /></div>`;
+    }
+    if (!summary.wechat_qr_url && !summary.alipay_qr_url) {
+      h += `<p style="color:var(--clr-warn);font-size:0.85rem">管理员尚未上传收款码，请联系店主。</p>`;
+    }
+    return h;
+  })();
+
+  const purchaseSection = pendingOrder ? `
+        <div style="margin-top:1.2rem;padding:1rem;background:rgba(230,126,34,0.12);border-radius:var(--radius);border:1px solid var(--border-light)">
+          <p style="font-size:0.9rem;line-height:1.55;margin-bottom:0.65rem">您有 <strong>一笔</strong> 订单正在等待管理员确认收款。为避免重复付款，需处理完成后再下单。</p>
+          <button type="button" class="btn btn-primary btn-sm" onclick="claudeShopViewOrder('${pendingOrder.id}')">查看该订单与收款码</button>
+        </div>
+        ` : `
+        <div style="margin-top:1.2rem;padding:1rem;background:var(--bg-card);border-radius:var(--radius);border:1px solid var(--border-light)">
+          <label class="form-label">购买数量</label>
+          <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
+          <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
+          <p style="font-size:1.12rem;font-weight:700;color:var(--clr-primary);margin:0.35rem 0">
+            应付金额：<span id="claude-shop-pay-total">—</span>
+          </p>
+          <div style="margin-top:1rem;padding-top:1rem;border-top:1px solid var(--border-light)">
+            <div class="form-label" style="margin-bottom:0.45rem">① 请先扫码支付</div>
+            <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.5;margin-bottom:0.65rem">请向下方二维码支付与上方「应付金额」一致的金额。系统无法在扫码瞬间自动建单，付款后再进行第 ② 步。</p>
+            <div class="shop-qr-row">${qrBlock}</div>
+            ${summary.tutorial_url ? `<p style="margin-top:0.55rem;font-size:0.85rem"><a href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></p>` : ''}
+          </div>
+          <div style="margin-top:1rem">
+            <label style="display:flex;align-items:flex-start;gap:0.5rem;cursor:pointer;font-size:0.88rem;line-height:1.45">
+              <input type="checkbox" id="claude-shop-pay-done" style="margin-top:0.2rem" onchange="syncClaudeShopSubmitGate()" />
+              <span>② 我确认已按上述金额完成扫码支付</span>
+            </label>
+            <button type="button" class="btn btn-primary" style="margin-top:0.7rem" id="claude-shop-submit-btn" disabled onclick="submitClaudeShopOrder()">生成订单（待管理员核对）</button>
+            <p style="font-size:0.74rem;color:var(--text-muted);margin-top:0.45rem;line-height:1.45">同一账号仅允许一笔「待确认收款」订单；管理员确认后将自动发货。</p>
+          </div>
+        </div>
+        `;
 
   container.innerHTML = `
     ${highlightHtml}
@@ -2253,16 +2317,7 @@ async function renderClaudeShop(container) {
           <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>
           <div><span style="color:var(--text-muted)">批发</span> <strong>¥${Number(summary.wholesale_price_yuan).toFixed(2)}</strong> / 件（${summary.wholesale_min_qty || 5} 件起）</div>
         </div>
-        <div style="margin-top:1.2rem;padding:1rem;background:var(--bg-card);border-radius:var(--radius);border:1px solid var(--border-light)">
-          <label class="form-label">购买数量</label>
-          <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
-          <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
-          <p style="font-size:1.12rem;font-weight:700;color:var(--clr-primary);margin:0.35rem 0">
-            应付金额：<span id="claude-shop-pay-total">—</span>
-          </p>
-          <p style="font-size:0.76rem;color:var(--clr-warn);line-height:1.5">请按此处显示金额扫码支付。支付完成后由管理员在后台确认，确认后将自动显示登录 Key 与邮箱。</p>
-          <button type="button" class="btn btn-primary" style="margin-top:0.65rem" onclick="submitClaudeShopOrder()">提交订单</button>
-        </div>
+        ${purchaseSection}
       </div>
     </div>
     <div class="card" style="max-width:720px;margin-top:1rem">

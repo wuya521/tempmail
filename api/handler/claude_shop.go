@@ -159,6 +159,8 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "数量无效"})
 		case "exceeds_purchase_limit":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "超过每用户限购数量"})
+		case "pending_order_exists":
+			c.JSON(http.StatusConflict, gin.H{"error": "您已有待管理员确认的订单，请在「我的购买记录」中查看，勿重复提交"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}

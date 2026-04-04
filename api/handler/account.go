@@ -72,11 +72,16 @@ func (h *AccountHandler) Create(c *gin.Context) {
 // GET /api/admin/accounts - 列出所有账号（管理员）
 func (h *AccountHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
-	size, _ := strconv.Atoi(c.DefaultQuery("size", "20"))
-	if page < 1 { page = 1 }
-	if size < 1 || size > 100 { size = 20 }
+	size, _ := strconv.Atoi(c.DefaultQuery("size", "10"))
+	if page < 1 {
+		page = 1
+	}
+	if size < 1 || size > 100 {
+		size = 10
+	}
+	q := c.Query("q")
 
-	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size)
+	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size, q)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
@@ -106,13 +111,51 @@ func (h *AccountHandler) Delete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "account deleted"})
 }
 
+// PATCH /api/admin/accounts/:id  body: { "is_active": true|false } 封禁=停用登录
+func (h *AccountHandler) Patch(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+	var req struct {
+		IsActive *bool `json:"is_active" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	self := middleware.GetAccount(c)
+	if id == self.ID && !*req.IsActive {
+		c.JSON(http.StatusForbidden, gin.H{"error": "不能封禁当前登录账号"})
+		return
+	}
+	adminTarget, err := h.store.GetAccountByID(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "账户不存在"})
+		return
+	}
+	if adminTarget.IsAdmin && !*req.IsActive {
+		c.JSON(http.StatusForbidden, gin.H{"error": "不能封禁管理员账号"})
+		return
+	}
+	_ = self
+	if err := h.store.SetAccountActive(c.Request.Context(), id, *req.IsActive); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "ok"})
+}
+
 // GET /api/me - 查看当前账号信息
 func (h *AccountHandler) Me(c *gin.Context) {
 	account := middleware.GetAccount(c)
-	c.JSON(http.StatusOK, gin.H{
-		"id":         account.ID,
-		"username":   account.Username,
-		"is_admin":   account.IsAdmin,
-		"created_at": account.CreatedAt,
-	})
+	out := gin.H{
+		"id":           account.ID,
+		"username":     account.Username,
+		"is_admin":     account.IsAdmin,
+		"created_at":   account.CreatedAt,
+		"last_seen_at": account.LastSeenAt,
+	}
+	c.JSON(http.StatusOK, out)
 }

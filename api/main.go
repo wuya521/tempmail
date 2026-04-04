@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -49,6 +50,14 @@ func main() {
 	defer rdb.Close()
 	log.Println("✓ Redis connected")
 
+	shopDir := strings.TrimSpace(cfg.ShopAssetDir)
+	if shopDir == "" {
+		shopDir = "/data/shop"
+	}
+	if err := os.MkdirAll(shopDir, 0755); err != nil {
+		log.Printf("[shop] mkdir %s: %v", shopDir, err)
+	}
+
 	// ==================== Gin 路由 ====================
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
@@ -76,6 +85,7 @@ func main() {
 	settingH := handler.NewSettingHandler(db)
 	registerH := handler.NewRegisterHandler(db)
 	statsH   := handler.NewStatsHandler(db)
+	shopH    := handler.NewClaudeShopHandler(db, shopDir)
 
 	// 公开路由（无需认证）
 	public := r.Group("/public")
@@ -83,6 +93,8 @@ func main() {
 		public.GET("/settings", settingH.GetPublic)
 		public.POST("/register", registerH.Register)
 		public.GET("/stats", statsH.Get)
+		public.GET("/claude-shop", shopH.PublicSummary)
+		public.GET("/shop-assets/:filename", shopH.ServeShopAsset)
 	}
 
 	// API 路由组（需要认证 + 速率限制）
@@ -92,6 +104,10 @@ func main() {
 	{
 		// 当前用户
 		api.GET("/me", accountH.Me)
+
+		api.GET("/shop/orders", shopH.ListMyOrders)
+		api.GET("/shop/orders/:id", shopH.GetMyOrder)
+		api.POST("/shop/orders", shopH.CreateOrder)
 
 		// 域名池（所有用户可查看）
 		api.GET("/domains", domainH.List)
@@ -115,7 +131,15 @@ func main() {
 		{
 			admin.POST("/accounts", accountH.Create)
 			admin.GET("/accounts", accountH.List)
+			admin.PATCH("/accounts/:id", accountH.Patch)
 			admin.DELETE("/accounts/:id", accountH.Delete)
+
+			admin.GET("/shop/config", shopH.AdminGetConfig)
+			admin.PUT("/shop/config", shopH.AdminPutConfig)
+			admin.POST("/shop/qrcodes", shopH.AdminUploadQR)
+			admin.POST("/shop/inventory/import", shopH.AdminImportInventory)
+			admin.GET("/shop/orders", shopH.AdminListOrders)
+			admin.POST("/shop/orders/:id/confirm", shopH.AdminConfirmOrder)
 
 			admin.POST("/domains", domainH.Add)
 			admin.DELETE("/domains/:id", domainH.Delete)

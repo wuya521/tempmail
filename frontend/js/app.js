@@ -14,6 +14,12 @@ const state = {
   account:   JSON.parse(localStorage.getItem('tm_account') || 'null'),
   theme:     localStorage.getItem('tm_theme') || 'light',
   page:      'dashboard',
+  /** 自助售号入口（来自 /public/claude-shop） */
+  claudeShopEnabled: false,
+  adminAccountsPage: 1,
+  adminAccountsQ: '',
+  claudeHighlightOrderId: null,
+  _claudeShopSummary: null,
   /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
   siteTitle: 'TempMail',
   // 当前邮箱
@@ -80,7 +86,10 @@ async function apiFetch(path, opts = {}) {
   try { data = await res.json(); } catch { data = {}; }
   if (!res.ok) {
     const errMsg = data.error || data.message || `HTTP ${res.status}`;
-    throw new Error(errMsg);
+    const e = new Error(errMsg);
+    e.status = res.status;
+    if (data.code) e.code = data.code;
+    throw e;
   }
   return data;
 }
@@ -88,6 +97,7 @@ async function apiFetch(path, opts = {}) {
 const api = {
   // 公共
   publicSettings: () => fetch(PUBLIC_BASE + '/settings').then(r => r.json()),
+  publicClaudeShop: () => fetch(PUBLIC_BASE + '/claude-shop').then(r => r.json()),
   publicStats:     () => fetch(PUBLIC_BASE + '/stats').then(r => r.json()),
   register: body  => apiFetch(PUBLIC_BASE + '/register', { method: 'POST', body: JSON.stringify(body) }),
 
@@ -109,10 +119,44 @@ const api = {
   getEmail:   (mid, eid) => apiFetch(API_BASE + '/mailboxes/' + mid + '/emails/' + eid).then(d => d.email || d),
   deleteEmail:(mid, eid) => apiFetch(API_BASE + '/mailboxes/' + mid + '/emails/' + eid, { method: 'DELETE' }),
   // 管理
+  shopListOrders: (page=1,size=20) => apiFetch(API_BASE + '/shop/orders?page='+page+'&size='+size),
+  shopGetOrder: id => apiFetch(API_BASE + '/shop/orders/' + id),
+  shopCreateOrder: body => apiFetch(API_BASE + '/shop/orders', { method: 'POST', body: JSON.stringify(body) }),
   admin: {
-    listAccounts:  (page=1,size=50) => apiFetch(API_BASE + '/admin/accounts?page='+page+'&size='+size).then(d => Array.isArray(d) ? d : (d.data || [])),
+    listAccounts:  (page=1,size=10,q='') => {
+      let u = API_BASE + '/admin/accounts?page='+page+'&size='+size;
+      if (q) u += '&q=' + encodeURIComponent(q);
+      return apiFetch(u);
+    },
+    patchAccount: (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'PATCH', body: JSON.stringify(body) }),
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
+    shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
+    shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
+    shopImportInventory: text => fetch(API_BASE + '/admin/shop/inventory/import', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + state.apiKey, 'Content-Type': 'text/plain; charset=utf-8' },
+      body: text,
+    }).then(async res => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '导入失败');
+      return data;
+    }),
+    shopUploadQR: (formData) => fetch(API_BASE + '/admin/shop/qrcodes', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + state.apiKey },
+      body: formData,
+    }).then(async res => {
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || '上传失败');
+      return data;
+    }),
+    shopListOrders: (status='', page=1, size=20) => {
+      let u = API_BASE + '/admin/shop/orders?page='+page+'&size='+size;
+      if (status) u += '&status=' + encodeURIComponent(status);
+      return apiFetch(u);
+    },
+    shopConfirmOrder: id => apiFetch(API_BASE + '/admin/shop/orders/' + id + '/confirm', { method: 'POST' }),
     addDomain:   body => apiFetch(API_BASE + '/admin/domains', { method: 'POST', body: JSON.stringify(body) }),
     deleteDomain:  id => apiFetch(API_BASE + '/admin/domains/' + id, { method: 'DELETE' }),
     toggleDomain:  (id, active) => apiFetch(API_BASE + '/admin/domains/' + id + '/toggle', { method: 'PUT', body: JSON.stringify({ active }) }),
@@ -162,12 +206,16 @@ async function tryLogin(key) {
     state.account = acct;
     localStorage.setItem('tm_apikey', key);
     localStorage.setItem('tm_account', JSON.stringify(acct));
-    showMainLayout();
+    await showMainLayout();
     navigate('dashboard');
     toast(`欢迎回来，${acct.username || '用户'}`, 'success');
   } catch (e) {
     state.apiKey = '';
-    toast('API Key 无效: ' + e.message, 'error');
+    if (e.status === 403 && e.code === 'account_banned') {
+      toast(e.message || '由于违反邮箱服务协议，您的账户已被封禁，无法登录。', 'error');
+    } else {
+      toast('API Key 无效: ' + e.message, 'error');
+    }
   }
 }
 
@@ -187,6 +235,7 @@ function navigate(page, params = {}) {
   state.page = page;
   Object.assign(state, params);
   renderPage(page);
+  if (state.account) refreshClaudeShopNav();
   // 更新侧导航高亮
   document.querySelectorAll('.nav-item').forEach(n => {
     n.classList.toggle('active', n.dataset.page === page);
@@ -200,10 +249,28 @@ function showAuthPage() {
   renderLoginForm();
 }
 
-function showMainLayout() {
+async function showMainLayout() {
   $('app').innerHTML = '';
   $('app').appendChild(buildMainLayout());
   applyTheme(state.theme);
+  await refreshClaudeShopNav();
+}
+
+async function refreshClaudeShopNav() {
+  try {
+    const s = await api.publicClaudeShop();
+    state.claudeShopEnabled = !!(s && s.enabled);
+  } catch {
+    state.claudeShopEnabled = false;
+  }
+  const wrap = $('nav-claude-shop-slot');
+  if (!wrap) return;
+  if (state.claudeShopEnabled) {
+    wrap.innerHTML = `<div class="nav-section">商城</div>
+      <button class="nav-item" data-page="claude-shop" onclick="navigate('claude-shop')"><span class="nav-icon">🛒</span><span>自助 Claude 账号</span></button>`;
+  } else {
+    wrap.innerHTML = '';
+  }
 }
 
 function buildAuthPage() {
@@ -346,6 +413,7 @@ function buildMainLayout() {
         <button class="nav-item" data-page="api-docs" onclick="navigate('api-docs')">
           <span class="nav-icon">📖</span><span>API 文档</span>
         </button>
+        <div id="nav-claude-shop-slot"></div>
         ${isAdmin ? `
         <div class="nav-section">管理</div>
         <button class="nav-item" data-page="admin-accounts" onclick="navigate('admin-accounts')">
@@ -353,6 +421,9 @@ function buildMainLayout() {
         </button>
         <button class="nav-item" data-page="admin-domains" onclick="navigate('admin-domains')">
           <span class="nav-icon">🌐</span><span>域名管理</span>
+        </button>
+        <button class="nav-item" data-page="admin-claude-shop" onclick="navigate('admin-claude-shop')">
+          <span class="nav-icon">🏷</span><span>店铺配置</span>
         </button>
         <button class="nav-item" data-page="admin-settings" onclick="navigate('admin-settings')">
           <span class="nav-icon">⚙</span><span>系统设置</span>
@@ -431,6 +502,8 @@ async function renderPage(page) {
     'admin-accounts': ['账户管理', '创建和管理用户账户'],
     'admin-domains':  ['域名管理', '管理域名池'],
     'admin-settings': ['系统设置', ''],
+    'claude-shop':    ['自助 Claude 账号', '选购与订单'],
+    'admin-claude-shop': ['店铺配置', '商品、库存、收款码与订单核销'],
     'apikey-show':    ['API Key', ''],
     'api-docs':       ['API 接口文档', '查看所有可用 API 及调用示例'],
   };
@@ -448,6 +521,8 @@ async function renderPage(page) {
       case 'admin-accounts': await renderAdminAccounts(container); break;
       case 'admin-domains':  await renderAdminDomains(container); break;
       case 'admin-settings': await renderAdminSettings(container); break;
+      case 'claude-shop':    await renderClaudeShop(container); break;
+      case 'admin-claude-shop': await renderAdminClaudeShop(container); break;
       case 'apikey-show':    renderApiKeyShow(container); break;
       case 'api-docs':       renderApiDocs(container); break;
       default: container.innerHTML = '<div class="page"><p>页面未找到</p></div>';
@@ -948,45 +1023,99 @@ async function renderDomainsGuide(container) {
 }
 
 // ─── Admin: 账户管理 ─────────────────────────────────────────
+function formatLastSeen(t) {
+  if (!t) return '—';
+  return formatDate(t);
+}
+
+window.adminAccSearch = function() {
+  state.adminAccountsQ = ($('admin-acc-q')?.value || '').trim();
+  state.adminAccountsPage = 1;
+  navigate('admin-accounts');
+};
+
+window.adminAccGoPage = function(p) {
+  state.adminAccountsPage = Math.max(1, p);
+  navigate('admin-accounts');
+};
+
+window.toggleBanAccount = function(id, username, ban) {
+  const act = ban ? '封禁' : '解除封禁';
+  showModal(act + '账户', `<p>确定对 <strong>${escHtml(username)}</strong> ${act}？封禁后该用户无法登录。</p>`, async () => {
+    try {
+      await api.admin.patchAccount(id, { is_active: !ban });
+      toast('已更新', 'success');
+      navigate('admin-accounts');
+    } catch (e) {
+      toast(e.message || '失败', 'error');
+    }
+  });
+};
+
 async function renderAdminAccounts(container) {
+  const page = state.adminAccountsPage || 1;
+  const q = state.adminAccountsQ || '';
   const actions = $('topbar-actions');
   if (actions) {
-    actions.innerHTML = `<button class="btn btn-primary btn-sm" onclick="showCreateAccountModal()">+ 创建账户</button>`;
+    actions.innerHTML = `
+      <input class="form-input" id="admin-acc-q" placeholder="搜用户名或 Key" value="${escHtml(q)}"
+        style="max-width:200px;padding:0.35rem 0.5rem;font-size:0.82rem" onkeydown="if(event.key==='Enter')adminAccSearch()" />
+      <button class="btn btn-ghost btn-sm" onclick="adminAccSearch()">搜索</button>
+      <button class="btn btn-primary btn-sm" onclick="showCreateAccountModal()" style="margin-left:0.3rem">+ 创建账户</button>
+    `;
   }
 
-  const accounts = await api.admin.listAccounts();
+  const res = await api.admin.listAccounts(page, 10, q);
+  const accounts = res.data || [];
+  const total = res.total ?? 0;
+  const size = res.size || 10;
+  const maxPage = Math.max(1, Math.ceil(total / size) || 1);
+
   container.innerHTML = `
-    <div class="card" style="max-width:860px">
+    <div class="card" style="max-width:920px">
       <div class="card-header">
         <div class="card-title">👥 账户列表</div>
-        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${(accounts||[]).length} 个账户</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${total} 个账户 · 每页 ${size} 条 · 第 ${page}/${maxPage} 页</div>
       </div>
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>用户名</th><th>角色</th><th>创建时间</th><th>操作</th></tr>
+            <tr><th>用户名 / Key</th><th>角色</th><th>状态</th><th>创建</th><th>最近活跃</th><th>操作</th></tr>
           </thead>
           <tbody>
-            ${(accounts||[]).map(a => `
+            ${accounts.map(a => {
+              const keyJs = JSON.stringify(a.api_key || '');
+              return `
               <tr>
                 <td>
                   <div style="font-weight:600">${escHtml(a.username || '—')}</div>
                   <div class="code-box" style="margin-top:0.3rem;font-size:0.72rem">
                     <span>${escHtml(a.api_key || '—')}</span>
-                    <button class="copy-btn" onclick="copyText('${escHtml(a.api_key||'')}')">⎘</button>
+                    <button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⎘</button>
                   </div>
                 </td>
                 <td>${a.is_admin
                   ? '<span class="badge badge-gold">管理员</span>'
                   : '<span class="badge badge-gray">普通用户</span>'}</td>
+                <td>${a.is_active === false
+                  ? '<span class="badge" style="background:var(--clr-danger);color:#fff">已封禁</span>'
+                  : '<span class="badge badge-green">正常</span>'}</td>
                 <td style="font-size:0.8rem">${formatDate(a.created_at)}</td>
-                <td>
-                  ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick="confirmDeleteAccount('${a.id}','${escHtml(a.username||'')}')">删除</button>` : ''}
+                <td style="font-size:0.8rem">${formatLastSeen(a.last_seen_at)}</td>
+                <td style="white-space:nowrap">
+                  ${!a.is_admin && a.is_active ? `<button class="btn btn-ghost btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, true)'>封禁</button>` : ''}
+                  ${!a.is_admin && a.is_active === false ? `<button class="btn btn-success btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, false)'>解除</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick='confirmDeleteAccount("${a.id}", ${JSON.stringify(a.username||'')})'>删除</button>` : ''}
                 </td>
-              </tr>
-            `).join('')}
+              </tr>`;
+            }).join('')}
           </tbody>
         </table>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminAccGoPage(${page - 1})">上一页</button>
+        <span style="font-size:0.85rem;color:var(--text-muted)">第 ${page} / ${maxPage} 页</span>
+        <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminAccGoPage(${page + 1})">下一页</button>
       </div>
     </div>
   `;
@@ -1815,6 +1944,349 @@ k6 run /tmp/test.js`,
   `;
 }
 
+// ─── Claude 自助购号（用户）──────────────────────────────────
+window.claudeShopPriceRefresh = function() {
+  const s = state._claudeShopSummary;
+  if (!s) return;
+  const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
+  const minW = s.wholesale_min_qty || 5;
+  const isWs = qty >= minW;
+  const unit = isWs ? Number(s.wholesale_price_yuan) : Number(s.retail_price_yuan);
+  const total = unit * qty;
+  const el = $('claude-shop-pay-total');
+  if (el) el.textContent = '¥' + total.toFixed(2);
+  const el2 = $('claude-shop-unit-hint');
+  if (el2) {
+    el2.textContent = isWs
+      ? `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`
+      : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${Number(s.wholesale_price_yuan).toFixed(2)} / 件`;
+  }
+};
+
+window.submitClaudeShopOrder = async function() {
+  const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
+  try {
+    const r = await api.shopCreateOrder({ quantity: qty });
+    state.claudeHighlightOrderId = r.order.id;
+    toast('订单已创建，请按应付金额扫码付款', 'success');
+    navigate('claude-shop');
+  } catch (e) {
+    toast(e.message || '下单失败', 'error');
+  }
+};
+
+window.claudeShopViewOrder = function(id) {
+  state.claudeHighlightOrderId = id;
+  navigate('claude-shop');
+};
+
+window.claudeShopDismissHighlight = function() {
+  state.claudeHighlightOrderId = null;
+  navigate('claude-shop');
+};
+
+async function renderClaudeShop(container) {
+  const actions = $('topbar-actions');
+  if (actions) actions.innerHTML = '';
+  const summary = await api.publicClaudeShop();
+  state._claudeShopSummary = summary;
+  if (!summary.enabled) {
+    container.innerHTML = `<div class="card" style="max-width:560px"><p>店主暂未开放自助购号。</p></div>`;
+    return;
+  }
+
+  let highlightHtml = '';
+  if (state.claudeHighlightOrderId) {
+    try {
+      const d = await api.shopGetOrder(state.claudeHighlightOrderId);
+      const o = d.order;
+      const pay = d.payment || {};
+      const totalY = (o.total_cents / 100).toFixed(2);
+      let body = '';
+      if (o.status === 'fulfilled' && (o.lines || []).length) {
+        body += `<div style="background:rgba(39,174,96,0.12);padding:0.6rem 0.8rem;border-radius:var(--radius-sm);font-size:0.82rem;margin-bottom:0.8rem">
+          ⚠ 请立即复制保存以下信息，页面关闭后仍可在「我的购买记录」中查看。</div>`;
+        body += (o.lines || []).map(ln => `
+          <div class="code-box" style="margin-top:0.45rem;font-size:0.78rem">
+            <div><b>邮箱</b> ${escHtml(ln.email)}
+              <button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(ln.email)})'>⎘</button></div>
+            <div style="margin-top:0.25rem"><b>登录 Key</b> ${escHtml(ln.api_key)}
+              <button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(ln.api_key)})'>⎘</button></div>
+          </div>
+        `).join('');
+      } else {
+        body += `<p style="font-size:0.9rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
+        body += `<p style="font-size:0.78rem;color:var(--text-muted);margin-bottom:0.8rem">请使用微信或支付宝扫描下方二维码支付对应金额，支付完成后等待管理员确认。</p>`;
+        body += `<div class="shop-qr-row">`;
+        if (pay.wechat_qr_url) {
+          body += `<div><div class="form-hint" style="margin-bottom:0.3rem">微信收款</div>
+            <img class="shop-qr-img" src="${escHtml(pay.wechat_qr_url)}" alt="微信收款码" loading="lazy" /></div>`;
+        }
+        if (pay.alipay_qr_url) {
+          body += `<div><div class="form-hint" style="margin-bottom:0.3rem">支付宝收款</div>
+            <img class="shop-qr-img" src="${escHtml(pay.alipay_qr_url)}" alt="支付宝收款码" loading="lazy" /></div>`;
+        }
+        if (!pay.wechat_qr_url && !pay.alipay_qr_url) {
+          body += `<p style="color:var(--clr-warn)">管理员尚未上传收款二维码，请联系店主。</p>`;
+        }
+        body += `</div>`;
+        if (pay.tutorial_url) {
+          body += `<p style="margin-top:0.6rem"><a href="${escHtml(pay.tutorial_url)}" target="_blank" rel="noopener">使用教程</a></p>`;
+        }
+      }
+      highlightHtml = `
+        <div class="card shop-order-highlight" style="max-width:720px;margin-bottom:1rem;border-left:4px solid var(--clr-accent)">
+          <div class="card-header" style="align-items:flex-start">
+            <div>
+              <div class="card-title">订单详情</div>
+              <div style="font-size:0.75rem;color:var(--text-muted);margin-top:0.2rem">#${escHtml(o.id)}</div>
+            </div>
+            <button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopDismissHighlight()">收起</button>
+          </div>
+          <div class="card-body">${body}</div>
+        </div>`;
+    } catch {
+      highlightHtml = '';
+    }
+  }
+
+  const tags = [];
+  if (summary.tag_hot) tags.push('<span class="shop-tag shop-tag-hot">🔥 爆火</span>');
+  if (summary.show_tag_wholesale) tags.push(`<span class="shop-tag">批发 ${summary.wholesale_min_qty || 5} 件起</span>`);
+  if (summary.tag_fan_welfare) tags.push(`<span class="shop-tag shop-tag-fan">${escHtml(summary.tag_fan_welfare)}</span>`);
+  if (summary.max_per_user > 0) tags.push(`<span class="shop-tag">限购 · 每用户 ${summary.max_per_user} 件</span>`);
+
+  const myOrders = await api.shopListOrders(1, 20).catch(() => ({ data: [] }));
+  const orders = myOrders.data || [];
+
+  container.innerHTML = `
+    ${highlightHtml}
+    <div class="card" style="max-width:720px">
+      <div class="card-header">
+        <div>
+          <div class="card-title">${escHtml(summary.title || 'Claude 账号')}</div>
+          <div style="font-size:0.8rem;color:var(--text-muted);margin-top:0.2rem">${escHtml(summary.subtitle || '')}</div>
+        </div>
+      </div>
+      <div class="card-body">
+        <div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>
+        <p style="font-size:0.88rem;line-height:1.65;color:var(--text-secondary);white-space:pre-wrap">${escHtml(summary.description || '')}</p>
+        ${summary.tutorial_url ? `<p style="margin-top:0.65rem"><a href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></p>` : ''}
+        <div style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:1.1rem;align-items:center;font-size:0.88rem">
+          <div><span style="color:var(--text-muted)">库存</span> <strong>${summary.stock_available ?? 0}</strong> 件</div>
+          <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>
+          <div><span style="color:var(--text-muted)">批发</span> <strong>¥${Number(summary.wholesale_price_yuan).toFixed(2)}</strong> / 件（${summary.wholesale_min_qty || 5} 件起）</div>
+        </div>
+        <div style="margin-top:1.2rem;padding:1rem;background:var(--bg-card);border-radius:var(--radius);border:1px solid var(--border-light)">
+          <label class="form-label">购买数量</label>
+          <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
+          <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
+          <p style="font-size:1.12rem;font-weight:700;color:var(--clr-primary);margin:0.35rem 0">
+            应付金额：<span id="claude-shop-pay-total">—</span>
+          </p>
+          <p style="font-size:0.76rem;color:var(--clr-warn);line-height:1.5">请按此处显示金额扫码支付。支付完成后由管理员在后台确认，确认后将自动显示登录 Key 与邮箱。</p>
+          <button type="button" class="btn btn-primary" style="margin-top:0.65rem" onclick="submitClaudeShopOrder()">提交订单</button>
+        </div>
+      </div>
+    </div>
+    <div class="card" style="max-width:720px;margin-top:1rem">
+      <div class="card-header"><div class="card-title">我的购买记录</div></div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>时间</th><th>数量</th><th>应付</th><th>状态</th><th></th></tr></thead>
+          <tbody>
+            ${orders.length ? orders.map(o => `
+              <tr>
+                <td style="font-size:0.78rem">${formatDate(o.created_at)}</td>
+                <td>${o.quantity}</td>
+                <td>¥${(o.total_cents / 100).toFixed(2)}</td>
+                <td>${o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : '<span class="badge badge-gray">待确认收款</span>'}</td>
+                <td><button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopViewOrder('${o.id}')">查看</button></td>
+              </tr>
+            `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+  claudeShopPriceRefresh();
+}
+
+// ─── Claude 店铺（管理员）────────────────────────────────────
+window.saveAdminShopConfig = async function() {
+  const body = {
+    enabled: $('shop-cfg-enabled')?.checked || false,
+    title: ($('shop-cfg-title')?.value || '').trim(),
+    subtitle: ($('shop-cfg-subtitle')?.value || '').trim(),
+    description: ($('shop-cfg-desc')?.value || '').trim(),
+    tutorial_url: ($('shop-cfg-tutorial')?.value || '').trim(),
+    retail_price_yuan: parseFloat($('shop-cfg-retail')?.value || '0') || 0,
+    wholesale_min_qty: parseInt($('shop-cfg-wsqty')?.value || '5', 10) || 5,
+    wholesale_price_yuan: parseFloat($('shop-cfg-wholesale')?.value || '0') || 0,
+    tag_hot: $('shop-cfg-hot')?.checked || false,
+    show_tag_wholesale: $('shop-cfg-showws')?.checked !== false,
+    tag_fan_welfare: ($('shop-cfg-fan')?.value || '').trim(),
+    max_per_user: parseInt($('shop-cfg-maxuser')?.value || '0', 10) || 0,
+  };
+  try {
+    await api.admin.shopPutConfig(body);
+    toast('已保存', 'success');
+    await refreshClaudeShopNav();
+    navigate('admin-claude-shop');
+  } catch (e) {
+    toast(e.message || '保存失败', 'error');
+  }
+};
+
+window.uploadShopQR = async function() {
+  const fd = new FormData();
+  const w = $('shop-qr-wechat')?.files?.[0];
+  const a = $('shop-qr-alipay')?.files?.[0];
+  if (w) fd.append('wechat', w);
+  if (a) fd.append('alipay', a);
+  if (!w && !a) {
+    toast('请选择至少一张图片', 'warn');
+    return;
+  }
+  try {
+    await api.admin.shopUploadQR(fd);
+    toast('收款码已更新', 'success');
+    navigate('admin-claude-shop');
+  } catch (e) {
+    toast(e.message || '上传失败', 'error');
+  }
+};
+
+window.runShopImport = async function() {
+  const t = ($('shop-import-ta')?.value || '').trim();
+  if (!t) {
+    toast('请粘贴 .txt / .csv 内容', 'warn');
+    return;
+  }
+  try {
+    const r = await api.admin.shopImportInventory(t);
+    let msg = `成功导入 ${r.inserted} 条`;
+    if (r.warnings && r.warnings.length) msg += `（${r.warnings.length} 行跳过）`;
+    toast(msg, 'success');
+    navigate('admin-claude-shop');
+  } catch (e) {
+    toast(e.message || '导入失败', 'error');
+  }
+};
+
+window.confirmShopOrderPaid = function(id) {
+  showModal('确认收款', '<p>确认已收到该笔款项？系统将从库存自动扣减并发货给买家。</p>', async () => {
+    try {
+      await api.admin.shopConfirmOrder(id);
+      toast('已确认并发货', 'success');
+      navigate('admin-claude-shop');
+    } catch (e) {
+      toast(e.message || '操作失败', 'error');
+    }
+  });
+};
+
+async function renderAdminClaudeShop(container) {
+  const actions = $('topbar-actions');
+  if (actions) actions.innerHTML = '';
+  const cfg = await api.admin.shopGetConfig();
+  const pending = await api.admin.shopListOrders('awaiting_payment', 1, 50).catch(() => ({ data: [] }));
+  const pendRows = pending.data || [];
+
+  container.innerHTML = `
+    <div style="max-width:820px;display:flex;flex-direction:column;gap:1rem">
+      <div class="card">
+        <div class="card-header"><div class="card-title">店铺开关与文案</div></div>
+        <div class="card-body">
+          <label style="display:flex;align-items:center;gap:0.5rem;margin-bottom:0.8rem;cursor:pointer">
+            <input type="checkbox" id="shop-cfg-enabled" ${cfg.enabled ? 'checked' : ''} />
+            <span>开启自助购号（关闭后普通用户侧栏不显示入口）</span>
+          </label>
+          <div class="form-group"><label class="form-label">商品标题</label>
+            <input class="form-input" id="shop-cfg-title" value="${escHtml(cfg.title || '')}" /></div>
+          <div class="form-group"><label class="form-label">副标题</label>
+            <input class="form-input" id="shop-cfg-subtitle" value="${escHtml(cfg.subtitle || '')}" /></div>
+          <div class="form-group"><label class="form-label">商品说明</label>
+            <textarea class="form-input" id="shop-cfg-desc" rows="4" style="resize:vertical">${escHtml(cfg.description || '')}</textarea></div>
+          <div class="form-group"><label class="form-label">使用教程链接</label>
+            <input class="form-input" id="shop-cfg-tutorial" placeholder="https://" value="${escHtml(cfg.tutorial_url || '')}" /></div>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">价格与标签</div></div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+            <div class="form-group"><label class="form-label">零售价（元/件）</label>
+              <input type="number" step="0.01" class="form-input" id="shop-cfg-retail" value="${Number(cfg.retail_price_yuan).toFixed(2)}" /></div>
+            <div class="form-group"><label class="form-label">批发价（元/件）</label>
+              <input type="number" step="0.01" class="form-input" id="shop-cfg-wholesale" value="${Number(cfg.wholesale_price_yuan).toFixed(2)}" /></div>
+            <div class="form-group"><label class="form-label">批发起订件数</label>
+              <input type="number" class="form-input" id="shop-cfg-wsqty" value="${cfg.wholesale_min_qty ?? 5}" /></div>
+            <div class="form-group"><label class="form-label">每用户限购（0=不限）</label>
+              <input type="number" class="form-input" id="shop-cfg-maxuser" value="${cfg.max_per_user ?? 0}" /></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:0.45rem;margin:0.6rem 0;cursor:pointer">
+            <input type="checkbox" id="shop-cfg-hot" ${cfg.tag_hot ? 'checked' : ''} /><span>显示「爆火」标签</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:0.45rem;margin:0.3rem 0;cursor:pointer">
+            <input type="checkbox" id="shop-cfg-showws" ${cfg.show_tag_wholesale !== false ? 'checked' : ''} /><span>显示「批发」标签</span>
+          </label>
+          <div class="form-group"><label class="form-label">粉丝福利等自定义标签文案（留空不显示）</label>
+            <input class="form-input" id="shop-cfg-fan" placeholder="如：粉丝福利" value="${escHtml(cfg.tag_fan_welfare || '')}" /></div>
+          <button type="button" class="btn btn-primary" onclick="saveAdminShopConfig()">保存配置</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">收款二维码（原图存储，前端自适应显示）</div></div>
+        <div class="card-body">
+          <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.6rem">支持 png / jpg / webp / gif，单张最大 8MB。</p>
+          <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.8rem">
+            ${cfg.wechat_qr_url ? `<div><div class="form-hint">当前微信</div><img class="shop-qr-img" src="${escHtml(cfg.wechat_qr_url)}" alt="" /></div>` : ''}
+            ${cfg.alipay_qr_url ? `<div><div class="form-hint">当前支付宝</div><img class="shop-qr-img" src="${escHtml(cfg.alipay_qr_url)}" alt="" /></div>` : ''}
+          </div>
+          <div class="form-group"><label class="form-label">上传微信收款码</label><input type="file" id="shop-qr-wechat" accept="image/*" /></div>
+          <div class="form-group"><label class="form-label">上传支付宝收款码</label><input type="file" id="shop-qr-alipay" accept="image/*" /></div>
+          <button type="button" class="btn btn-success btn-sm" onclick="uploadShopQR()">上传所选图片</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">导入库存</div></div>
+        <div class="card-body">
+          <p style="font-size:0.8rem;color:var(--text-secondary);line-height:1.55;margin-bottom:0.5rem">
+            每行一件：<code>邮箱####登录key</code>、<code>----</code> 或 <code>====</code> 分隔；也支持 CSV 两列（自动识别含 @ 的为邮箱）。
+          </p>
+          <textarea class="form-input" id="shop-import-ta" rows="8" style="resize:vertical;font-family:var(--font-mono);font-size:0.78rem" placeholder="user@mail.com####tm_xxx"></textarea>
+          <button type="button" class="btn btn-primary btn-sm" style="margin-top:0.5rem" onclick="runShopImport()">导入到待售池</button>
+          <p style="font-size:0.75rem;color:var(--text-muted);margin-top:0.45rem">当前可售库存：<strong>${cfg.stock_available ?? 0}</strong> 件</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">待确认收款订单</div>
+          <div style="font-size:0.75rem;color:var(--text-muted)">核对到账后点击确认，将自动发货</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>订单号</th><th>买家账号ID</th><th>数量</th><th>应付</th><th>时间</th><th></th></tr></thead>
+            <tbody>
+              ${pendRows.length ? pendRows.map(o => `
+                <tr>
+                  <td style="font-size:0.72rem;font-family:var(--font-mono)">${escHtml(o.id)}</td>
+                  <td style="font-size:0.72rem;font-family:var(--font-mono)">${escHtml(o.account_id)}</td>
+                  <td>${o.quantity}</td>
+                  <td>¥${(o.total_cents / 100).toFixed(2)}</td>
+                  <td style="font-size:0.78rem">${formatDate(o.created_at)}</td>
+                  <td><button type="button" class="btn btn-success btn-sm" onclick='confirmShopOrderPaid("${o.id}")'>确认收款并发货</button></td>
+                </tr>
+              `).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1rem">暂无待处理订单</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
 // ─── 启动 ──────────────────────────────────────────────────
 async function init() {
   applyTheme(state.theme);
@@ -1822,7 +2294,7 @@ async function init() {
   applySiteBranding();
 
   if (state.apiKey && state.account) {
-    showMainLayout();
+    await showMainLayout();
     applySiteBranding();
     navigate('dashboard');
   } else if (state.apiKey) {

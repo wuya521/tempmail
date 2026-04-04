@@ -12,6 +12,8 @@ import (
 
 const AccountKey = "account"
 
+const ErrBannedMessage = "由于违反邮箱服务协议，您的账户已被封禁，无法登录。"
+
 // Auth API Key 认证中间件
 func Auth(s *store.Store) gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -20,7 +22,6 @@ func Auth(s *store.Store) gin.HandlerFunc {
 			apiKey = c.Query("api_key")
 		}
 
-		// 支持 Bearer token 格式
 		apiKey = strings.TrimPrefix(apiKey, "Bearer ")
 		apiKey = strings.TrimSpace(apiKey)
 
@@ -32,15 +33,26 @@ func Auth(s *store.Store) gin.HandlerFunc {
 		}
 
 		account, err := s.GetAccountByAPIKey(c.Request.Context(), apiKey)
-		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
-				"error": "invalid api_key",
+		if err == nil && account != nil {
+			_ = s.TouchAccountLastSeen(c.Request.Context(), account.ID)
+			c.Set(AccountKey, account)
+			c.Next()
+			return
+		}
+
+		// 区分：Key 存在但已停用（封禁） vs 无效 Key
+		anyAcc, errAny := s.GetAccountByAPIKeyAny(c.Request.Context(), apiKey)
+		if errAny == nil && anyAcc != nil && !anyAcc.IsActive {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": ErrBannedMessage,
+				"code":  "account_banned",
 			})
 			return
 		}
 
-		c.Set(AccountKey, account)
-		c.Next()
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
+			"error": "invalid api_key",
+		})
 	}
 }
 

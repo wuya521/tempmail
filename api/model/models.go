@@ -9,13 +9,34 @@ import (
 // ==================== 数据模型 ====================
 
 type Account struct {
-	ID        uuid.UUID `json:"id"`
-	Username  string    `json:"username"`
-	APIKey    string    `json:"api_key"`
-	IsAdmin   bool      `json:"is_admin"`
-	IsActive  bool      `json:"is_active"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID         uuid.UUID  `json:"id"`
+	Username   string     `json:"username"`
+	APIKey     string     `json:"api_key"`
+	IsAdmin    bool       `json:"is_admin"`
+	IsActive   bool       `json:"is_active"`
+	CreatedAt  time.Time  `json:"created_at"`
+	UpdatedAt  time.Time  `json:"updated_at"`
+	LastSeenAt *time.Time `json:"last_seen_at,omitempty"`
+}
+
+// ClaudeOrder 自助售号订单
+type ClaudeOrder struct {
+	ID             uuid.UUID  `json:"id"`
+	AccountID      uuid.UUID  `json:"account_id"`
+	Quantity       int        `json:"quantity"`
+	UnitPriceCents int        `json:"unit_price_cents"`
+	TotalCents     int        `json:"total_cents"`
+	IsWholesale    bool       `json:"is_wholesale"`
+	Status         string     `json:"status"`
+	CreatedAt      time.Time  `json:"created_at"`
+	FulfilledAt    *time.Time `json:"fulfilled_at,omitempty"`
+	Lines          []ClaudeOrderLine `json:"lines,omitempty"`
+}
+
+type ClaudeOrderLine struct {
+	LineIndex int    `json:"line_index"`
+	Email     string `json:"email"`
+	APIKey    string `json:"api_key"`
 }
 
 type Domain struct {

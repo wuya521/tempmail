@@ -14,6 +14,7 @@ type Config struct {
 	RateWindow    int // seconds
 	SMTPServerIP  string // 仅从 SMTP_SERVER_IP 环境变量读取
 	SMTPHostname  string // 邮件服务器场指向的 hostname，不硬编码
+	ShopAssetDir  string // 收款码等静态文件目录
 }
 
 func Load() *Config {
@@ -38,6 +39,7 @@ func Load() *Config {
 		RateWindow:    rw,
 		SMTPServerIP:  os.Getenv("SMTP_SERVER_IP"),
 		SMTPHostname:  os.Getenv("SMTP_HOSTNAME"),
+		ShopAssetDir:  getEnv("SHOP_ASSET_DIR", "/data/shop"),
 	}
 }
 

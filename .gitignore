@@ -11,9 +11,13 @@ api/*.exe
 # IDE
 .idea/
 .vscode/
+.cursor/
 *.swp
 *.swo
 
 # OS
 .DS_Store
 Thumbs.db
+
+# 本地脚本目录（不推送到远程）
+scripts/

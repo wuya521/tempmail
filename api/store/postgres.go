@@ -62,9 +62,59 @@ func (s *Store) Close() {
 func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.Account, error) {
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at
+		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
 		 FROM accounts WHERE api_key = $1 AND is_active = TRUE`, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// GetAccountByAPIKeyAny 按 Key 查询（含已停用），用于区分「封禁」与「Key 错误」
+func (s *Store) GetAccountByAPIKeyAny(ctx context.Context, apiKey string) (*model.Account, error) {
+	var a model.Account
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
+		 FROM accounts WHERE api_key = $1`, apiKey,
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+	if err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
+// TouchAccountLastSeen 节流更新最近活跃（5 分钟内不重复写）
+func (s *Store) TouchAccountLastSeen(ctx context.Context, accountID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET last_seen_at = NOW(), updated_at = NOW()
+		 WHERE id = $1 AND (last_seen_at IS NULL OR last_seen_at < NOW() - INTERVAL '5 minutes')`,
+		accountID,
+	)
+	return err
+}
+
+// SetAccountActive 启用/停用（封禁仅停登录）
+func (s *Store) SetAccountActive(ctx context.Context, accountID uuid.UUID, active bool) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET is_active = $2, updated_at = NOW() WHERE id = $1`,
+		accountID, active,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+func (s *Store) GetAccountByID(ctx context.Context, id uuid.UUID) (*model.Account, error) {
+	var a model.Account
+	err := s.pool.QueryRow(ctx,
+		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
+		 FROM accounts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
 	if err != nil {
 		return nil, err
 	}
@@ -76,9 +126,9 @@ func (s *Store) CreateAccount(ctx context.Context, username string) (*model.Acco
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO accounts (username, api_key) VALUES ($1, $2)
-		 RETURNING id, username, api_key, is_admin, is_active, created_at, updated_at`,
+		 RETURNING id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at`,
 		username, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt)
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
 	if err != nil {
 		return nil, err
 	}
@@ -90,18 +140,39 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID uuid.UUID) error {
 	return err
 }
 
-func (s *Store) ListAccounts(ctx context.Context, page, size int) ([]model.Account, int, error) {
+func (s *Store) ListAccounts(ctx context.Context, page, size int, search string) ([]model.Account, int, error) {
 	var total int
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total)
+	var err error
+	q := strings.TrimSpace(search)
+	if q != "" {
+		pattern := "%" + q + "%"
+		err = s.pool.QueryRow(ctx,
+			`SELECT COUNT(*) FROM accounts WHERE username ILIKE $1 OR api_key ILIKE $1`,
+			pattern,
+		).Scan(&total)
+	} else {
+		err = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total)
+	}
 	if err != nil {
 		return nil, 0, err
 	}
 
-	rows, err := s.pool.Query(ctx,
-		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at
-		 FROM accounts ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-		size, (page-1)*size,
-	)
+	var rows pgx.Rows
+	if q != "" {
+		pattern := "%" + q + "%"
+		rows, err = s.pool.Query(ctx,
+			`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
+			 FROM accounts WHERE username ILIKE $1 OR api_key ILIKE $1
+			 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+			pattern, size, (page-1)*size,
+		)
+	} else {
+		rows, err = s.pool.Query(ctx,
+			`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
+			 FROM accounts ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
+			size, (page-1)*size,
+		)
+	}
 	if err != nil {
 		return nil, 0, err
 	}

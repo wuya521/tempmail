@@ -132,6 +132,8 @@ services:
       SMTP_SERVER_IP: ${SMTP_SERVER_IP}
       SMTP_HOSTNAME: ${SMTP_HOSTNAME}
       ADMIN_KEY_FILE: /data/admin.key
+      # 收款码等文件目录（默认 /data/shop，已含在 ./data 卷内）
+      SHOP_ASSET_DIR: /data/shop
     depends_on:
       pgbouncer:
         condition: service_started

@@ -15,7 +15,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /build/api-server .
 # ==================== 运行阶段 ====================
 FROM alpine:3.20
 
-RUN apk --no-cache add ca-certificates tzdata
+# 国内构建时 apk 拉 dl-cdn.alpinelinux.org 常极慢（数分钟～超时）；替换为阿里云镜像可明显加速。
+# 若在境外构建且镜像不可用，可改为官方源：删除下行 sed，仅保留 apk 命令。
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories \
+    && apk --no-cache add ca-certificates tzdata
 ENV TZ=Asia/Shanghai
 
 COPY --from=builder /build/api-server /usr/local/bin/api-server

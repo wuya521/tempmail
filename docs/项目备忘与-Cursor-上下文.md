@@ -12,6 +12,7 @@ GitHub：github.com/wuya521/tempmail，main 分支；本地开发路径 e:\AImai
 服务器拉代码用 SSH：git@github.com:wuya521/tempmail.git；勿在服务器设 127.0.0.1:7890 为 git 代理（7890 是本地电脑代理）。
 api/Dockerfile 已内置 GOPROXY=https://goproxy.cn,direct 与 GOSUMDB，勿在服务器再改 Dockerfile 以免 dirty；更新流程 git pull → docker compose build api → up -d api。
 docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码目录 data/shop）。
+nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location ~* \\.(png|jpg)$ 会抢走 /public/shop-assets/*.png 导致收款码 404。
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
 数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（如 migrate_v5 含 Claude 店铺与 accounts.last_seen_at）。
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。

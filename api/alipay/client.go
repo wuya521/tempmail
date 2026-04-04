@@ -337,7 +337,7 @@ func ParsePublicKey(raw string) (*rsa.PublicKey, error) {
 				}
 				return nil, fmt.Errorf("public key is not RSA")
 			}
-			if pub, err := rsa.ParsePKCS1PublicKey(block.Bytes); err == nil {
+			if pub, err := x509.ParsePKCS1PublicKey(block.Bytes); err == nil {
 				return pub, nil
 			}
 		}
@@ -360,7 +360,7 @@ func ParsePublicKey(raw string) (*rsa.PublicKey, error) {
 				return rk, nil
 			}
 		}
-		if pub, err := rsa.ParsePKCS1PublicKey(der); err == nil {
+		if pub, err := x509.ParsePKCS1PublicKey(der); err == nil {
 			return pub, nil
 		}
 	}

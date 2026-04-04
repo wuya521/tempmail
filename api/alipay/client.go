@@ -145,11 +145,10 @@ func (c *Client) VerifyNotify(params map[string]string) error {
 }
 
 func signRSA2(params map[string]string, key *rsa.PrivateKey) (string, error) {
-	// 网关请求验签：待签名字符串须与开放平台一致——除 sign 外非空参数均参与（含 sign_type、format）。
-	// 异步通知验签仍用 buildSignContent，那边按文档排除 sign、sign_type。
+	// 与官方 SDK 一致：待签名字符串剔除 sign、sign_type；空值不参与。
 	p := make(map[string]string, len(params))
 	for k, v := range params {
-		if k == "sign" {
+		if k == "sign" || k == "sign_type" {
 			continue
 		}
 		if strings.TrimSpace(v) == "" {

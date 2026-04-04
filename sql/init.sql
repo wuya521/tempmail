@@ -122,9 +122,28 @@ CREATE TABLE claude_shop_config (
     wechat_qr_file          VARCHAR(255) NOT NULL DEFAULT '',
     alipay_qr_file          VARCHAR(255) NOT NULL DEFAULT '',
     static_payment_manual_confirm BOOLEAN NOT NULL DEFAULT TRUE,
+    static_qr_enabled       BOOLEAN      NOT NULL DEFAULT TRUE,
     updated_at              TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 INSERT INTO claude_shop_config (id) VALUES (1);
+
+CREATE TABLE claude_shop_products (
+    id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    sort_order            INT          NOT NULL DEFAULT 0,
+    enabled               BOOLEAN      NOT NULL DEFAULT TRUE,
+    title                 VARCHAR(160) NOT NULL,
+    description           TEXT         NOT NULL DEFAULT '',
+    tag                   VARCHAR(64)  NOT NULL DEFAULT '',
+    retail_price_cents    INT          NOT NULL DEFAULT 0,
+    wholesale_min_qty     INT          NOT NULL DEFAULT 5,
+    wholesale_price_cents INT          NOT NULL DEFAULT 0,
+    created_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at            TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (wholesale_min_qty >= 1),
+    CHECK (retail_price_cents >= 0),
+    CHECK (wholesale_price_cents >= 0)
+);
+CREATE INDEX idx_claude_shop_products_enabled_sort ON claude_shop_products (enabled, sort_order, created_at);
 
 CREATE TABLE claude_orders (
     id               UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -136,6 +155,8 @@ CREATE TABLE claude_orders (
     status           VARCHAR(32)  NOT NULL DEFAULT 'awaiting_payment',
     payment_channel  VARCHAR(24)  NOT NULL DEFAULT 'static',
     alipay_trade_no  VARCHAR(64),
+    product_id       UUID         REFERENCES claude_shop_products(id) ON DELETE SET NULL,
+    product_title_snapshot VARCHAR(160) NOT NULL DEFAULT '',
     created_at       TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     fulfilled_at     TIMESTAMPTZ
 );

@@ -25,7 +25,13 @@ const state = {
   adminShopOrdersPage: 1,
   /** 管理端订单筛选：''=全部 awaiting_payment fulfilled */
   adminShopOrdersStatus: '',
+  /** 管理端「在售 SKU」正在编辑的商品 id */
+  adminShopProductEditId: null,
   claudeHighlightOrderId: null,
+  /** 多 SKU 模式下当前选中的商品 id */
+  claudeSelectedProductId: null,
+  /** 无多 SKU 时，需用户点击默认商品卡片后才允许支付 */
+  claudeShopDefaultAck: false,
   _claudeShopSummary: null,
   /** 支付宝当面付订单轮询定时器 */
   claudeAlipayPollTimer: null,
@@ -316,6 +322,10 @@ const api = {
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
     shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
     shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
+    shopListProducts: () => apiFetch(API_BASE + '/admin/shop/products'),
+    shopCreateProduct: body => apiFetch(API_BASE + '/admin/shop/products', { method: 'POST', body: JSON.stringify(body) }),
+    shopUpdateProduct: (id, body) => apiFetch(API_BASE + '/admin/shop/products/' + id, { method: 'PUT', body: JSON.stringify(body) }),
+    shopDeleteProduct: id => apiFetch(API_BASE + '/admin/shop/products/' + id, { method: 'DELETE' }),
     shopImportInventory: (text, batch) => {
       let u = API_BASE + '/admin/shop/inventory/import';
       if (batch) u += '?batch=' + encodeURIComponent(batch);
@@ -627,6 +637,9 @@ function buildMainLayout() {
         <button class="nav-item" data-page="admin-shop-settings" onclick="navigate('admin-shop-settings')">
           <span class="nav-icon">🏷</span><span>商品与收款</span>
         </button>
+        <button class="nav-item" data-page="admin-shop-products" onclick="navigate('admin-shop-products')">
+          <span class="nav-icon">🛒</span><span>在售 SKU</span>
+        </button>
         <button class="nav-item" data-page="admin-shop-inventory" onclick="navigate('admin-shop-inventory')">
           <span class="nav-icon">📦</span><span>库存与货物</span>
         </button>
@@ -713,6 +726,7 @@ async function renderPage(page) {
     'claude-shop':    ['自助 Claude 账号', '选购商品'],
     'claude-shop-orders': ['我的订单', '记录与发货信息'],
     'admin-shop-settings': ['商品与收款', '文案、价格、收款码'],
+    'admin-shop-products': ['在售 SKU', '多商品与标签'],
     'admin-shop-inventory': ['库存与货物', '导入与货物列表'],
     'admin-shop-orders': ['订单与发货', '待确认与历史订单'],
     'apikey-show':    ['API Key', ''],
@@ -735,6 +749,7 @@ async function renderPage(page) {
       case 'claude-shop':    await renderClaudeShop(container); break;
       case 'claude-shop-orders': await renderClaudeShopOrders(container); break;
       case 'admin-shop-settings': await renderAdminShopSettings(container); break;
+      case 'admin-shop-products': await renderAdminShopProducts(container); break;
       case 'admin-shop-inventory': await renderAdminShopInventory(container); break;
       case 'admin-shop-orders': await renderAdminShopOrders(container); break;
       case 'apikey-show':    renderApiKeyShow(container); break;
@@ -2238,13 +2253,46 @@ async function buildClaudeShopHighlightHtml() {
   }
 }
 
+function claudeShopGetSelectedProduct(summary) {
+  const prods = summary.products || [];
+  if (!summary.product_pick_required || !prods.length) return null;
+  const id = state.claudeSelectedProductId;
+  return prods.find(p => p.id === id) || null;
+}
+
+window.claudeShopAckDefaultProduct = function() {
+  state.claudeShopDefaultAck = true;
+  document.querySelectorAll('.shop-product-card[data-default-product="1"]').forEach(card => {
+    card.classList.add('shop-product-card--selected');
+  });
+  claudeShopPriceRefresh();
+};
+
+window.claudeShopSelectProduct = function(id) {
+  state.claudeSelectedProductId = id;
+  document.querySelectorAll('.shop-product-card[data-product-id]').forEach(card => {
+    card.classList.toggle('shop-product-card--selected', card.getAttribute('data-product-id') === id);
+  });
+  claudeShopPriceRefresh();
+};
+
 window.claudeShopPriceRefresh = function() {
   const s = state._claudeShopSummary;
   if (!s) return;
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
-  const minW = s.wholesale_min_qty || 5;
+  const picked = claudeShopGetSelectedProduct(s);
+  let minW, retailY, wholesaleY;
+  if (picked) {
+    minW = picked.wholesale_min_qty || 5;
+    retailY = Number(picked.retail_price_yuan);
+    wholesaleY = Number(picked.wholesale_price_yuan);
+  } else {
+    minW = s.wholesale_min_qty || 5;
+    retailY = Number(s.retail_price_yuan);
+    wholesaleY = Number(s.wholesale_price_yuan);
+  }
   const isWs = qty >= minW;
-  const unit = isWs ? Number(s.wholesale_price_yuan) : Number(s.retail_price_yuan);
+  const unit = isWs ? wholesaleY : retailY;
   const total = unit * qty;
   const txt = '¥' + total.toFixed(2);
   const el = $('claude-shop-pay-total');
@@ -2255,7 +2303,15 @@ window.claudeShopPriceRefresh = function() {
   if (el2) {
     el2.textContent = isWs
       ? `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`
-      : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${Number(s.wholesale_price_yuan).toFixed(2)} / 件`;
+      : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${wholesaleY.toFixed(2)} / 件`;
+  }
+  const payBtn = document.querySelector('[data-claude-shop-pay]');
+  if (payBtn) {
+    const showStaticPay = s.static_qr_enabled && !!(s.wechat_qr_url || s.alipay_qr_url);
+    const canPay = (s.alipay_precreate_available || showStaticPay);
+    const needPickMulti = s.product_pick_required && (s.products || []).length > 0 && !picked;
+    const needAckDefault = !s.product_pick_required && !state.claudeShopDefaultAck;
+    payBtn.disabled = !canPay || needPickMulti || needAckDefault;
   }
   syncClaudeShopModalGate();
 };
@@ -2283,7 +2339,26 @@ window.closeClaudeShopPayModal = function() {
 window.openClaudeShopPayFlow = function() {
   const s = state._claudeShopSummary;
   if (!s) return;
-  const useAlipay = s.alipay_precreate_available && $('claude-shop-pay-mode-alipay')?.checked;
+  const showStaticPay = s.static_qr_enabled && !!(s.wechat_qr_url || s.alipay_qr_url);
+  if (!s.alipay_precreate_available && !showStaticPay) {
+    toast('未配置可用支付方式', 'warn');
+    return;
+  }
+  const pickReq = s.product_pick_required && (s.products || []).length > 0;
+  if (pickReq && !state.claudeSelectedProductId) {
+    toast('请先点击选择一款商品', 'warn');
+    return;
+  }
+  if (!pickReq && !state.claudeShopDefaultAck) {
+    toast('请先点击商品卡片确认选购，再支付', 'warn');
+    return;
+  }
+  let useAlipay = !!s.alipay_precreate_available;
+  if (showStaticPay && s.alipay_precreate_available) {
+    useAlipay = $('claude-shop-pay-mode-alipay')?.checked !== false;
+  } else if (showStaticPay && !s.alipay_precreate_available) {
+    useAlipay = false;
+  }
   if (useAlipay) {
     openClaudeShopAlipayPayModal();
   } else {
@@ -2301,6 +2376,15 @@ window.openClaudeShopAlipayPayModal = async function() {
   const stock = s.stock_available ?? 0;
   if (stock < 1) {
     toast('暂时缺货', 'warn');
+    return;
+  }
+  const pickReq = s.product_pick_required && (s.products || []).length > 0;
+  if (pickReq && !state.claudeSelectedProductId) {
+    toast('请先点击选择一款商品', 'warn');
+    return;
+  }
+  if (!pickReq && !state.claudeShopDefaultAck) {
+    toast('请先点击商品卡片确认选购，再支付', 'warn');
     return;
   }
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
@@ -2325,7 +2409,9 @@ window.openClaudeShopAlipayPayModal = async function() {
   overlay.addEventListener('click', e => { if (e.target === overlay) closeClaudeShopPayModal(); });
   claudeShopPriceRefresh();
   try {
-    const r = await api.shopCreateOrder({ quantity: qty, payment_method: 'alipay' });
+    const body = { quantity: qty, payment_method: 'alipay' };
+    if (state.claudeSelectedProductId) body.product_id = state.claudeSelectedProductId;
+    const r = await api.shopCreateOrder(body);
     const qr = r.payment && r.payment.alipay_qr_code;
     const hint = (r.payment && r.payment.hint) || '请使用支付宝扫码支付。';
     if (!qr) {
@@ -2378,6 +2464,15 @@ window.openClaudeShopPayModal = function() {
     toast('购买数量超过当前库存', 'warn');
     return;
   }
+  const pickReq = s.product_pick_required && (s.products || []).length > 0;
+  if (pickReq && !state.claudeSelectedProductId) {
+    toast('请先点击选择一款商品', 'warn');
+    return;
+  }
+  if (!pickReq && !state.claudeShopDefaultAck) {
+    toast('请先点击商品卡片确认选购，再支付', 'warn');
+    return;
+  }
   if (!s.wechat_qr_url && !s.alipay_qr_url) {
     toast('管理员尚未上传收款码，请联系店主', 'warn');
     return;
@@ -2406,7 +2501,7 @@ window.openClaudeShopPayModal = function() {
         <button type="button" class="btn btn-ghost" onclick="closeClaudeShopPayModal()">取消</button>
         <button type="button" class="btn btn-primary" id="claude-shop-modal-submit" disabled onclick="submitClaudeShopOrder()">确认并生成订单</button>
       </div>
-      <p style="font-size:0.72rem;color:var(--text-muted);margin-top:0.65rem;line-height:1.45">同一账号仅允许一笔「待确认收款」订单。</p>
+      <p style="font-size:0.72rem;color:var(--text-muted);margin-top:0.65rem;line-height:1.45">使用静态收款码时，同一账号仅允许一笔待管理员确认的订单；支付宝当面付可继续下新单。</p>
     </div>
   `;
   document.body.appendChild(overlay);
@@ -2423,7 +2518,9 @@ window.submitClaudeShopOrder = async function() {
   }
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   try {
-    const r = await api.shopCreateOrder({ quantity: qty, payment_method: 'static' });
+    const body = { quantity: qty, payment_method: 'static' };
+    if (state.claudeSelectedProductId) body.product_id = state.claudeSelectedProductId;
+    const r = await api.shopCreateOrder(body);
     closeClaudeShopPayModal();
     state.claudeHighlightOrderId = r.order.id;
     const done = r.order && r.order.status === 'fulfilled';
@@ -2468,37 +2565,98 @@ async function renderClaudeShop(container) {
   if (summary.tag_fan_welfare) tags.push(`<span class="shop-tag shop-tag-fan">${escHtml(summary.tag_fan_welfare)}</span>`);
   if (summary.max_per_user > 0) tags.push(`<span class="shop-tag">限购 · 每用户 ${summary.max_per_user} 件</span>`);
 
+  const prods = summary.products || [];
+  const pickReq = summary.product_pick_required && prods.length > 0;
+  if (pickReq) {
+    const ids = new Set(prods.map(p => p.id));
+    if (state.claudeSelectedProductId && !ids.has(state.claudeSelectedProductId)) state.claudeSelectedProductId = null;
+  } else {
+    state.claudeSelectedProductId = null;
+    state.claudeShopDefaultAck = false;
+  }
+
   const myOrders = await api.shopListOrders(1, 20).catch(() => ({ data: [] }));
   const orders = myOrders.data || [];
-  const pendingOrder = orders.find(o => o.status === 'awaiting_payment');
+  const pendingStaticOrder = orders.find(o => o.status === 'awaiting_payment' && o.payment_channel !== 'alipay_precreate');
+  const showStaticPay = summary.static_qr_enabled && !!(summary.wechat_qr_url || summary.alipay_qr_url);
+  const alipayOk = !!summary.alipay_precreate_available;
+  const blockCheckoutEntirely = !!pendingStaticOrder && !alipayOk;
+  const restrictStaticDueToPending = !!pendingStaticOrder && alipayOk;
 
-  const purchaseSection = pendingOrder ? `
+  let productGridHtml = '';
+  if (pickReq) {
+    productGridHtml = prods.map(p => {
+      const sel = state.claudeSelectedProductId === p.id;
+      const tagHtml = p.tag ? `<span class="shop-product-card-tag">${escHtml(p.tag)}</span>` : '';
+      return `<button type="button" class="shop-product-card${sel ? ' shop-product-card--selected' : ''}" data-product-id="${escHtml(p.id)}" onclick="claudeShopSelectProduct('${escHtml(p.id)}')">
+        <div class="shop-product-card-head">${tagHtml}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
+        <p class="shop-product-card-desc">${escHtml(p.description || '')}</p>
+        <div class="shop-product-card-prices">
+          <span class="shop-product-card-retail">¥${Number(p.retail_price_yuan).toFixed(2)}<small>/件</small></span>
+          <span class="shop-product-card-ws">满 ${p.wholesale_min_qty || 5} 件 · ¥${Number(p.wholesale_price_yuan).toFixed(2)}/件</span>
+        </div>
+        <div class="shop-product-card-foot"><span class="shop-product-card-picked">已选中</span><span class="shop-product-card-hint">点击选中</span></div>
+      </button>`;
+    }).join('');
+  } else {
+    const selDef = state.claudeShopDefaultAck;
+    productGridHtml = `<button type="button" class="shop-product-card shop-product-card--default${selDef ? ' shop-product-card--selected' : ''}" data-default-product="1" onclick="claudeShopAckDefaultProduct()" aria-label="店铺默认商品，点击确认选购">
+      <div class="shop-product-card-head"><span class="shop-product-card-title">${escHtml(summary.title || 'Claude 账号')}</span></div>
+      <p class="shop-product-card-desc">${escHtml(summary.description || '')}</p>
+      <div class="shop-product-card-prices">
+        <span class="shop-product-card-retail">¥${Number(summary.retail_price_yuan).toFixed(2)}<small>/件</small></span>
+        <span class="shop-product-card-ws">满 ${summary.wholesale_min_qty || 5} 件 · ¥${Number(summary.wholesale_price_yuan).toFixed(2)}/件</span>
+      </div>
+      <div class="shop-product-card-foot"><span class="shop-product-card-picked">已确认 · 可支付</span><span class="shop-product-card-hint">请点击卡片确认选购</span></div>
+    </button>`;
+  }
+
+  let payHint = '';
+  if (summary.alipay_precreate_available && showStaticPay) {
+    payHint = '选「当面付」将直接生成订单并展示支付宝二维码；选「静态码」请先扫码付款，再勾选确认生成订单。';
+  } else if (summary.alipay_precreate_available && !showStaticPay) {
+    payHint = '使用支付宝当面付：支付成功后系统自动发货。';
+  } else if (showStaticPay) {
+    payHint = '先弹出静态码完成支付，勾选确认后生成订单；发货后请在「我的订单」查看。';
+  } else {
+    payHint = '当前未配置可用支付方式，请联系店主。';
+  }
+
+  let payBtnLabel = '去支付';
+  if (summary.alipay_precreate_available && showStaticPay) payBtnLabel = '继续支付';
+  else if (summary.alipay_precreate_available && !showStaticPay) payBtnLabel = '支付宝支付';
+  else if (showStaticPay) payBtnLabel = '打开收款码并生成订单';
+
+  const staticRadioAttrs = restrictStaticDueToPending ? 'disabled' : '';
+  const payModeBlock = (summary.alipay_precreate_available && showStaticPay) ? `
+          <div style="margin:0.65rem 0;font-size:0.86rem;line-height:1.55">
+            <span style="color:var(--text-muted);display:block;margin-bottom:0.35rem">支付方式</span>
+            <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer;margin-bottom:0.25rem">
+              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-alipay" value="alipay" checked onchange="claudeShopPriceRefresh()" />
+              <span><strong>支付宝当面付</strong>（官方动态码，付完自动发货）</span>
+            </label>
+            <label style="display:flex;align-items:flex-start;gap:0.45rem;cursor:${restrictStaticDueToPending ? 'not-allowed' : 'pointer'};opacity:${restrictStaticDueToPending ? '0.72' : '1'}">
+              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-static" value="static" onchange="claudeShopPriceRefresh()" ${staticRadioAttrs} />
+              <span>微信 / 支付宝静态收款码（需管理员确认）${restrictStaticDueToPending ? '<span style="display:block;font-size:0.78rem;color:var(--clr-warn);margin-top:0.2rem">您有待管理员确认的静态收款订单，请先处理或改用当面付；静态码暂不可再选。</span>' : ''}</span>
+            </label>
+          </div>` : '';
+
+  const purchaseSection = blockCheckoutEntirely ? `
         <div class="shop-checkout-panel" style="margin-top:0.5rem;padding:1rem;background:rgba(230,126,34,0.12);border-radius:var(--radius);border:1px solid var(--border-light)">
-          <p style="font-size:0.9rem;line-height:1.55;margin-bottom:0.65rem">您有 <strong>一笔</strong> 订单正在等待管理员确认收款。为避免重复付款，需处理完成后再下单。</p>
-          <button type="button" class="btn btn-primary btn-sm" onclick="claudeShopViewOrder('${pendingOrder.id}')">前往我的订单 · 查看收款码</button>
+          <p style="font-size:0.9rem;line-height:1.55;margin-bottom:0.65rem">您有 <strong>一笔</strong> 待管理员确认的静态收款订单，且当前仅支持静态码支付。请先等待该笔订单处理完成后再继续购买。</p>
+          <button type="button" class="btn btn-primary btn-sm" onclick="claudeShopViewOrder('${pendingStaticOrder.id}')">前往我的订单</button>
         </div>
         ` : `
         <div class="shop-checkout-panel" style="margin-top:0.5rem;padding:1rem 0 0">
+          ${restrictStaticDueToPending ? `<div class="shop-pending-static-banner" role="status"><strong>提示：</strong>您有待确认的静态收款订单，仍可继续使用<strong>支付宝当面付</strong>下单；静态码路径需等上一单处理完毕。</div>` : ''}
           <label class="form-label">购买数量</label>
           <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
           <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
           <p class="shop-checkout-total-line">应付金额：<span id="claude-shop-pay-total">—</span></p>
-          ${summary.alipay_precreate_available ? `
-          <div style="margin:0.65rem 0;font-size:0.86rem;line-height:1.55">
-            <span style="color:var(--text-muted);display:block;margin-bottom:0.35rem">支付方式</span>
-            <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer;margin-bottom:0.25rem">
-              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-alipay" value="alipay" checked />
-              <span><strong>支付宝当面付</strong>（官方动态码，付完自动发货）</span>
-            </label>
-            <label style="display:flex;align-items:center;gap:0.45rem;cursor:pointer">
-              <input type="radio" name="claude-shop-pay-mode" id="claude-shop-pay-mode-static" value="static" />
-              <span>微信 / 支付宝静态收款码（备用，流程与原先一致）</span>
-            </label>
-          </div>` : ''}
-          <button type="button" class="btn btn-primary" style="margin-top:0.25rem" onclick="openClaudeShopPayFlow()">${summary.alipay_precreate_available ? '继续支付' : '打开收款码并生成订单'}</button>
-          <p class="shop-checkout-hint">${summary.alipay_precreate_available
-    ? '选「当面付」将直接生成订单并展示支付宝二维码；选「静态码」请先扫码付款，再勾选确认生成订单。'
-    : '先弹出二维码完成支付，勾选确认后关闭弹窗并生成订单号；发货后请在「我的订单」查看账号。'}</p>
+          ${payModeBlock}
+          <button type="button" class="btn btn-primary" data-claude-shop-pay style="margin-top:0.25rem" onclick="openClaudeShopPayFlow()">${escHtml(payBtnLabel)}</button>
+          <p class="shop-checkout-hint">${escHtml(payHint)}</p>
+          ${pickReq ? '<p class="shop-checkout-hint" style="color:var(--clr-warn)">请先点击上方卡片<strong>选中</strong>一款商品，再支付。</p>' : '<p class="shop-checkout-hint" style="color:var(--clr-warn)">请先点击上方商品卡片<strong>确认选购</strong>，再支付。</p>'}
         </div>
         `;
 
@@ -2513,13 +2671,10 @@ async function renderClaudeShop(container) {
       </div>
       <div class="card-body">
         <section class="shop-product-panel" aria-label="商品信息">
-          <div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>
-          <p style="font-size:0.88rem;line-height:1.65;color:var(--text-secondary);white-space:pre-wrap">${escHtml(summary.description || '')}</p>
-          ${summary.tutorial_url ? `<p style="margin-top:0.55rem"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程点我！！</a></p>` : ''}
-          <div style="margin-top:1rem;display:flex;flex-wrap:wrap;gap:1.1rem;align-items:center;font-size:0.88rem">
-            <div><span style="color:var(--text-muted)">库存</span> <strong>${summary.stock_available ?? 0}</strong> 件</div>
-            <div><span style="color:var(--text-muted)">零售</span> <strong>¥${Number(summary.retail_price_yuan).toFixed(2)}</strong> / 件</div>
-            <div><span style="color:var(--text-muted)">批发</span> <strong>¥${Number(summary.wholesale_price_yuan).toFixed(2)}</strong> / 件（${summary.wholesale_min_qty || 5} 件起）</div>
+          ${!pickReq ? `<div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>` : `<p class="form-label" style="margin-bottom:0.65rem">选择商品 <span style="font-weight:400;color:var(--text-muted);font-size:0.82rem">（必选 · 点击卡片选中）</span></p>`}
+          <div class="shop-product-grid">${productGridHtml}</div>
+          <div class="shop-stock-banner"><span class="text-muted">共用库存</span> <strong>${summary.stock_available ?? 0}</strong> 件可售
+            ${summary.tutorial_url ? `<span class="shop-stock-banner-tutorial"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></span>` : ''}
           </div>
         </section>
         <section class="shop-checkout-panel" aria-label="购买">
@@ -2554,17 +2709,20 @@ async function renderClaudeShopOrders(container) {
       <div class="card-header"><div class="card-title">我的订单</div></div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间</th><th>数量</th><th>应付</th><th>状态</th><th></th></tr></thead>
+          <thead><tr><th>时间</th><th>商品</th><th>数量</th><th>应付</th><th>状态</th><th></th></tr></thead>
           <tbody>
-            ${orders.length ? orders.map(o => `
+            ${orders.length ? orders.map(o => {
+              const pt = (o.product_title_snapshot && String(o.product_title_snapshot).trim()) || '—';
+              return `
               <tr>
                 <td style="font-size:0.78rem">${formatDate(o.created_at)}</td>
+                <td style="font-size:0.78rem;max-width:140px">${escHtml(pt)}</td>
                 <td>${o.quantity}</td>
                 <td>¥${(o.total_cents / 100).toFixed(2)}</td>
                 <td>${o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : (o.payment_channel === 'alipay_precreate' ? '<span class="badge badge-gray">待支付·支付宝</span>' : '<span class="badge badge-gray">待确认收款</span>')}</td>
                 <td><button type="button" class="btn btn-ghost btn-sm" onclick="claudeShopViewOrder('${o.id}')">查看详情</button></td>
-              </tr>
-            `).join('') : '<tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
+              </tr>`;
+            }).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -2588,6 +2746,7 @@ window.saveAdminShopConfig = async function() {
     tag_fan_welfare: ($('shop-cfg-fan')?.value || '').trim(),
     max_per_user: parseInt($('shop-cfg-maxuser')?.value || '0', 10) || 0,
     static_payment_manual_confirm: $('shop-cfg-static-manual')?.checked !== false,
+    static_qr_enabled: $('shop-cfg-static-qr')?.checked !== false,
   };
   try {
     await api.admin.shopPutConfig(body);
@@ -2770,6 +2929,9 @@ window.showAdminShopOrderDetail = async function(id) {
     const stLabel = o.status === 'fulfilled' ? '已发货' : (o.status === 'awaiting_payment' ? '待确认收款' : o.status);
     let body = `<p style="font-size:0.85rem"><strong>状态</strong> ${stLabel}</p>`;
     body += `<p style="font-size:0.85rem"><strong>买家账号</strong> <code style="font-size:0.78rem">${escHtml(o.account_id)}</code></p>`;
+    if (o.product_title_snapshot && String(o.product_title_snapshot).trim()) {
+      body += `<p style="font-size:0.85rem"><strong>商品</strong> ${escHtml(o.product_title_snapshot)}</p>`;
+    }
     body += `<p style="font-size:0.85rem"><strong>数量</strong> ${o.quantity} · <strong>应付</strong> ¥${(o.total_cents / 100).toFixed(2)}</p>`;
     if ((o.lines || []).length) {
       body += `<p class="form-label" style="margin-top:0.85rem">已发货账号</p>`;
@@ -2814,7 +2976,8 @@ window.showAdminShopOrderDetail = async function(id) {
 async function renderAdminShopSettings(container) {
   const actions = $('topbar-actions');
   if (actions) {
-    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-products')">在售 SKU</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>
       <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
   }
   const cfg = await api.admin.shopGetConfig();
@@ -2859,27 +3022,33 @@ async function renderAdminShopSettings(container) {
           <div class="form-group"><label class="form-label">粉丝福利等自定义标签文案（留空不显示）</label>
             <input class="form-input" id="shop-cfg-fan" placeholder="如：粉丝福利" value="${escHtml(cfg.tag_fan_welfare || '')}" /></div>
           <label style="display:flex;align-items:flex-start;gap:0.45rem;margin:0.75rem 0;cursor:pointer;line-height:1.45">
+            <input type="checkbox" id="shop-cfg-static-qr" style="margin-top:0.2rem" ${cfg.static_qr_enabled !== false ? 'checked' : ''} />
+            <span><strong>启用静态收款码</strong>：开启后用户可选用微信/支付宝静态码；<strong>静态码</strong>路径下同一账号仅允许一笔待管理员确认。关闭后用户端不展示静态码；<strong>支付宝当面付</strong>始终可多笔待支付并行（若已配置）。</span>
+          </label>
+          <label style="display:flex;align-items:flex-start;gap:0.45rem;margin:0.75rem 0;cursor:pointer;line-height:1.45">
             <input type="checkbox" id="shop-cfg-static-manual" style="margin-top:0.2rem" ${cfg.static_payment_manual_confirm !== false ? 'checked' : ''} />
             <span><strong>静态收款码</strong>订单需管理员手动确认发货（推荐开启）。关闭后用户选静态码下单将<strong>立即自动发货</strong>，无法核实是否付款。</span>
           </label>
           <p style="font-size:0.78rem;color:var(--text-muted);margin:-0.35rem 0 0.6rem;line-height:1.45">
-            支付宝当面付订单不受此项影响，支付成功后会始终自动发货。
+            支付宝当面付订单不受「手动确认」影响，支付成功后会始终自动发货。
             ${cfg.alipay_precreate_available ? '<span style="color:var(--clr-success)">当前：支付宝当面付已配置。</span>' : '<span>当面付：请在服务器配置 ALIPAY_* 环境变量。</span>'}
           </p>
+          <p style="font-size:0.78rem;color:var(--text-muted);margin-bottom:0.6rem;line-height:1.45">多商品与独立标价请到侧栏「在售 SKU」维护；未添加任何 SKU 时，用户侧使用本页的默认标题与价格。</p>
           <button type="button" class="btn btn-primary" onclick="saveAdminShopConfig()">保存配置</button>
         </div>
       </div>
       <div class="card">
-        <div class="card-header"><div class="card-title">收款二维码（原图存储，前端自适应显示）</div></div>
+        <div class="card-header"><div class="card-title">收款二维码（静态码，需先勾选「启用静态收款码」）</div></div>
         <div class="card-body">
+          ${cfg.static_qr_enabled === false ? `<p style="font-size:0.85rem;color:var(--clr-warn);margin-bottom:0.75rem">静态收款码已关闭：用户端不会展示静态码，也无法再发起静态码支付。需要时请先勾选上方「启用静态收款码」并保存。</p>` : ''}
           <p style="font-size:0.8rem;color:var(--text-muted);margin-bottom:0.6rem">支持 png / jpg / jpeg / webp / gif / bmp / jfif，单张最大 8MB。</p>
           <div style="display:flex;flex-wrap:wrap;gap:1rem;margin-bottom:0.8rem">
             ${cfg.wechat_qr_url ? `<div><div class="form-hint">当前微信</div><img class="shop-qr-img" src="${escHtml(cfg.wechat_qr_url)}" alt="" /></div>` : ''}
             ${cfg.alipay_qr_url ? `<div><div class="form-hint">当前支付宝</div><img class="shop-qr-img" src="${escHtml(cfg.alipay_qr_url)}" alt="" /></div>` : ''}
           </div>
-          <div class="form-group"><label class="form-label">上传微信收款码</label><input type="file" id="shop-qr-wechat" accept="image/*" /></div>
-          <div class="form-group"><label class="form-label">上传支付宝收款码</label><input type="file" id="shop-qr-alipay" accept="image/*" /></div>
-          <button type="button" class="btn btn-success btn-sm" onclick="uploadShopQR()">上传所选图片</button>
+          <div class="form-group"><label class="form-label">上传微信收款码</label><input type="file" id="shop-qr-wechat" accept="image/*" ${cfg.static_qr_enabled === false ? 'disabled' : ''} /></div>
+          <div class="form-group"><label class="form-label">上传支付宝收款码</label><input type="file" id="shop-qr-alipay" accept="image/*" ${cfg.static_qr_enabled === false ? 'disabled' : ''} /></div>
+          <button type="button" class="btn btn-success btn-sm" onclick="uploadShopQR()" ${cfg.static_qr_enabled === false ? 'disabled' : ''}>上传所选图片</button>
         </div>
       </div>
     </div>
@@ -2890,6 +3059,7 @@ async function renderAdminShopInventory(container) {
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-settings')">商品与收款</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-products')">在售 SKU</button>
       <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
   }
   const inventoryPage = state.adminShopInventoryPage || 1;
@@ -3026,6 +3196,7 @@ async function renderAdminShopOrders(container) {
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-settings')">商品与收款</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-products')">在售 SKU</button>
       <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>`;
   }
   const status = state.adminShopOrdersStatus || '';
@@ -3056,16 +3227,18 @@ async function renderAdminShopOrders(container) {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>订单号</th><th>买家账号ID</th><th>数量</th><th>应付</th><th>状态</th><th>时间</th><th></th></tr></thead>
+            <thead><tr><th>订单号</th><th>商品</th><th>买家账号ID</th><th>数量</th><th>应付</th><th>状态</th><th>时间</th><th></th></tr></thead>
             <tbody>
               ${rows.length ? rows.map(o => {
                 const st = o.status === 'fulfilled' ? '<span class="badge badge-green">已发货</span>' : '<span class="badge badge-gray">待确认</span>';
                 const confirmBtn = o.status === 'awaiting_payment'
                   ? `<button type="button" class="btn btn-success btn-sm" onclick='confirmShopOrderPaid("${o.id}")'>确认发货</button>`
                   : '';
+                const ptitle = (o.product_title_snapshot && String(o.product_title_snapshot).trim()) || '—';
                 return `
                 <tr>
                   <td style="font-size:0.7rem;font-family:var(--font-mono);max-width:120px;word-break:break-all">${escHtml(o.id)}</td>
+                  <td style="font-size:0.78rem;max-width:140px">${escHtml(ptitle)}</td>
                   <td style="font-size:0.7rem;font-family:var(--font-mono);max-width:100px;word-break:break-all">${escHtml(o.account_id)}</td>
                   <td>${o.quantity}</td>
                   <td>¥${(o.total_cents / 100).toFixed(2)}</td>
@@ -3076,7 +3249,7 @@ async function renderAdminShopOrders(container) {
                     ${confirmBtn}
                   </td>
                 </tr>`;
-              }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
+              }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:1rem">暂无订单</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -3086,6 +3259,136 @@ async function renderAdminShopOrders(container) {
             <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminShopOrdersGoPage(${page - 1})">上一页</button>
             <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminShopOrdersGoPage(${page + 1})">下一页</button>
           </div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+window.adminShopProductStartEdit = function(id) {
+  state.adminShopProductEditId = id || null;
+  navigate('admin-shop-products');
+};
+
+window.adminShopProductCancelEdit = function() {
+  state.adminShopProductEditId = null;
+  navigate('admin-shop-products');
+};
+
+window.submitAdminShopProductForm = async function() {
+  const editId = ($('shop-prod-edit-id')?.value || '').trim();
+  const body = {
+    title: ($('shop-prod-title')?.value || '').trim(),
+    description: ($('shop-prod-desc')?.value || '').trim(),
+    tag: ($('shop-prod-tag')?.value || '').trim(),
+    retail_price_yuan: parseFloat($('shop-prod-retail')?.value || '0') || 0,
+    wholesale_price_yuan: parseFloat($('shop-prod-wholesale')?.value || '0') || 0,
+    wholesale_min_qty: parseInt($('shop-prod-wsqty')?.value || '5', 10) || 5,
+    sort_order: parseInt($('shop-prod-sort')?.value || '0', 10) || 0,
+    enabled: $('shop-prod-enabled')?.checked !== false,
+  };
+  if (!body.title) {
+    toast('请填写商品标题', 'warn');
+    return;
+  }
+  try {
+    if (editId) {
+      await api.admin.shopUpdateProduct(editId, body);
+      toast('已更新 SKU', 'success');
+    } else {
+      await api.admin.shopCreateProduct(body);
+      toast('已新增 SKU', 'success');
+    }
+    state.adminShopProductEditId = null;
+    navigate('admin-shop-products');
+  } catch (e) {
+    toast(e.message || '保存失败', 'error');
+  }
+};
+
+window.adminShopProductDelete = function(id, title) {
+  showModal('删除 SKU', `<p>确定删除 <strong>${escHtml(title || id)}</strong> 吗？历史订单仍保留快照。</p>`, async () => {
+    try {
+      await api.admin.shopDeleteProduct(id);
+      toast('已删除', 'success');
+      if (state.adminShopProductEditId === id) state.adminShopProductEditId = null;
+      navigate('admin-shop-products');
+    } catch (e) {
+      toast(e.message || '删除失败', 'error');
+    }
+  });
+};
+
+async function renderAdminShopProducts(container) {
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-settings')">商品与收款</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>
+      <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
+  }
+  const res = await api.admin.shopListProducts().catch(() => ({ data: [] }));
+  const list = res.data || [];
+  const editId = state.adminShopProductEditId;
+  const editing = editId ? list.find(p => p.id === editId) : null;
+
+  const formTitle = editing ? '编辑 SKU' : '新增 SKU';
+  const v = editing || {};
+  const hid = editing ? `<input type="hidden" id="shop-prod-edit-id" value="${escHtml(editing.id)}" />` : '<input type="hidden" id="shop-prod-edit-id" value="" />';
+
+  container.innerHTML = `
+    <div style="max-width:1120px;display:flex;flex-direction:column;gap:1rem">
+      <div class="card">
+        <div class="card-header" style="justify-content:space-between;align-items:center;flex-wrap:wrap;gap:0.75rem">
+          <div class="card-title">${escHtml(formTitle)}</div>
+          ${editing ? '<button type="button" class="btn btn-ghost btn-sm" onclick="adminShopProductCancelEdit()">取消编辑</button>' : ''}
+        </div>
+        <div class="card-body">
+          ${hid}
+          <div class="form-group"><label class="form-label">标题</label>
+            <input class="form-input" id="shop-prod-title" placeholder="如：Claude 成品号" value="${escHtml(v.title || '')}" /></div>
+          <div class="form-group"><label class="form-label">标签（展示在卡片角标，可空）</label>
+            <input class="form-input" id="shop-prod-tag" placeholder="如：热销 / 粉丝价" value="${escHtml(v.tag || '')}" /></div>
+          <div class="form-group"><label class="form-label">说明</label>
+            <textarea class="form-input" id="shop-prod-desc" rows="3" style="resize:vertical">${escHtml(v.description || '')}</textarea></div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.75rem">
+            <div class="form-group"><label class="form-label">零售价（元/件）</label>
+              <input type="number" step="0.01" class="form-input" id="shop-prod-retail" value="${v.retail_price_yuan != null ? Number(v.retail_price_yuan).toFixed(2) : ''}" /></div>
+            <div class="form-group"><label class="form-label">批发价（元/件）</label>
+              <input type="number" step="0.01" class="form-input" id="shop-prod-wholesale" value="${v.wholesale_price_yuan != null ? Number(v.wholesale_price_yuan).toFixed(2) : ''}" /></div>
+            <div class="form-group"><label class="form-label">批发起订件数</label>
+              <input type="number" class="form-input" id="shop-prod-wsqty" value="${v.wholesale_min_qty ?? 5}" /></div>
+            <div class="form-group"><label class="form-label">排序（越小越靠前）</label>
+              <input type="number" class="form-input" id="shop-prod-sort" value="${v.sort_order ?? 0}" /></div>
+          </div>
+          <label style="display:flex;align-items:center;gap:0.45rem;margin:0.6rem 0;cursor:pointer">
+            <input type="checkbox" id="shop-prod-enabled" ${editing && v.enabled === false ? '' : 'checked'} />
+            <span>上架（关闭后用户侧不展示）</span>
+          </label>
+          <button type="button" class="btn btn-primary" onclick="submitAdminShopProductForm()">${editing ? '保存修改' : '添加 SKU'}</button>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header"><div class="card-title">已维护的 SKU</div></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>排序</th><th>标题</th><th>标签</th><th>零售</th><th>批发</th><th>上架</th><th></th></tr></thead>
+            <tbody>
+              ${list.length ? list.map(p => `
+                <tr>
+                  <td>${p.sort_order ?? 0}</td>
+                  <td style="font-size:0.85rem">${escHtml(p.title || '')}</td>
+                  <td style="font-size:0.8rem">${escHtml(p.tag || '—')}</td>
+                  <td>¥${Number(p.retail_price_yuan).toFixed(2)}</td>
+                  <td>¥${Number(p.wholesale_price_yuan).toFixed(2)} <span style="font-size:0.72rem;color:var(--text-muted)">(${p.wholesale_min_qty || 5}件起)</span></td>
+                  <td>${p.enabled !== false ? '是' : '否'}</td>
+                  <td style="display:flex;flex-wrap:wrap;gap:0.35rem">
+                    <button type="button" class="btn btn-ghost btn-sm" onclick="adminShopProductStartEdit('${escHtml(p.id)}')">编辑</button>
+                    <button type="button" class="btn btn-ghost btn-sm" onclick="adminShopProductDelete(${JSON.stringify(p.id)}, ${JSON.stringify(p.title || '')})">删除</button>
+                  </td>
+                </tr>
+              `).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1rem">暂无 SKU，用户侧将使用「商品与收款」页的默认单价</td></tr>'}
+            </tbody>
+          </table>
         </div>
       </div>
     </div>

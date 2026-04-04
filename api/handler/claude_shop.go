@@ -15,6 +15,7 @@ import (
 
 	"tempmail/alipay"
 	"tempmail/middleware"
+	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
@@ -46,6 +47,24 @@ func centsToYuan(c int) float64 {
 	return float64(c) / 100
 }
 
+func shopProductToResponse(p *model.ClaudeShopProduct) gin.H {
+	return gin.H{
+		"id":                    p.ID.String(),
+		"sort_order":            p.SortOrder,
+		"enabled":               p.Enabled,
+		"title":                 p.Title,
+		"description":           p.Description,
+		"tag":                   p.Tag,
+		"retail_price_yuan":     centsToYuan(p.RetailPriceCents),
+		"wholesale_price_yuan":  centsToYuan(p.WholesalePriceCents),
+		"wholesale_min_qty":     p.WholesaleMinQty,
+		"retail_price_cents":    p.RetailPriceCents,
+		"wholesale_price_cents": p.WholesalePriceCents,
+		"created_at":            p.CreatedAt,
+		"updated_at":            p.UpdatedAt,
+	}
+}
+
 // GET /public/claude-shop
 func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 	cfg, err := h.store.GetClaudeShopConfig(c.Request.Context())
@@ -53,27 +72,51 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"enabled": false, "error": "shop not initialized"})
 		return
 	}
-	stock, _ := h.store.CountClaudeInventoryAvailable(c.Request.Context())
+	ctx := c.Request.Context()
+	stock, _ := h.store.CountClaudeInventoryAvailable(ctx)
+	wechatU, alipayU := "", ""
+	if cfg.StaticQREnabled {
+		wechatU = h.qrURL(cfg.WechatQRFile)
+		alipayU = h.qrURL(cfg.AlipayQRFile)
+	}
+	plist, _ := h.store.ListClaudeShopProductsPublic(ctx)
+	products := make([]gin.H, 0, len(plist))
+	for _, p := range plist {
+		products = append(products, gin.H{
+			"id":                    p.ID.String(),
+			"title":                 p.Title,
+			"description":           p.Description,
+			"tag":                   p.Tag,
+			"retail_price_yuan":     centsToYuan(p.RetailPriceCents),
+			"wholesale_min_qty":     p.WholesaleMinQty,
+			"wholesale_price_yuan":  centsToYuan(p.WholesalePriceCents),
+			"retail_price_cents":    p.RetailPriceCents,
+			"wholesale_price_cents": p.WholesalePriceCents,
+		})
+	}
 	out := gin.H{
-		"enabled":                 cfg.Enabled,
-		"title":                   cfg.Title,
-		"subtitle":                cfg.Subtitle,
-		"description":             cfg.Description,
-		"tutorial_url":            cfg.TutorialURL,
-		"retail_price_yuan":       centsToYuan(cfg.RetailPriceCents),
-		"wholesale_min_qty":       cfg.WholesaleMinQty,
-		"wholesale_price_yuan":    centsToYuan(cfg.WholesalePriceCents),
-		"tag_hot":                 cfg.TagHot,
-		"show_tag_wholesale":      cfg.ShowTagWholesale,
-		"tag_fan_welfare":         cfg.TagFanWelfare,
-		"max_per_user":            cfg.MaxPerUser,
-		"stock_available":         stock,
-		"wechat_qr_url":           h.qrURL(cfg.WechatQRFile),
-		"alipay_qr_url":           h.qrURL(cfg.AlipayQRFile),
-		"retail_price_cents":      cfg.RetailPriceCents,
-		"wholesale_price_cents":   cfg.WholesalePriceCents,
-		"alipay_precreate_available": h.alipay != nil && h.notifyURL != "" && h.appID != "",
+		"enabled":                       cfg.Enabled,
+		"title":                         cfg.Title,
+		"subtitle":                      cfg.Subtitle,
+		"description":                   cfg.Description,
+		"tutorial_url":                  cfg.TutorialURL,
+		"retail_price_yuan":             centsToYuan(cfg.RetailPriceCents),
+		"wholesale_min_qty":           cfg.WholesaleMinQty,
+		"wholesale_price_yuan":        centsToYuan(cfg.WholesalePriceCents),
+		"tag_hot":                       cfg.TagHot,
+		"show_tag_wholesale":            cfg.ShowTagWholesale,
+		"tag_fan_welfare":               cfg.TagFanWelfare,
+		"max_per_user":                  cfg.MaxPerUser,
+		"stock_available":               stock,
+		"wechat_qr_url":                 wechatU,
+		"alipay_qr_url":                 alipayU,
+		"retail_price_cents":            cfg.RetailPriceCents,
+		"wholesale_price_cents":         cfg.WholesalePriceCents,
+		"alipay_precreate_available":    h.alipay != nil && h.notifyURL != "" && h.appID != "",
 		"static_payment_manual_confirm": cfg.StaticPaymentManualConfirm,
+		"static_qr_enabled":             cfg.StaticQREnabled,
+		"products":                      products,
+		"product_pick_required":         len(products) > 0,
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -94,6 +137,10 @@ func (h *ClaudeShopHandler) ServeShopAsset(c *gin.Context) {
 	}
 	cfg, err := h.store.GetClaudeShopConfig(c.Request.Context())
 	if err != nil {
+		c.Status(http.StatusNotFound)
+		return
+	}
+	if !cfg.StaticQREnabled {
 		c.Status(http.StatusNotFound)
 		return
 	}
@@ -235,10 +282,13 @@ func (h *ClaudeShopHandler) GetMyOrder(c *gin.Context) {
 		return
 	}
 	cfg, _ := h.store.GetClaudeShopConfig(c.Request.Context())
-	pay := gin.H{
-		"wechat_qr_url": h.qrURL(cfg.WechatQRFile),
-		"alipay_qr_url": h.qrURL(cfg.AlipayQRFile),
-		"tutorial_url":  cfg.TutorialURL,
+	pay := gin.H{"tutorial_url": cfg.TutorialURL}
+	if cfg.StaticQREnabled {
+		pay["wechat_qr_url"] = h.qrURL(cfg.WechatQRFile)
+		pay["alipay_qr_url"] = h.qrURL(cfg.AlipayQRFile)
+	} else {
+		pay["wechat_qr_url"] = ""
+		pay["alipay_qr_url"] = ""
 	}
 	if o.Status == "awaiting_payment" && o.PaymentChannel == "alipay_precreate" {
 		pay["hint"] = "本单为支付宝当面付：若二维码已过期，请稍后在订单页刷新或联系管理员。"
@@ -246,12 +296,13 @@ func (h *ClaudeShopHandler) GetMyOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"order": o, "payment": pay})
 }
 
-// POST /api/shop/orders  body: { "quantity": n, "payment_method": "static" | "alipay" }
+// POST /api/shop/orders  body: { "quantity": n, "payment_method": "static" | "alipay", "product_id": "uuid?" }
 func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 	acc := middleware.GetAccount(c)
 	var req struct {
-		Quantity       int    `json:"quantity" binding:"required,min=1,max=999"`
-		PaymentMethod  string `json:"payment_method"` // 默认 static；alipay 表示当面付 precreate
+		Quantity      int     `json:"quantity" binding:"required,min=1,max=999"`
+		PaymentMethod string  `json:"payment_method"` // 默认 static；alipay 表示当面付 precreate
+		ProductID     *string `json:"product_id"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -277,7 +328,27 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	o, err := h.store.CreateClaudeOrder(ctx, acc.ID, req.Quantity, payCh)
+	cfg0, err := h.store.GetClaudeShopConfig(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	if payCh == "static" && !cfg0.StaticQREnabled {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "静态收款码已关闭，请使用支付宝当面付"})
+		return
+	}
+
+	var prodPtr *uuid.UUID
+	if req.ProductID != nil && strings.TrimSpace(*req.ProductID) != "" {
+		pid, perr := parseUUID(strings.TrimSpace(*req.ProductID))
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "product_id 无效"})
+			return
+		}
+		prodPtr = &pid
+	}
+
+	o, err := h.store.CreateClaudeOrder(ctx, acc.ID, req.Quantity, payCh, prodPtr)
 	if err != nil {
 		switch err.Error() {
 		case "shop_disabled":
@@ -291,7 +362,11 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 		case "exceeds_purchase_limit":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "超过每用户限购数量"})
 		case "pending_order_exists":
-			c.JSON(http.StatusConflict, gin.H{"error": "您已有待支付/待确认的订单，请在「我的购买记录」中查看，勿重复提交"})
+			c.JSON(http.StatusConflict, gin.H{"error": "您已有一笔待管理员确认的静态收款订单，请先处理后再使用静态码下单；或使用支付宝当面付继续购买。"})
+		case "product_required":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择商品"})
+		case "invalid_product":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "商品不存在或已下架"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
@@ -299,15 +374,22 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 	}
 
 	cfg, _ := h.store.GetClaudeShopConfig(ctx)
-	payment := gin.H{
-		"wechat_qr_url": h.qrURL(cfg.WechatQRFile),
-		"alipay_qr_url": h.qrURL(cfg.AlipayQRFile),
-		"tutorial_url":  cfg.TutorialURL,
+	payment := gin.H{"tutorial_url": cfg.TutorialURL}
+	if cfg.StaticQREnabled {
+		payment["wechat_qr_url"] = h.qrURL(cfg.WechatQRFile)
+		payment["alipay_qr_url"] = h.qrURL(cfg.AlipayQRFile)
+	} else {
+		payment["wechat_qr_url"] = ""
+		payment["alipay_qr_url"] = ""
 	}
 
 	switch payCh {
 	case "alipay_precreate":
-		subj := truncateSubject(cfg.Title+" ×"+strconv.Itoa(o.Quantity), 256)
+		subBase := strings.TrimSpace(o.ProductTitleSnapshot)
+		if subBase == "" {
+			subBase = cfg.Title
+		}
+		subj := truncateSubject(subBase+" ×"+strconv.Itoa(o.Quantity), 256)
 		totalStr := fmt.Sprintf("%.2f", centsToYuan(o.TotalCents))
 		qr, perr := h.alipay.Precreate(h.notifyURL, o.ID.String(), subj, totalStr)
 		if perr != nil {
@@ -372,6 +454,7 @@ func (h *ClaudeShopHandler) AdminGetConfig(c *gin.Context) {
 		"wechat_qr_url":           h.qrURL(cfg.WechatQRFile),
 		"alipay_qr_url":           h.qrURL(cfg.AlipayQRFile),
 		"static_payment_manual_confirm": cfg.StaticPaymentManualConfirm,
+		"static_qr_enabled":             cfg.StaticQREnabled,
 		"alipay_precreate_available":    h.alipay != nil && h.notifyURL != "" && h.appID != "",
 	})
 }
@@ -397,6 +480,7 @@ func (h *ClaudeShopHandler) AdminPutConfig(c *gin.Context) {
 		TagFanWelfare       *string  `json:"tag_fan_welfare"`
 		MaxPerUser          *int     `json:"max_per_user"`
 		StaticPaymentManualConfirm *bool `json:"static_payment_manual_confirm"`
+		StaticQREnabled            *bool `json:"static_qr_enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -452,6 +536,9 @@ func (h *ClaudeShopHandler) AdminPutConfig(c *gin.Context) {
 	}
 	if req.StaticPaymentManualConfirm != nil {
 		cur.StaticPaymentManualConfirm = *req.StaticPaymentManualConfirm
+	}
+	if req.StaticQREnabled != nil {
+		cur.StaticQREnabled = *req.StaticQREnabled
 	}
 	if err := h.store.UpdateClaudeShopConfig(c.Request.Context(), cur); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -723,4 +810,164 @@ func (h *ClaudeShopHandler) AdminConfirmOrder(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"message": "已发货", "order": o})
+}
+
+// GET /api/admin/shop/products
+func (h *ClaudeShopHandler) AdminListShopProducts(c *gin.Context) {
+	list, err := h.store.ListClaudeShopProductsAdmin(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	out := make([]gin.H, 0, len(list))
+	for i := range list {
+		out = append(out, shopProductToResponse(&list[i]))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// POST /api/admin/shop/products
+func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
+	var req struct {
+		SortOrder          int     `json:"sort_order"`
+		Enabled            *bool   `json:"enabled"`
+		Title              string  `json:"title" binding:"required"`
+		Description        string  `json:"description"`
+		Tag                string  `json:"tag"`
+		RetailPriceYuan    float64 `json:"retail_price_yuan"`
+		WholesalePriceYuan float64 `json:"wholesale_price_yuan"`
+		WholesaleMinQty    int     `json:"wholesale_min_qty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "标题不能为空"})
+		return
+	}
+	en := true
+	if req.Enabled != nil {
+		en = *req.Enabled
+	}
+	wsq := req.WholesaleMinQty
+	if wsq < 1 {
+		wsq = 5
+	}
+	rp := int(req.RetailPriceYuan*100 + 0.5)
+	wp := int(req.WholesalePriceYuan*100 + 0.5)
+	if rp < 0 || wp < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "价格无效"})
+		return
+	}
+	p := &model.ClaudeShopProduct{
+		SortOrder:           req.SortOrder,
+		Enabled:             en,
+		Title:               title,
+		Description:         req.Description,
+		Tag:                 strings.TrimSpace(req.Tag),
+		RetailPriceCents:    rp,
+		WholesaleMinQty:     wsq,
+		WholesalePriceCents: wp,
+	}
+	if err := h.store.InsertClaudeShopProduct(c.Request.Context(), p); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"product": shopProductToResponse(p)})
+}
+
+// PUT /api/admin/shop/products/:id
+func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	cur, err := h.store.GetClaudeShopProductByID(c.Request.Context(), id, false)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	var req struct {
+		SortOrder          *int     `json:"sort_order"`
+		Enabled            *bool    `json:"enabled"`
+		Title              *string  `json:"title"`
+		Description        *string  `json:"description"`
+		Tag                *string  `json:"tag"`
+		RetailPriceYuan    *float64 `json:"retail_price_yuan"`
+		WholesalePriceYuan *float64 `json:"wholesale_price_yuan"`
+		WholesaleMinQty    *int     `json:"wholesale_min_qty"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.SortOrder != nil {
+		cur.SortOrder = *req.SortOrder
+	}
+	if req.Enabled != nil {
+		cur.Enabled = *req.Enabled
+	}
+	if req.Title != nil {
+		cur.Title = strings.TrimSpace(*req.Title)
+	}
+	if req.Description != nil {
+		cur.Description = *req.Description
+	}
+	if req.Tag != nil {
+		cur.Tag = strings.TrimSpace(*req.Tag)
+	}
+	if req.RetailPriceYuan != nil {
+		cur.RetailPriceCents = int(*req.RetailPriceYuan*100 + 0.5)
+	}
+	if req.WholesalePriceYuan != nil {
+		cur.WholesalePriceCents = int(*req.WholesalePriceYuan*100 + 0.5)
+	}
+	if req.WholesaleMinQty != nil {
+		cur.WholesaleMinQty = *req.WholesaleMinQty
+		if cur.WholesaleMinQty < 1 {
+			cur.WholesaleMinQty = 1
+		}
+	}
+	if strings.TrimSpace(cur.Title) == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "标题不能为空"})
+		return
+	}
+	if cur.RetailPriceCents < 0 || cur.WholesalePriceCents < 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "价格无效"})
+		return
+	}
+	if err := h.store.UpdateClaudeShopProduct(c.Request.Context(), cur); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"product": shopProductToResponse(cur)})
+}
+
+// DELETE /api/admin/shop/products/:id
+func (h *ClaudeShopHandler) AdminDeleteShopProduct(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	if err := h.store.DeleteClaudeShopProduct(c.Request.Context(), id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }

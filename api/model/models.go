@@ -21,18 +21,35 @@ type Account struct {
 
 // ClaudeOrder 自助售号订单
 type ClaudeOrder struct {
-	ID             uuid.UUID  `json:"id"`
-	AccountID      uuid.UUID  `json:"account_id"`
-	Quantity       int        `json:"quantity"`
-	UnitPriceCents int        `json:"unit_price_cents"`
-	TotalCents     int        `json:"total_cents"`
-	IsWholesale    bool       `json:"is_wholesale"`
-	Status         string     `json:"status"`
-	PaymentChannel string     `json:"payment_channel"`
-	AlipayTradeNo  *string    `json:"alipay_trade_no,omitempty"`
-	CreatedAt      time.Time  `json:"created_at"`
-	FulfilledAt    *time.Time `json:"fulfilled_at,omitempty"`
-	Lines          []ClaudeOrderLine `json:"lines,omitempty"`
+	ID                   uuid.UUID  `json:"id"`
+	AccountID            uuid.UUID  `json:"account_id"`
+	Quantity             int        `json:"quantity"`
+	UnitPriceCents       int        `json:"unit_price_cents"`
+	TotalCents           int        `json:"total_cents"`
+	IsWholesale          bool       `json:"is_wholesale"`
+	Status               string     `json:"status"`
+	PaymentChannel       string     `json:"payment_channel"`
+	AlipayTradeNo        *string    `json:"alipay_trade_no,omitempty"`
+	ProductID            *uuid.UUID `json:"product_id,omitempty"`
+	ProductTitleSnapshot string     `json:"product_title_snapshot,omitempty"`
+	CreatedAt            time.Time  `json:"created_at"`
+	FulfilledAt          *time.Time `json:"fulfilled_at,omitempty"`
+	Lines                []ClaudeOrderLine `json:"lines,omitempty"`
+}
+
+// ClaudeShopProduct 店铺 SKU（与全局库存共用池，区别在展示名称与单价）
+type ClaudeShopProduct struct {
+	ID                  uuid.UUID `json:"id"`
+	SortOrder           int       `json:"sort_order"`
+	Enabled             bool      `json:"enabled"`
+	Title               string    `json:"title"`
+	Description         string    `json:"description"`
+	Tag                 string    `json:"tag"`
+	RetailPriceCents    int       `json:"retail_price_cents"`
+	WholesaleMinQty     int       `json:"wholesale_min_qty"`
+	WholesalePriceCents int       `json:"wholesale_price_cents"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type ClaudeOrderLine struct {

@@ -17,9 +17,9 @@ api/Dockerfile：Go 用 GOPROXY/GOSUMDB；运行阶段 apk 前已 sed 换阿里�
 docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；**域名 HTTPS 若 502，先查 `docker compose ps` 是否有 tempmail-frontend-1**，没有则 `docker compose up -d frontend`；宝塔反代应指向该端口。API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码；**支付宝 PEM 可放 data/alipay_*.pem**，见下文 KEY_FILE）。
 nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location ~* \\.(png|jpg)$ 会抢走 /public/shop-assets/*.png 导致收款码 404。
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
-数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm）。
+数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm、v8 static_qr_enabled 开关与 claude_shop_products 多 SKU）。
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。
-业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过；可选支付宝当面付 precreate + POST /public/alipay/notify 自动发货，静态收款码备用；店铺可配置 static_payment_manual_confirm）；库存 batch_label；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺三页；GET /api/admin/shop/orders/:id 订单详情。
+业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过；可选支付宝当面付 precreate + POST /public/alipay/notify 自动发货；静态收款码由 static_qr_enabled 总开关控制，开启时静态路径仍限制一单待确认，当面付可多笔并行）；店铺 static_payment_manual_confirm；多 SKU claude_shop_products + 标签；库存 batch_label；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺三页；GET /api/admin/shop/orders/:id 订单详情。
 生产域名示例：Web https://mail.yahoohh.cloud/；支付宝异步通知须与 .env 一致：https://mail.yahoohh.cloud/public/alipay/notify（支付宝开放平台同址）。
 支付宝：`api/alipay/client.go` 中 **网关下单签名 `signRSA2` 仅剔除 `sign`（`sign_type` 参与签名）**；**异步通知验签 `buildSignContent` 剔除 `sign` 与 `sign_type`**。推荐 `.env` 使用 `ALIPAY_*_KEY_FILE` 指向 `/data/*.pem`；`isv.invalid-signature` 多为应用私钥与开放平台「应用公钥」不成对；网关请求含 `format=JSON`。
 用户偏好：回复简体中文；代码改动聚焦需求；本机推送 GitHub：代理可用时 `git config --global http.https://github.com.proxy http://127.0.0.1:7890`（仅 github.com）；不用代理则 `git config --global --unset http.https://github.com.proxy`；或 `git -c http.proxy= -c https.proxy= push`。服务器 Git 勿设 127.0.0.1:7890 代理。
@@ -119,6 +119,8 @@ docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < s
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v6.sql
 # 支付宝当面付 + 静态收款是否人工确认（claude_orders.payment_channel / alipay_trade_no；claude_shop_config.static_payment_manual_confirm）
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v7.sql
+# v8：static_qr_enabled、claude_shop_products、订单 product 快照
+docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v8.sql
 ```
 
 若 `docker compose ps -q postgres` 为空，先 `docker compose up -d postgres` 再执行。**已执行过的 migrate 不要重复执行**（重复 ALTER IF NOT EXISTS 一般无害，但养成按版本核对习惯）。

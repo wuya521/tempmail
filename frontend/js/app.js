@@ -72,6 +72,26 @@ function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
+/** HTML 邮件在 sandbox iframe 内展示；外链若在当前 frame 打开，整页会加载进 iframe，而 claude.ai 等站点禁止被嵌入（X-Frame-Options / CSP），浏览器即显示「拒绝连接」。统一改为新标签页打开。 */
+function rewriteEmailIframeLinks(doc) {
+  if (!doc || !doc.body) return;
+  const nodes = doc.querySelectorAll('a[href], area[href]');
+  nodes.forEach((el) => {
+    const href = (el.getAttribute('href') || '').trim();
+    if (!href || href === '#' || href.startsWith('#')) return;
+    if (/^javascript:/i.test(href)) return;
+
+    const t = (el.getAttribute('target') || '').toLowerCase();
+    if (!t || t === '_self' || t === '_top' || t === '_parent') {
+      el.setAttribute('target', '_blank');
+    }
+    const relSet = new Set((el.getAttribute('rel') || '').split(/\s+/).filter(Boolean));
+    relSet.add('noopener');
+    relSet.add('noreferrer');
+    el.setAttribute('rel', [...relSet].join(' '));
+  });
+}
+
 function formatDate(s) {
   if (!s) return '—';
   const d = new Date(s);
@@ -1102,7 +1122,7 @@ async function renderEmailView(container) {
         </div>
       </div>
       ${htmlBody
-        ? `<iframe class="email-body-frame" id="email-frame" sandbox="allow-same-origin allow-popups"></iframe>`
+        ? `<iframe class="email-body-frame" id="email-frame" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"></iframe>`
         : `<div class="email-body-text" style="white-space:pre-wrap">${escHtml(textBody || '(邮件内容为空)')}</div>`
       }
     </div>
@@ -1115,6 +1135,7 @@ async function renderEmailView(container) {
       frame.contentDocument.open();
       frame.contentDocument.write(htmlBody);
       frame.contentDocument.close();
+      rewriteEmailIframeLinks(frame.contentDocument);
       const setH = () => {
         try { frame.style.height = frame.contentDocument.body.scrollHeight + 20 + 'px'; } catch (_) {}
       };

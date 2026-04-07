@@ -14,7 +14,7 @@ GitHub：github.com/wuya521/tempmail，main 分支；本地开发路径 e:\AImai
 仅前端/静态/nginx 配置变更：cd /root/tempmail && git pull origin main && docker compose restart frontend（或改 default.conf 时用 up -d frontend --force-recreate）；不必 build api。
 改了 Go/api 代码：pull 后 docker compose build api（大改或疑缓存时可 --no-cache）&& docker compose up -d api（需读新 .env 时用 --force-recreate）。
 api/Dockerfile：Go 用 GOPROXY/GOSUMDB；运行阶段 apk 前已 sed 换阿里云 Alpine 源（国内构建 apk 否则可能卡 10+ 分钟）；勿在服务器手写改 Dockerfile 与仓库冲突。
-docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；**域名 HTTPS 若 502，先查 `docker compose ps` 是否有 tempmail-frontend-1**，没有则 `docker compose up -d frontend`；宝塔反代应指向该端口。API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码；**支付宝 PEM 可放 data/alipay_*.pem**，见下文 KEY_FILE）。
+docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；**域名 HTTPS 若 502，先查 `docker compose ps` 是否有 tempmail-frontend-1**，没有则 `docker compose up -d frontend`；宝塔反代应指向该端口。API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码；**支付宝 PEM 可放 data/alipay_*.pem**，见下文 KEY_FILE）。**Postfix（对外 SMTP 收信，宿主机 25）**：`docker compose ps` 须含 **tempmail-postfix-1** 且映射 **25→25**；若从未启动或只执行过 `up -d api` 等，会**完全或间歇收不到**外部按 MX 投递的邮件；处理：`docker compose up -d`（拉全栈）或 `docker compose up -d postfix`，并用 `ss -lntp | grep ':25 '` 确认监听；阿里云安全组须放行 **入站 TCP 25**。
 nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location ~* \\.(png|jpg)$ 会抢走 /public/shop-assets/*.png 导致收款码 404。
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
 数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm、v8 static_qr_enabled 开关与 claude_shop_products 多 SKU）。
@@ -258,6 +258,15 @@ docker compose logs api --tail 80
 | **`up -d api --force-recreate` 容器名冲突** | 见上文 **B** 中 `docker rm -f tempmail-api-1` 与按 name 过滤删除后再 `up -d api`。勿轻易 `docker compose down` 全栈。 |
 | 日志无 **`解析器 v5`** 却仍报密钥错误 | 多为未拉到最新镜像：确认已 `git pull` 且 **`build api --no-cache`** 后再 `--force-recreate`。 |
 | `curl \| grep` 报 **`grep: invalid option -- 'S'`** | 两行命令粘成一行，`grep` 误解析了第二个 `curl -sS`。整行只保留一条 `curl \| grep`，或分两行执行。 |
+| **间歇或完全收不到外部邮件**；`docker compose ps` **没有** postfix；`exec postfix` 报 **not running** | **根因常为 Postfix 容器未启动**（例如只 `up -d api`、从未全栈启动）。处理：`cd /root/tempmail && docker compose up -d postfix` 或 **`docker compose up -d`** 拉全栈；确认 `tempmail-postfix-1` 为 **Up** 且 **0.0.0.0:25->25/tcp**；用 `ss -lntp` 确认 **25** 端口由 **docker-proxy** 监听。缺镜像时先 `docker compose build postfix`。仍异常再查云安全组 **入站 25**、域名 **MX** 是否指向本机公网 IP。 |
+| **`docker compose logs postfix` 为空或很少** | 不少情况下业务日志在容器内 **`/var/log/mail.log`**，不一定出现在 `docker logs`；属正常现象。排错以 **`docker compose ps postfix`**、**端口 25**、API **`/internal/deliver`** 为主。 |
+
+### Postfix（SMTP 收信）未启动 — 已验证案例
+
+- **现象**：外部网站验证邮件等「有时能收到、有时收不到」或长时间收不到；`docker compose logs postfix` 无输出；`docker compose exec postfix …` 提示 **`service "postfix" is not running`**；`docker compose ps` 列表中**没有** `tempmail-postfix-1`。
+- **原因**：部署或重启时**未拉起 Postfix 服务**，仅起了 api / frontend / 数据库等，**25 端口无进程监听**，MX 投递无法进机。
+- **处理**：`docker compose up -d postfix` 或推荐 **`docker compose up -d`**（避免漏服务）；确认 **`docker compose ps`** 中含 **postfix** 且 **`0.0.0.0:25->25/tcp`**；必要时 **`docker compose build postfix`** 后再 `up -d postfix`。
+- **习惯**：更新后尽量 **`docker compose up -d`** 一次性拉全栈，并用 **`docker compose ps`** 核对 **api、frontend、postgres、pgbouncer、redis、postfix** 均在运行。
 
 ---
 

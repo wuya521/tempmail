@@ -258,6 +258,59 @@ func (s *Store) CountClaudeInventoryAvailable(ctx context.Context) (int, error) 
 	return n, err
 }
 
+// CountClaudeInventoryAvailableFor 返回某订单实际可用库存（混合池方案）。
+// productID 非空：同 product_id 专属池 + 通用池（product_id IS NULL）两部分之和（订单可兜底取用）。
+// productID 为空：仅通用池，用于无 SKU（单店模式）订单或老订单。
+func (s *Store) CountClaudeInventoryAvailableFor(ctx context.Context, productID *uuid.UUID) (int, error) {
+	var n int
+	if productID == nil {
+		err := s.pool.QueryRow(ctx,
+			`SELECT COUNT(*)::int FROM claude_inventory WHERE status = 'available' AND product_id IS NULL`,
+		).Scan(&n)
+		return n, err
+	}
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*)::int FROM claude_inventory
+		 WHERE status = 'available' AND (product_id = $1 OR product_id IS NULL)`,
+		*productID,
+	).Scan(&n)
+	return n, err
+}
+
+// GetProductStockMap 返回每 SKU 的可用库存统计（分专属池 / 含通用池兜底）以及通用池本身的数量。
+// unassigned 为 product_id IS NULL 的待售数；products 键为 SKU id，值为 dedicated + with_unassigned。
+func (s *Store) GetProductStockMap(ctx context.Context) (products map[string]model.ClaudeProductStock, unassigned int, err error) {
+	products = map[string]model.ClaudeProductStock{}
+	if err = s.pool.QueryRow(ctx,
+		`SELECT COUNT(*)::int FROM claude_inventory WHERE status = 'available' AND product_id IS NULL`,
+	).Scan(&unassigned); err != nil {
+		return nil, 0, err
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT product_id, COUNT(*)::int
+		FROM claude_inventory
+		WHERE status = 'available' AND product_id IS NOT NULL
+		GROUP BY product_id`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var pid uuid.UUID
+		var n int
+		if err = rows.Scan(&pid, &n); err != nil {
+			return nil, 0, err
+		}
+		pidCopy := pid
+		products[pid.String()] = model.ClaudeProductStock{
+			ProductID:      &pidCopy,
+			Dedicated:      n,
+			WithUnassigned: n + unassigned,
+		}
+	}
+	return products, unassigned, rows.Err()
+}
+
 func (s *Store) GetClaudeInventorySummary(ctx context.Context) (*model.ClaudeInventorySummary, error) {
 	var summary model.ClaudeInventorySummary
 	err := s.pool.QueryRow(ctx, `
@@ -284,12 +337,15 @@ func normalizeClaudeInventoryStatusFilter(status string) (string, bool) {
 	}
 }
 
-func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilter string, page, size int) ([]model.ClaudeInventoryItem, int, error) {
+// ListClaudeInventory 管理端库存列表。
+// productFilter: ""=不过滤；"__none__"=仅通用池（product_id IS NULL）；否则按 UUID 过滤。
+func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilter, productFilter string, page, size int) ([]model.ClaudeInventoryItem, int, error) {
 	filter, ok := normalizeClaudeInventoryStatusFilter(statusFilter)
 	if !ok {
 		return nil, 0, fmt.Errorf("invalid_inventory_status")
 	}
 	batchFilter = strings.TrimSpace(batchFilter)
+	productFilter = strings.TrimSpace(productFilter)
 	offset := (page - 1) * size
 
 	conds := []string{"1=1"}
@@ -309,6 +365,19 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 			argI++
 		}
 	}
+	if productFilter != "" {
+		if productFilter == "__none__" {
+			conds = append(conds, "product_id IS NULL")
+		} else {
+			pid, perr := uuid.Parse(productFilter)
+			if perr != nil {
+				return nil, 0, fmt.Errorf("invalid_product_filter")
+			}
+			conds = append(conds, fmt.Sprintf("product_id = $%d", argI))
+			args = append(args, pid)
+			argI++
+		}
+	}
 	whereSQL := strings.Join(conds, " AND ")
 
 	var total int
@@ -319,7 +388,7 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 
 	dataArgs := append(append([]interface{}{}, args...), size, offset)
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
-		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), created_at
+		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), product_id, created_at
 		FROM claude_inventory
 		WHERE %s
 		ORDER BY created_at DESC
@@ -335,13 +404,18 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 	for rows.Next() {
 		var item model.ClaudeInventoryItem
 		var orderIDText *string
-		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &item.CreatedAt); err != nil {
+		var prodID *uuid.UUID
+		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &prodID, &item.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		if orderIDText != nil && strings.TrimSpace(*orderIDText) != "" {
 			if orderID, err := uuid.Parse(*orderIDText); err == nil {
 				item.OrderID = &orderID
 			}
+		}
+		if prodID != nil {
+			pidCopy := *prodID
+			item.ProductID = &pidCopy
 		}
 		list = append(list, item)
 	}
@@ -359,7 +433,8 @@ func (s *Store) DeleteClaudeInventory(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair, batchLabel string) (int, error) {
+// ImportClaudeInventory 批量导入卡券。productID 为 nil 表示通用池（任意 SKU 订单都能兜底取用）。
+func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair, batchLabel string, productID *uuid.UUID) (int, error) {
 	if len(pairs) == 0 {
 		return 0, nil
 	}
@@ -374,7 +449,10 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 	defer tx.Rollback(ctx)
 	n := 0
 	for _, p := range pairs {
-		_, err := tx.Exec(ctx, `INSERT INTO claude_inventory (email, api_key, batch_label) VALUES ($1, $2, $3)`, p.Email, p.APIKey, batchLabel)
+		_, err := tx.Exec(ctx,
+			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id) VALUES ($1, $2, $3, $4)`,
+			p.Email, p.APIKey, batchLabel, productID,
+		)
 		if err != nil {
 			return n, err
 		}
@@ -467,13 +545,8 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 	if quantity < 1 || quantity > 999 {
 		return nil, fmt.Errorf("invalid_quantity")
 	}
-	avail, err := s.CountClaudeInventoryAvailable(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if avail < quantity {
-		return nil, fmt.Errorf("insufficient_stock")
-	}
+	// 混合池的精确预检放在解析完 productID 之后（见后文 CountClaudeInventoryAvailableFor）；
+	// 实际扣库存由 FulfillClaudeOrder 的 FOR UPDATE SKIP LOCKED 保证一致性。
 	if cfg.MaxPerUser > 0 {
 		bought, err := s.SumFulfilledClaudeQuantityForAccount(ctx, accountID)
 		if err != nil {
@@ -541,6 +614,14 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 		if wholesale {
 			unit = cfg.WholesalePriceCents
 		}
+	}
+	// 按选中商品的"专属池+通用池"（或无 SKU 时只看通用池）再精确预检一次
+	availFor, err := s.CountClaudeInventoryAvailableFor(ctx, prodRef)
+	if err != nil {
+		return nil, err
+	}
+	if availFor < quantity {
+		return nil, fmt.Errorf("insufficient_stock")
 	}
 	total := unit * quantity
 
@@ -748,7 +829,7 @@ func (s *Store) SetClaudeOrderAlipayTradeNo(ctx context.Context, orderID uuid.UU
 	return nil
 }
 
-// FulfillClaudeOrder 管理员确认收款后扣库存并发货
+// FulfillClaudeOrder 管理员/支付回调确认收款后扣库存并发货（混合池：先订单 SKU 专属池，再通用池兜底）
 func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -758,7 +839,11 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 
 	var status string
 	var qty int
-	err = tx.QueryRow(ctx, `SELECT status, quantity FROM claude_orders WHERE id = $1 FOR UPDATE`, orderID).Scan(&status, &qty)
+	var prodID *uuid.UUID
+	err = tx.QueryRow(ctx,
+		`SELECT status, quantity, product_id FROM claude_orders WHERE id = $1 FOR UPDATE`,
+		orderID,
+	).Scan(&status, &qty, &prodID)
 	if err != nil {
 		return err
 	}
@@ -766,29 +851,55 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		return fmt.Errorf("order_not_awaiting_payment")
 	}
 
-	rows, err := tx.Query(ctx, `
-		SELECT id, email, api_key FROM claude_inventory
-		WHERE status = 'available' ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
-		qty,
-	)
-	if err != nil {
-		return err
-	}
 	type pick struct {
 		id     uuid.UUID
 		email  string
 		apiKey string
 	}
+	// Step 1: 同 SKU 专属池优先（订单无 SKU 时跳过）
 	var picks []pick
-	for rows.Next() {
-		var p pick
-		if err := rows.Scan(&p.id, &p.email, &p.apiKey); err != nil {
-			rows.Close()
+	if prodID != nil {
+		rows, err := tx.Query(ctx, `
+			SELECT id, email, api_key FROM claude_inventory
+			WHERE status = 'available' AND product_id = $1
+			ORDER BY created_at ASC LIMIT $2 FOR UPDATE SKIP LOCKED`,
+			*prodID, qty,
+		)
+		if err != nil {
 			return err
 		}
-		picks = append(picks, p)
+		for rows.Next() {
+			var p pick
+			if err := rows.Scan(&p.id, &p.email, &p.apiKey); err != nil {
+				rows.Close()
+				return err
+			}
+			picks = append(picks, p)
+		}
+		rows.Close()
 	}
-	rows.Close()
+	// Step 2: 通用池兜底（product_id IS NULL）；订单无 SKU 时全部从此来源
+	if len(picks) < qty {
+		rest := qty - len(picks)
+		rows, err := tx.Query(ctx, `
+			SELECT id, email, api_key FROM claude_inventory
+			WHERE status = 'available' AND product_id IS NULL
+			ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
+			rest,
+		)
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var p pick
+			if err := rows.Scan(&p.id, &p.email, &p.apiKey); err != nil {
+				rows.Close()
+				return err
+			}
+			picks = append(picks, p)
+		}
+		rows.Close()
+	}
 	if len(picks) < qty {
 		return fmt.Errorf("insufficient_stock")
 	}

@@ -22,6 +22,8 @@ const state = {
   adminShopInventoryStatus: 'all',
   /** 库存列表批次筛选：''=全部 '__none__'=无批次 其它=批次号 */
   adminShopInventoryBatch: '',
+  /** 库存列表商品筛选：''=全部 '__none__'=通用池 其它=商品 uuid */
+  adminShopInventoryProduct: '',
   adminShopOrdersPage: 1,
   /** 管理端订单筛选：''=全部 awaiting_payment fulfilled */
   adminShopOrdersStatus: '',
@@ -312,6 +314,7 @@ const api = {
 
   // 账户
   me:              () => apiFetch(API_BASE + '/me'),
+  rotateMyKey:     () => apiFetch(API_BASE + '/me/rotate-key', { method: 'POST', body: '{}' }),
   stats:           () => apiFetch(API_BASE + '/stats'),
   // 域名 → 解包 {domains:[...]} → 数组
   domains:         () => apiFetch(API_BASE + '/domains').then(d => Array.isArray(d) ? d : (d.domains || [])),
@@ -340,15 +343,19 @@ const api = {
     patchAccount: (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'PATCH', body: JSON.stringify(body) }),
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
+    rotateAccountKey: id => apiFetch(API_BASE + '/admin/accounts/' + id + '/rotate-key', { method: 'POST', body: '{}' }),
     shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
     shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
     shopListProducts: () => apiFetch(API_BASE + '/admin/shop/products'),
     shopCreateProduct: body => apiFetch(API_BASE + '/admin/shop/products', { method: 'POST', body: JSON.stringify(body) }),
     shopUpdateProduct: (id, body) => apiFetch(API_BASE + '/admin/shop/products/' + id, { method: 'PUT', body: JSON.stringify(body) }),
     shopDeleteProduct: id => apiFetch(API_BASE + '/admin/shop/products/' + id, { method: 'DELETE' }),
-    shopImportInventory: (text, batch) => {
+    shopImportInventory: (text, batch, productId) => {
       let u = API_BASE + '/admin/shop/inventory/import';
-      if (batch) u += '?batch=' + encodeURIComponent(batch);
+      const qs = [];
+      if (batch) qs.push('batch=' + encodeURIComponent(batch));
+      if (productId) qs.push('product_id=' + encodeURIComponent(productId));
+      if (qs.length) u += '?' + qs.join('&');
       return fetch(u, {
       method: 'POST',
       headers: { 'Authorization': 'Bearer ' + state.apiKey, 'Content-Type': 'text/plain; charset=utf-8' },
@@ -368,10 +375,11 @@ const api = {
       if (!res.ok) throw new Error(data.error || '上传失败');
       return data;
     }),
-    shopListInventory: (status='all', page=1, size=30, batch='') => {
+    shopListInventory: (status='all', page=1, size=30, batch='', productId='') => {
       let u = API_BASE + '/admin/shop/inventory?page=' + page + '&size=' + size;
       if (status && status !== 'all') u += '&status=' + encodeURIComponent(status);
       if (batch) u += '&batch=' + encodeURIComponent(batch);
+      if (productId) u += '&product_id=' + encodeURIComponent(productId);
       return apiFetch(u);
     },
     shopListInventoryBatches: () => apiFetch(API_BASE + '/admin/shop/inventory/batches'),
@@ -553,8 +561,12 @@ function renderLoginForm() {
   area.innerHTML = `
     <div class="form-group">
       <label class="form-label">API Key</label>
-      <input class="form-input" id="login-key" type="password" placeholder="tm_xxxxxxxxxxxx" autocomplete="current-password" />
-      <div class="form-hint">在邮箱管理后台获取的 API Key</div>
+      <div style="position:relative">
+        <input class="form-input" id="login-key" type="password" placeholder="tm_xxxxxxxxxxxx" autocomplete="current-password" style="padding-right:3.5rem" />
+        <button type="button" id="login-key-toggle" onclick="toggleLoginKeyVisibility()" title="显示/隐藏 API Key"
+          style="position:absolute;right:0.5rem;top:50%;transform:translateY(-50%);background:transparent;border:0;cursor:pointer;font-size:0.78rem;color:var(--text-muted);padding:0.25rem 0.45rem">显示</button>
+      </div>
+      <div class="form-hint">使用账户的 API Key 登录（本项目通过 API Key 代替传统密码；若怀疑泄露可登录后自助重置）</div>
     </div>
     <button class="btn btn-primary" style="width:100%" onclick="doLogin()">登 录</button>
     <div class="divider"></div>
@@ -566,6 +578,19 @@ function renderLoginForm() {
   if (inp) inp.addEventListener('keydown', e => { if (e.key === 'Enter') doLogin(); });
 }
 
+window.toggleLoginKeyVisibility = function() {
+  const inp = $('login-key');
+  const btn = $('login-key-toggle');
+  if (!inp || !btn) return;
+  if (inp.type === 'password') {
+    inp.type = 'text';
+    btn.textContent = '隐藏';
+  } else {
+    inp.type = 'password';
+    btn.textContent = '显示';
+  }
+};
+
 function renderRegForm() {
   const area = $('auth-form-area');
   if (!area) return;
@@ -573,10 +598,7 @@ function renderRegForm() {
     <div class="form-group">
       <label class="form-label">用户名</label>
       <input class="form-input" id="reg-username" type="text" placeholder="your_name" />
-    </div>
-    <div class="form-group">
-      <label class="form-label">邮箱（可选）</label>
-      <input class="form-input" id="reg-email" type="email" placeholder="contact@example.com" />
+      <div class="form-hint">注册成功后系统会生成专属 API Key，请妥善保存。</div>
     </div>
     <button class="btn btn-primary" style="width:100%" onclick="doRegister()">注 册</button>
   `;
@@ -590,10 +612,9 @@ window.doLogin = async function() {
 
 window.doRegister = async function() {
   const username = ($('reg-username')?.value || '').trim();
-  const email    = ($('reg-email')?.value || '').trim();
   if (!username) { toast('请输入用户名', 'warn'); return; }
   try {
-    const result = await api.register({ username, email: email || undefined });
+    const result = await api.register({ username });
     // 显示成功
     const area = $('auth-form-area');
     area.innerHTML = `
@@ -970,6 +991,7 @@ window.confirmDeleteMailbox = function(id, addr) {
 // ─── API Key 展示 ──────────────────────────────────────────
 function renderApiKeyShow(container) {
   const key = state.apiKey || '—';
+  const keyJs = JSON.stringify(key);
   container.innerHTML = `
     <div class="card" style="max-width:540px">
       <div class="card-header"><div class="card-title">⚿ 我的 API Key</div></div>
@@ -980,9 +1002,12 @@ function renderApiKeyShow(container) {
         <div class="form-label">当前 API Key</div>
         <div class="code-box" style="margin-bottom:1rem">
           <span style="filter:blur(4px);cursor:pointer" id="key-blur" onclick="this.style.filter='none'">${escHtml(key)}</span>
-          <button class="copy-btn" onclick="copyText('${escHtml(key)}')" title="复制">⎘</button>
+          <button class="copy-btn" onclick='copyText(${keyJs})' title="复制">⎘</button>
         </div>
-        <p style="font-size:0.76rem;color:var(--text-muted)">点击 Key 可显示明文。保存后请妥善保管，丢失需联系管理员重置。</p>
+        <p style="font-size:0.76rem;color:var(--text-muted)">点击 Key 可显示明文。若怀疑泄露，可点下方按钮自助重置，旧 Key 会立刻失效。</p>
+        <div style="margin-top:0.9rem">
+          <button class="btn btn-danger btn-sm" onclick="confirmRotateMyKey()">⟳ 重置 API Key</button>
+        </div>
         <div class="divider"></div>
         <div class="form-label">HTTP 请求示例</div>
         <div class="code-box" style="font-size:0.75rem">curl -H "Authorization: Bearer &lt;api_key&gt;" http://server:8080/api/mailboxes</div>
@@ -990,6 +1015,79 @@ function renderApiKeyShow(container) {
     </div>
   `;
 }
+
+// ─── 重置 API Key（用户自助 / 管理员代操作共用一个结果弹窗）──
+/** 展示"一次性新 Key"模态：大号明文 + 复制 + 仅一个关闭按钮 */
+function showNewApiKeyModal(title, newKey, noteHtml) {
+  const old = document.querySelector('.modal-overlay');
+  if (old) old.remove();
+  const keyJs = JSON.stringify(newKey);
+  const overlay = el('div', 'modal-overlay');
+  overlay.innerHTML = `
+    <div class="modal" style="max-width:560px">
+      <div class="modal-title">${escHtml(title)}</div>
+      <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
+      <div style="background:var(--clr-warning-soft, #fff3cd);border:1px solid var(--clr-warning, #f0ad4e);padding:0.7rem 0.85rem;border-radius:8px;font-size:0.84rem;margin-bottom:0.9rem;color:var(--text-primary)">
+        ${noteHtml}
+      </div>
+      <div class="form-label">新 API Key（仅此一次显示）</div>
+      <div class="code-box" style="user-select:all;word-break:break-all;font-size:0.86rem;padding:0.6rem 0.7rem">
+        <span style="flex:1">${escHtml(newKey)}</span>
+        <button class="copy-btn" onclick='copyText(${keyJs})' title="复制">⎘</button>
+      </div>
+      <div class="modal-actions">
+        <button class="btn btn-primary" onclick="this.closest('.modal-overlay').remove()">我已保存</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+}
+
+window.confirmRotateMyKey = function() {
+  showModal('重置我的 API Key', `
+    <p>重置后，<strong>旧 Key 将立即失效</strong>，所有使用旧 Key 的脚本 / 程序将返回 401。</p>
+    <p style="font-size:0.85rem;color:var(--text-muted);margin-top:0.4rem">请确认已准备好更新所有调用方。</p>
+  `, async () => {
+    try {
+      const res = await api.rotateMyKey();
+      const newKey = res.api_key;
+      if (!newKey) throw new Error('未返回新 Key');
+      state.apiKey = newKey;
+      localStorage.setItem('tm_apikey', newKey);
+      toast('API Key 已轮换', 'success');
+      showNewApiKeyModal('新的 API Key',
+        newKey,
+        '<strong>旧 Key 已失效。</strong>请立即复制保存新 Key；关闭此窗口后系统不会再次展示。');
+      const c = $('page-content');
+      if (c && state.page === 'apikey-show') renderApiKeyShow(c);
+    } catch (e) {
+      toast('重置失败: ' + (e.message || '未知错误'), 'error');
+      return false;
+    }
+  });
+};
+
+window.adminRotateAccountKey = function(id, username) {
+  showModal('为该账户重置 API Key', `
+    <p>将为账户 <strong>${escHtml(username)}</strong> 生成新 API Key。</p>
+    <p><strong>旧 Key 立即失效</strong>，该用户当前登录会失效，需要用新 Key 重新登录。</p>
+    <p style="font-size:0.85rem;color:var(--text-muted);margin-top:0.4rem">新 Key 仅在下一步弹窗中显示一次，请及时通知该用户。</p>
+  `, async () => {
+    try {
+      const res = await api.admin.rotateAccountKey(id);
+      const newKey = res.api_key;
+      if (!newKey) throw new Error('未返回新 Key');
+      toast('已重置该账户的 API Key', 'success');
+      showNewApiKeyModal(`【${username}】的新 API Key`,
+        newKey,
+        '<strong>仅此一次显示。</strong>请立即复制并通过安全渠道通知该用户；关闭后无法再查看原始值（列表页会显示同值，但不要以此为唯一依据）。');
+      navigate('admin-accounts');
+    } catch (e) {
+      toast('重置失败: ' + (e.message || '未知错误'), 'error');
+      return false;
+    }
+  });
+};
 
 // ─── Inbox ────────────────────────────────────────────────
 async function renderInbox(container) {
@@ -1355,6 +1453,7 @@ async function renderAdminAccounts(container) {
                 <td style="white-space:nowrap">
                   ${!a.is_admin && a.is_active ? `<button class="btn btn-ghost btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, true)'>封禁</button>` : ''}
                   ${!a.is_admin && a.is_active === false ? `<button class="btn btn-success btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, false)'>解除</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='adminRotateAccountKey("${a.id}", ${JSON.stringify(a.username||'')})' title="重置该账户的 API Key，旧 Key 立即失效">⟳ 重置 Key</button>` : ''}
                   ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick='confirmDeleteAccount("${a.id}", ${JSON.stringify(a.username||'')})'>删除</button>` : ''}
                 </td>
               </tr>`;
@@ -1770,7 +1869,12 @@ window.saveSetting = async function(inputId, settingKey) {
   const val = el2 ? (el2.tagName === 'TEXTAREA' ? el2.value : el2.value.trim()) : '';
   try {
     await api.admin.saveSettings({ [settingKey]: val });
-    toast('已保存', 'success');
+    // server_ip / hostname 由后台 goroutine 的 DB 优先逻辑热更新，30 秒内对下一轮 MX 巡检生效
+    if (settingKey === 'smtp_server_ip' || settingKey === 'smtp_hostname') {
+      toast('已保存，下次 MX 巡检（30 秒内）自动使用新值', 'success');
+    } else {
+      toast('已保存', 'success');
+    }
     if (settingKey === 'site_title') {
       state.siteTitle = val.trim() ? val.trim() : 'TempMail';
       applySiteBranding();
@@ -2609,14 +2713,19 @@ async function renderClaudeShop(container) {
     productGridHtml = prods.map(p => {
       const sel = state.claudeSelectedProductId === p.id;
       const tagHtml = p.tag ? `<span class="shop-product-card-tag">${escHtml(p.tag)}</span>` : '';
-      return `<button type="button" class="shop-product-card${sel ? ' shop-product-card--selected' : ''}" data-product-id="${escHtml(p.id)}" onclick="claudeShopSelectProduct('${escHtml(p.id)}')">
+      // p.stock_available = 专属池 + 通用池兜底，能实际下单的数量；低于 1 时标红并禁用
+      const available = Number(p.stock_available ?? 0);
+      const outOfStock = available <= 0;
+      const stockStyle = outOfStock ? 'color:var(--clr-danger, #c0392b)' : 'color:var(--text-muted)';
+      const stockText = outOfStock ? '暂无库存' : `剩余 <strong>${available}</strong> 件`;
+      return `<button type="button" class="shop-product-card${sel ? ' shop-product-card--selected' : ''}${outOfStock ? ' shop-product-card--disabled' : ''}" data-product-id="${escHtml(p.id)}" ${outOfStock ? 'disabled aria-disabled="true"' : ''} onclick="${outOfStock ? '' : `claudeShopSelectProduct('${escHtml(p.id)}')`}">
         <div class="shop-product-card-head">${tagHtml}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
         <p class="shop-product-card-desc">${escHtml(p.description || '')}</p>
         <div class="shop-product-card-prices">
           <span class="shop-product-card-retail">¥${Number(p.retail_price_yuan).toFixed(2)}<small>/件</small></span>
           <span class="shop-product-card-ws">满 ${p.wholesale_min_qty || 5} 件 · ¥${Number(p.wholesale_price_yuan).toFixed(2)}/件</span>
         </div>
-        <div class="shop-product-card-foot"><span class="shop-product-card-picked">已选中</span><span class="shop-product-card-hint">点击选中</span></div>
+        <div class="shop-product-card-foot"><span class="shop-product-card-picked">已选中</span><span class="shop-product-card-hint" style="${stockStyle}">${stockText}</span></div>
       </button>`;
     }).join('');
   } else {
@@ -2694,7 +2803,7 @@ async function renderClaudeShop(container) {
         <section class="shop-product-panel" aria-label="商品信息">
           ${!pickReq ? `<div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>` : `<p class="form-label" style="margin-bottom:0.65rem">选择商品 <span style="font-weight:400;color:var(--text-muted);font-size:0.82rem">（必选 · 点击卡片选中）</span></p>`}
           <div class="shop-product-grid">${productGridHtml}</div>
-          <div class="shop-stock-banner"><span class="text-muted">共用库存</span> <strong>${summary.stock_available ?? 0}</strong> 件可售
+          <div class="shop-stock-banner"><span class="text-muted">全站总可售</span> <strong>${summary.stock_available ?? 0}</strong> 件${(summary.stock_unassigned ?? 0) > 0 ? ` <span class="text-muted" style="font-size:0.78rem">（其中通用池 ${summary.stock_unassigned} 件，可作为任一 SKU 订单兜底）</span>` : ''}
             ${summary.tutorial_url ? `<span class="shop-stock-banner-tutorial"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></span>` : ''}
           </div>
         </section>
@@ -2830,6 +2939,7 @@ window.loadShopImportFile = async function() {
 
 window.runShopImport = async function() {
   const t = ($('shop-import-ta')?.value || '').trim();
+  const productId = ($('shop-import-product')?.value || '').trim();
   if (!t) {
     toast('请粘贴 .txt / .csv 内容', 'warn');
     return;
@@ -2840,8 +2950,9 @@ window.runShopImport = async function() {
     return;
   }
   const batchTag = ($('shop-import-batch')?.value || '').trim();
+  // productId 留空 = 通用池
   try {
-    const r = await api.admin.shopImportInventory(t, batchTag);
+    const r = await api.admin.shopImportInventory(t, batchTag, productId);
     const recognized = Number.isFinite(r.recognized) ? r.recognized : preview.pairs.length;
     const skipped = Number.isFinite(r.skipped) ? r.skipped : ((r.warnings || []).length);
     let msg = `识别 ${recognized} 条，导入成功 ${r.inserted} 条`;
@@ -2873,6 +2984,12 @@ window.adminShopInventorySetStatus = function(status) {
 
 window.adminShopInventorySetBatch = function(batch) {
   state.adminShopInventoryBatch = batch || '';
+  state.adminShopInventoryPage = 1;
+  navigate('admin-shop-inventory');
+};
+
+window.adminShopInventorySetProduct = function(productId) {
+  state.adminShopInventoryProduct = productId || '';
   state.adminShopInventoryPage = 1;
   navigate('admin-shop-inventory');
 };
@@ -3086,10 +3203,11 @@ async function renderAdminShopInventory(container) {
   const inventoryPage = state.adminShopInventoryPage || 1;
   const inventoryStatus = state.adminShopInventoryStatus || 'all';
   const batchFilter = state.adminShopInventoryBatch || '';
+  const productFilter = state.adminShopInventoryProduct || '';
   const defBatch = shopDefaultBatchMMDD();
-  const [cfg, inventoryRes, batchesRes] = await Promise.all([
+  const [cfg, inventoryRes, batchesRes, productsRes] = await Promise.all([
     api.admin.shopGetConfig(),
-    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30, batchFilter).catch(() => ({
+    api.admin.shopListInventory(inventoryStatus, inventoryPage, 30, batchFilter, productFilter).catch(() => ({
       data: [],
       total: 0,
       page: inventoryPage,
@@ -3101,7 +3219,20 @@ async function renderAdminShopInventory(container) {
       },
     })),
     api.admin.shopListInventoryBatches().catch(() => ({ data: [], unbatched_available: 0 })),
+    api.admin.shopListProducts().catch(() => ({ data: [], stock_unassigned: 0 })),
   ]);
+  const products = productsRes.data || [];
+  const unassignedStock = Number(productsRes.stock_unassigned ?? cfg.stock_unassigned ?? 0);
+  const productMap = new Map(products.map(p => [p.id, p]));
+  const productOptions = products.map(p => {
+    const dedicated = Number(p.stock_dedicated ?? 0);
+    return `<option value="${escHtml(p.id)}">${escHtml(p.title || '—')}（专属待售 ${dedicated}）</option>`;
+  }).join('');
+  const productFilterOptions = products.map(p => {
+    const sel = productFilter === p.id ? 'selected' : '';
+    const dedicated = Number(p.stock_dedicated ?? 0);
+    return `<option value="${escHtml(p.id)}" ${sel}>${escHtml(p.title || '—')}（专属 ${dedicated}）</option>`;
+  }).join('');
   const inventoryRows = inventoryRes.data || [];
   const inventoryTotal = inventoryRes.total ?? 0;
   const inventorySize = inventoryRes.size || 30;
@@ -3134,6 +3265,14 @@ async function renderAdminShopInventory(container) {
             <div class="form-hint">本次导入的所有行共用此标签，便于按批筛选、删除待售</div>
           </div>
           <div class="form-group">
+            <label class="form-label">关联商品（库存池归属）</label>
+            <select class="form-input" id="shop-import-product" style="max-width:360px">
+              <option value="">通用池（任意 SKU 订单均可兜底取用）</option>
+              ${productOptions}
+            </select>
+            <div class="form-hint">选择某商品 = 本批只供该 SKU 订单使用；留空 = 通用池（所有 SKU 订单的兜底）</div>
+          </div>
+          <div class="form-group">
             <label class="form-label">文件导入</label>
             <input type="file" id="shop-import-file" accept=".txt,.csv,text/plain,text/csv" onchange="loadShopImportFile()" />
             <div class="form-hint">支持 txt / csv，载入后会自动统计识别条数</div>
@@ -3142,7 +3281,7 @@ async function renderAdminShopInventory(container) {
           <div id="shop-import-stats" class="form-hint" style="margin-top:0.5rem"></div>
           <div style="display:flex;flex-wrap:wrap;gap:0.6rem;align-items:center;margin-top:0.6rem">
             <button type="button" class="btn btn-primary btn-sm" onclick="runShopImport()">导入到待售池</button>
-            <span style="font-size:0.75rem;color:var(--text-muted)">当前可售库存：<strong>${availableStock}</strong> 件 / 已售 <strong>${soldStock}</strong> 件 / 总计 <strong>${totalStock}</strong> 件</span>
+            <span style="font-size:0.75rem;color:var(--text-muted)">当前可售库存：<strong>${availableStock}</strong> 件（其中通用池 <strong>${unassignedStock}</strong>）/ 已售 <strong>${soldStock}</strong> 件 / 总计 <strong>${totalStock}</strong> 件</span>
           </div>
         </div>
       </div>
@@ -3165,6 +3304,12 @@ async function renderAdminShopInventory(container) {
               ${noneOpt}
               ${batchOpts}
             </select>
+            <span style="font-size:0.78rem;color:var(--text-muted)">商品</span>
+            <select class="form-input" style="min-width:200px" onchange="adminShopInventorySetProduct(this.value)">
+              <option value="" ${productFilter === '' ? 'selected' : ''}>全部</option>
+              <option value="__none__" ${productFilter === '__none__' ? 'selected' : ''}>通用池（未绑定 SKU · 可售 ${unassignedStock}）</option>
+              ${productFilterOptions}
+            </select>
           </div>
         </div>
         <div class="card-body" style="padding-top:0">
@@ -3176,7 +3321,7 @@ async function renderAdminShopInventory(container) {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>邮箱 / Key</th><th>批次</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
+            <thead><tr><th>邮箱 / Key</th><th>批次</th><th>所属商品</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
             <tbody>
               ${inventoryRows.length ? inventoryRows.map(item => {
                 const emailJs = JSON.stringify(item.email || '');
@@ -3184,6 +3329,10 @@ async function renderAdminShopInventory(container) {
                 const labelJs = JSON.stringify(item.email || item.id || '');
                 const bl = (item.batch_label || '').trim();
                 const blShow = bl ? escHtml(bl) : '<span style="color:var(--text-muted)">—</span>';
+                const prod = item.product_id ? productMap.get(item.product_id) : null;
+                const prodShow = item.product_id
+                  ? (prod ? escHtml(prod.title || '—') : '<span style="color:var(--clr-warn)">已删除 SKU</span>')
+                  : '<span class="badge badge-gray">通用池</span>';
                 return `
                 <tr data-shop-inventory-row>
                   <td>
@@ -3191,12 +3340,13 @@ async function renderAdminShopInventory(container) {
                     <div class="code-box" style="margin-top:0.35rem;font-size:0.72rem"><span>${escHtml(item.api_key || '')}</span><button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⧉</button></div>
                   </td>
                   <td style="font-size:0.78rem;font-weight:600">${blShow}</td>
+                  <td style="font-size:0.78rem">${prodShow}</td>
                   <td>${item.status === 'sold' ? '<span class="badge badge-gray">已售出</span>' : '<span class="badge badge-green">待售</span>'}</td>
                   <td style="font-size:0.72rem;font-family:var(--font-mono)">${item.order_id ? escHtml(item.order_id) : '<span style="color:var(--text-muted)">—</span>'}</td>
                   <td style="font-size:0.78rem">${formatDate(item.created_at)}</td>
                   <td><button type="button" class="btn btn-danger btn-sm" onclick='deleteShopInventory("${item.id}", ${labelJs})'>删除</button></td>
                 </tr>`;
-              }).join('') : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:1rem">暂无货物</td></tr>'}
+              }).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1rem">暂无货物</td></tr>'}
             </tbody>
           </table>
         </div>
@@ -3347,8 +3497,9 @@ async function renderAdminShopProducts(container) {
       <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-inventory')">库存与货物</button>
       <button type="button" class="btn btn-ghost btn-sm" onclick="navigate('admin-shop-orders')">订单与发货</button>`;
   }
-  const res = await api.admin.shopListProducts().catch(() => ({ data: [] }));
+  const res = await api.admin.shopListProducts().catch(() => ({ data: [], stock_unassigned: 0 }));
   const list = res.data || [];
+  const unassignedStock = Number(res.stock_unassigned ?? 0);
   const editId = state.adminShopProductEditId;
   const editing = editId ? list.find(p => p.id === editId) : null;
 
@@ -3389,25 +3540,32 @@ async function renderAdminShopProducts(container) {
         </div>
       </div>
       <div class="card">
-        <div class="card-header"><div class="card-title">已维护的 SKU</div></div>
+        <div class="card-header" style="align-items:flex-start;flex-wrap:wrap;gap:0.6rem">
+          <div class="card-title">已维护的 SKU</div>
+          <div style="font-size:0.78rem;color:var(--text-muted)">通用池（未绑定 SKU 的库存）可售：<strong>${unassignedStock}</strong> 件；任何 SKU 订单在专属池不足时会自动从通用池兜底。</div>
+        </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>排序</th><th>标题</th><th>标签</th><th>零售</th><th>批发</th><th>上架</th><th></th></tr></thead>
+            <thead><tr><th>排序</th><th>标题</th><th>标签</th><th>零售</th><th>批发</th><th>专属库存</th><th>上架</th><th></th></tr></thead>
             <tbody>
-              ${list.length ? list.map(p => `
+              ${list.length ? list.map(p => {
+                const dedicated = Number(p.stock_dedicated ?? 0);
+                const total = Number(p.stock_with_unassigned ?? dedicated);
+                return `
                 <tr>
                   <td>${p.sort_order ?? 0}</td>
                   <td style="font-size:0.85rem">${escHtml(p.title || '')}</td>
                   <td style="font-size:0.8rem">${escHtml(p.tag || '—')}</td>
                   <td>¥${Number(p.retail_price_yuan).toFixed(2)}</td>
                   <td>¥${Number(p.wholesale_price_yuan).toFixed(2)} <span style="font-size:0.72rem;color:var(--text-muted)">(${p.wholesale_min_qty || 5}件起)</span></td>
+                  <td style="font-size:0.82rem"><strong>${dedicated}</strong> <span style="color:var(--text-muted);font-size:0.72rem">（含兜底 ${total}）</span></td>
                   <td>${p.enabled !== false ? '是' : '否'}</td>
                   <td style="display:flex;flex-wrap:wrap;gap:0.35rem">
                     <button type="button" class="btn btn-ghost btn-sm" onclick="adminShopProductStartEdit('${escHtml(p.id)}')">编辑</button>
                     <button type="button" class="btn btn-ghost btn-sm" onclick="adminShopProductDelete(${JSON.stringify(p.id)}, ${JSON.stringify(p.title || '')})">删除</button>
                   </td>
-                </tr>
-              `).join('') : '<tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:1rem">暂无 SKU，用户侧将使用「商品与收款」页的默认单价</td></tr>'}
+                </tr>`;
+              }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:1rem">暂无 SKU，用户侧将使用「商品与收款」页的默认单价</td></tr>'}
             </tbody>
           </table>
         </div>

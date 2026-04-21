@@ -17,7 +17,9 @@ api/Dockerfile：Go 用 GOPROXY/GOSUMDB；运行阶段 apk 前已 sed 换阿里�
 docker-compose：frontend 挂载 ./frontend:ro + nginx/default.conf；对外常见 8880:80；**域名 HTTPS 若 502，先查 `docker compose ps` 是否有 tempmail-frontend-1**，没有则 `docker compose up -d frontend`；宝塔反代应指向该端口。API 依赖 postgres/redis/pgbouncer；数据卷 ./data（含 admin.key、shop 收款码；**支付宝 PEM 可放 data/alipay_*.pem**，见下文 KEY_FILE）。**Postfix（对外 SMTP 收信，宿主机 25）**：`docker compose ps` 须含 **tempmail-postfix-1** 且映射 **25→25**；若从未启动或只执行过 `up -d api` 等，会**完全或间歇收不到**外部按 MX 投递的邮件；处理：`docker compose up -d`（拉全栈）或 `docker compose up -d postfix`，并用 `ss -lntp | grep ':25 '` 确认监听；阿里云安全组须放行 **入站 TCP 25**。
 nginx：location 必须用 ^~ /public/（及 ^~ /api/），否则正则 location ~* \\.(png|jpg)$ 会抢走 /public/shop-assets/*.png 导致收款码 404。
 前端强缓存：nginx 对 .js/.css 使用 immutable；改 app.js/style.css 后必须在 frontend/index.html 增大 ?v= 版本号并部署。
-数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm、v8 static_qr_enabled 开关与 claude_shop_products 多 SKU）。
+数据库迁移在 sql/，新库用 init.sql；已有库按序执行 migrate_v*.sql（migrate_v5 Claude 店铺、v6 batch_label、v7 支付宝当面付字段与 static_payment_manual_confirm、v8 static_qr_enabled 开关与 claude_shop_products 多 SKU、**v9 claude_inventory.product_id 商品独立卡券池**，NULL = 通用池，订单带 product_id 时先专属池后通用池兜底）。
+后台 MX 巡检（api/main.go 的 `[mx-verifier]` / `[mx-recheck]`）已改为 **DB 优先、env 兜底**，与 `api/handler/domain.go` 的 `getServerIP/getServerHostname` 行为一致；管理员在「系统设置」改 `smtp_server_ip` / `smtp_hostname` 后，**30 秒内** 对下一轮 MX 巡检自动生效，无需重启 api 容器。
+账户凭证仍是 API Key（本项目不做传统密码登录）。用户可在「我的 API Key」页面、管理员可在「账户管理」每行点 **重置 API Key**：旧 key 立即失效，新 key 在响应里一次性展示。后端新增 `POST /api/me/rotate-key`、`POST /api/admin/accounts/:id/rotate-key`。
 scripts/ 目录已 .gitignore，不进入仓库；不要在回复里依赖该目录被推送。
 业务功能摘要：管理员账户分页/模糊搜/封禁仅禁登录；Claude 自助售号（库存导入 Tab/CSV/####/表头跳过；可选支付宝当面付 precreate + POST /public/alipay/notify 自动发货；静态收款码由 static_qr_enabled 总开关控制，开启时静态路径仍限制一单待确认，当面付可多笔并行）；店铺 static_payment_manual_confirm；多 SKU claude_shop_products + 标签；库存 batch_label；GET /admin/shop/inventory/batches、POST purge-batch / purge-available 仅删待售；管理员侧店铺三页；GET /api/admin/shop/orders/:id 订单详情。
 生产域名示例：Web https://mail.yahoohh.cloud/；支付宝异步通知须与 .env 一致：https://mail.yahoohh.cloud/public/alipay/notify（支付宝开放平台同址）。
@@ -121,9 +123,26 @@ docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < s
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v7.sql
 # v8：static_qr_enabled、claude_shop_products、订单 product 快照
 docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v8.sql
+# v9：claude_inventory.product_id（商品独立卡券池 + 通用池兜底）
+docker exec -i $(docker compose ps -q postgres) psql -U tempmail -d tempmail < sql/migrate_v9.sql
 ```
 
 若 `docker compose ps -q postgres` 为空，先 `docker compose up -d postgres` 再执行。**已执行过的 migrate 不要重复执行**（重复 ALTER IF NOT EXISTS 一般无害，但养成按版本核对习惯）。
+
+### 定期备份（强烈建议）
+
+仓库 `docs/backup-template.sh` 是一份参考脚本，复制到服务器 `/root/tempmail/scripts/backup.sh`（`scripts/` 已在 `.gitignore`，不会进仓库），做：
+
+1. `docker exec postgres pg_dump` 全量 → `/root/backups/db_YYYYMMDD_HHMM.sql.gz`
+2. `tar -czf` 打包 `./data`（含 `admin.key`、收款码、支付宝 PEM 等运行时文件）→ `/root/backups/data_YYYYMMDD_HHMM.tgz`
+
+放入 crontab（示例每天 03:10 一次，保留 14 天）：
+
+```
+10 3 * * * /bin/bash /root/tempmail/scripts/backup.sh >> /root/tempmail/scripts/backup.log 2>&1
+```
+
+**这一步必做**：git 推送不会同步 `.env` / `data/` / `pgdata` 卷，服务器磁盘损坏时这些都不在仓库里。
 
 ### 支付宝当面付（可选）
 

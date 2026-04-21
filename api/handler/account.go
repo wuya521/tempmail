@@ -159,3 +159,65 @@ func (h *AccountHandler) Me(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, out)
 }
+
+// POST /api/me/rotate-key - 当前用户自助重置 API Key。
+// 成功后旧 key 立即失效，新 key 仅在此响应中一次性返回，前端需保存并替换 localStorage。
+func (h *AccountHandler) MyRotateKey(c *gin.Context) {
+	account := middleware.GetAccount(c)
+	oldPrefix := apiKeyPrefix(account.APIKey)
+	newKey, err := h.store.RotateAPIKey(c.Request.Context(), account.ID)
+	if err != nil {
+		log.Printf("[rotate-key] self uid=%s username=%s failed: %v", account.ID, account.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	log.Printf("[rotate-key] self uid=%s username=%s old_prefix=%s new_prefix=%s",
+		account.ID, account.Username, oldPrefix, apiKeyPrefix(newKey))
+	c.JSON(http.StatusOK, gin.H{
+		"api_key": newKey,
+		"message": "API Key 已轮换，旧 Key 立即失效；请妥善保存新 Key，它不会再次展示。",
+	})
+}
+
+// POST /api/admin/accounts/:id/rotate-key - 管理员为指定账号重置 API Key。
+// 新 key 仅在响应里一次性返回，管理员需尽快通知用户；禁止对自己使用（请用 /api/me/rotate-key）。
+func (h *AccountHandler) AdminRotateKey(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+	self := middleware.GetAccount(c)
+	if id == self.ID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请使用 /api/me/rotate-key 重置自己的 Key"})
+		return
+	}
+	target, err := h.store.GetAccountByID(c.Request.Context(), id)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "账户不存在"})
+		return
+	}
+	oldPrefix := apiKeyPrefix(target.APIKey)
+	newKey, err := h.store.RotateAPIKey(c.Request.Context(), id)
+	if err != nil {
+		log.Printf("[rotate-key] admin by=%s target=%s failed: %v", self.Username, target.Username, err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	log.Printf("[rotate-key] admin by=%s target=%s old_prefix=%s new_prefix=%s",
+		self.Username, target.Username, oldPrefix, apiKeyPrefix(newKey))
+	c.JSON(http.StatusOK, gin.H{
+		"id":       target.ID,
+		"username": target.Username,
+		"api_key":  newKey,
+		"message":  "新 Key 仅在此展示一次，请立即告知用户并提醒其妥善保存。",
+	})
+}
+
+// apiKeyPrefix 日志脱敏：仅保留前 10 位（tm_ + 7 字符 hex），足以审计、无法还原。
+func apiKeyPrefix(k string) string {
+	if len(k) <= 10 {
+		return k
+	}
+	return k[:10] + "…"
+}

@@ -140,6 +140,35 @@ func (s *Store) DeleteAccount(ctx context.Context, accountID uuid.UUID) error {
 	return err
 }
 
+// RotateAPIKey 为指定账号生成新的 API Key，旧 key 立即失效（accounts.api_key 为 UNIQUE 索引，UPDATE 后旧 key 查不到）。
+// 返回新 key 的明文，调用者负责一次性返回给用户；函数内部对重复 key 的碰撞做最多 3 次重试。
+func (s *Store) RotateAPIKey(ctx context.Context, accountID uuid.UUID) (string, error) {
+	var lastErr error
+	for i := 0; i < 3; i++ {
+		newKey := generateAPIKey()
+		tag, err := s.pool.Exec(ctx,
+			`UPDATE accounts SET api_key = $2, updated_at = NOW() WHERE id = $1`,
+			accountID, newKey,
+		)
+		if err != nil {
+			lastErr = err
+			if strings.Contains(err.Error(), "accounts_api_key_key") ||
+				strings.Contains(strings.ToLower(err.Error()), "unique") {
+				continue
+			}
+			return "", err
+		}
+		if tag.RowsAffected() == 0 {
+			return "", pgx.ErrNoRows
+		}
+		return newKey, nil
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", fmt.Errorf("rotate api key: unknown error")
+}
+
 func (s *Store) ListAccounts(ctx context.Context, page, size int, search string) ([]model.Account, int, error) {
 	var total int
 	var err error

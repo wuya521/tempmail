@@ -80,8 +80,12 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		alipayU = h.qrURL(cfg.AlipayQRFile)
 	}
 	plist, _ := h.store.ListClaudeShopProductsPublic(ctx)
+	stockMap, unassigned, _ := h.store.GetProductStockMap(ctx)
 	products := make([]gin.H, 0, len(plist))
 	for _, p := range plist {
+		ps := stockMap[p.ID.String()]
+		// 用户看到的"可下单"= 专属池 + 通用池兜底；专属池单独用 stock_dedicated 展示
+		available := ps.Dedicated + unassigned
 		products = append(products, gin.H{
 			"id":                    p.ID.String(),
 			"title":                 p.Title,
@@ -92,6 +96,8 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 			"wholesale_price_yuan":  centsToYuan(p.WholesalePriceCents),
 			"retail_price_cents":    p.RetailPriceCents,
 			"wholesale_price_cents": p.WholesalePriceCents,
+			"stock_dedicated":       ps.Dedicated,
+			"stock_available":       available,
 		})
 	}
 	out := gin.H{
@@ -108,6 +114,7 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		"tag_fan_welfare":               cfg.TagFanWelfare,
 		"max_per_user":                  cfg.MaxPerUser,
 		"stock_available":               stock,
+		"stock_unassigned":              unassigned,
 		"wechat_qr_url":                 wechatU,
 		"alipay_qr_url":                 alipayU,
 		"retail_price_cents":            cfg.RetailPriceCents,
@@ -433,6 +440,7 @@ func (h *ClaudeShopHandler) AdminGetConfig(c *gin.Context) {
 		sold = summary.Sold
 		total = summary.Total
 	}
+	_, unassigned, _ := h.store.GetProductStockMap(c.Request.Context())
 	c.JSON(http.StatusOK, gin.H{
 		"enabled":                 cfg.Enabled,
 		"title":                   cfg.Title,
@@ -449,6 +457,7 @@ func (h *ClaudeShopHandler) AdminGetConfig(c *gin.Context) {
 		"tag_fan_welfare":         cfg.TagFanWelfare,
 		"max_per_user":            cfg.MaxPerUser,
 		"stock_available":         available,
+		"stock_unassigned":        unassigned,
 		"stock_sold":              sold,
 		"stock_total":             total,
 		"wechat_qr_url":           h.qrURL(cfg.WechatQRFile),
@@ -601,6 +610,7 @@ func (h *ClaudeShopHandler) AdminUploadQR(c *gin.Context) {
 }
 
 // POST /api/admin/shop/inventory/import  Content-Type: text/plain
+// Query: ?batch=xxx&product_id=<uuid>   product_id 留空 = 导入到通用池
 func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
@@ -624,7 +634,24 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		}
 		batch = time.Now().In(loc).Format("0102")
 	}
-	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs, batch)
+	var prodPtr *uuid.UUID
+	if pidStr := strings.TrimSpace(c.Query("product_id")); pidStr != "" {
+		pid, perr := parseUUID(pidStr)
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "product_id 无效"})
+			return
+		}
+		if _, err := h.store.GetClaudeShopProductByID(c.Request.Context(), pid, false); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "商品不存在"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		prodPtr = &pid
+	}
+	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs, batch, prodPtr)
 	if err != nil {
 		if err.Error() == "invalid_batch_label" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识无效"})
@@ -633,16 +660,20 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{
-		"recognized":   len(pairs),
-		"inserted":     n,
-		"skipped":      len(warns),
-		"warnings":     warns,
-		"batch_label":  batch,
-	})
+	resp := gin.H{
+		"recognized":  len(pairs),
+		"inserted":    n,
+		"skipped":     len(warns),
+		"warnings":    warns,
+		"batch_label": batch,
+	}
+	if prodPtr != nil {
+		resp["product_id"] = prodPtr.String()
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
-// GET /api/admin/shop/inventory?status=available&page=1&size=30
+// GET /api/admin/shop/inventory?status=available&page=1&size=30&product_id=<uuid|__none__>
 func (h *ClaudeShopHandler) AdminListInventory(c *gin.Context) {
 	status := c.DefaultQuery("status", "all")
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
@@ -654,10 +685,15 @@ func (h *ClaudeShopHandler) AdminListInventory(c *gin.Context) {
 		size = 30
 	}
 	batch := strings.TrimSpace(c.Query("batch"))
-	list, total, err := h.store.ListClaudeInventory(c.Request.Context(), status, batch, page, size)
+	product := strings.TrimSpace(c.Query("product_id"))
+	list, total, err := h.store.ListClaudeInventory(c.Request.Context(), status, batch, product, page, size)
 	if err != nil {
-		if err.Error() == "invalid_inventory_status" {
+		switch err.Error() {
+		case "invalid_inventory_status":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid inventory status"})
+			return
+		case "invalid_product_filter":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "product_id 无效"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -814,16 +850,22 @@ func (h *ClaudeShopHandler) AdminConfirmOrder(c *gin.Context) {
 
 // GET /api/admin/shop/products
 func (h *ClaudeShopHandler) AdminListShopProducts(c *gin.Context) {
-	list, err := h.store.ListClaudeShopProductsAdmin(c.Request.Context())
+	ctx := c.Request.Context()
+	list, err := h.store.ListClaudeShopProductsAdmin(ctx)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
+	stockMap, unassigned, _ := h.store.GetProductStockMap(ctx)
 	out := make([]gin.H, 0, len(list))
 	for i := range list {
-		out = append(out, shopProductToResponse(&list[i]))
+		row := shopProductToResponse(&list[i])
+		ps := stockMap[list[i].ID.String()]
+		row["stock_dedicated"] = ps.Dedicated
+		row["stock_with_unassigned"] = ps.Dedicated + unassigned
+		out = append(out, row)
 	}
-	c.JSON(http.StatusOK, gin.H{"data": out})
+	c.JSON(http.StatusOK, gin.H{"data": out, "stock_unassigned": unassigned})
 }
 
 // POST /api/admin/shop/products

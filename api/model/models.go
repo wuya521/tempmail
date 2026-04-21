@@ -37,7 +37,9 @@ type ClaudeOrder struct {
 	Lines                []ClaudeOrderLine `json:"lines,omitempty"`
 }
 
-// ClaudeShopProduct 店铺 SKU（与全局库存共用池，区别在展示名称与单价）
+// ClaudeShopProduct 店铺 SKU。
+// 自 migrate_v9 起，每个 SKU 可绑定独立卡券池（claude_inventory.product_id）；
+// 订单取货时先用本 SKU 专属池，不足再从通用池（product_id IS NULL）兜底。
 type ClaudeShopProduct struct {
 	ID                  uuid.UUID `json:"id"`
 	SortOrder           int       `json:"sort_order"`
@@ -65,6 +67,7 @@ type ClaudeInventoryItem struct {
 	Status     string     `json:"status"`
 	OrderID    *uuid.UUID `json:"order_id,omitempty"`
 	BatchLabel string     `json:"batch_label"`
+	ProductID  *uuid.UUID `json:"product_id,omitempty"` // nil = 通用池
 	CreatedAt  time.Time  `json:"created_at"`
 }
 
@@ -73,6 +76,13 @@ type ClaudeInventoryBatchInfo struct {
 	Label     string `json:"label"`
 	Total     int    `json:"total"`
 	Available int    `json:"available"`
+}
+
+// ClaudeProductStock 某 SKU 当前可售 = 专属池 + 通用池兜底
+type ClaudeProductStock struct {
+	ProductID       *uuid.UUID `json:"product_id,omitempty"` // nil = 通用池自身
+	Dedicated       int        `json:"dedicated"`            // 本 SKU 专属池可用
+	WithUnassigned  int        `json:"with_unassigned"`      // 包含通用池兜底后的可用数
 }
 
 type ClaudeInventorySummary struct {

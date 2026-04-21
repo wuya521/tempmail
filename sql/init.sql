@@ -170,9 +170,13 @@ CREATE TABLE claude_inventory (
     status       VARCHAR(24)  NOT NULL DEFAULT 'available',
     order_id     UUID         REFERENCES claude_orders(id) ON DELETE SET NULL,
     batch_label  VARCHAR(64)  NOT NULL DEFAULT '',
+    -- product_id 为 NULL 表示通用池；带 product_id 的订单优先从同 product_id 取货，
+    -- 不足时兜底取通用池。见 migrate_v9.sql。
+    product_id   UUID         REFERENCES claude_shop_products(id) ON DELETE SET NULL,
     created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
 );
 CREATE INDEX idx_claude_inv_available ON claude_inventory (created_at ASC) WHERE status = 'available';
+CREATE INDEX idx_claude_inv_product_available ON claude_inventory (product_id, created_at ASC) WHERE status = 'available';
 
 CREATE TABLE claude_order_lines (
     id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),

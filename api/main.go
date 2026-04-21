@@ -135,6 +135,7 @@ func main() {
 	{
 		// 当前用户
 		api.GET("/me", accountH.Me)
+		api.POST("/me/rotate-key", accountH.MyRotateKey)
 
 		api.GET("/shop/orders", shopH.ListMyOrders)
 		api.GET("/shop/orders/:id", shopH.GetMyOrder)
@@ -164,6 +165,7 @@ func main() {
 			admin.GET("/accounts", accountH.List)
 			admin.PATCH("/accounts/:id", accountH.Patch)
 			admin.DELETE("/accounts/:id", accountH.Delete)
+			admin.POST("/accounts/:id/rotate-key", accountH.AdminRotateKey)
 
 			admin.GET("/shop/config", shopH.AdminGetConfig)
 			admin.PUT("/shop/config", shopH.AdminPutConfig)
@@ -275,10 +277,7 @@ func main() {
 				if len(pendingDomains) == 0 {
 					continue
 				}
-				serverIP := cfg.SMTPServerIP
-				if serverIP == "" {
-					serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-				}
+				serverIP := currentServerIP(context.Background(), db, cfg.SMTPServerIP)
 				for _, d := range pendingDomains {
 					matched, _, mxStatus := store.CheckDomainMX(d.Domain, serverIP)
 					db.TouchDomainCheckTime(context.Background(), d.ID)
@@ -300,10 +299,7 @@ func main() {
 					log.Printf("[mx-recheck] list active error: %v", err)
 					continue
 				}
-				serverIP := cfg.SMTPServerIP
-				if serverIP == "" {
-					serverIP, _ = db.GetSetting(context.Background(), "smtp_server_ip")
-				}
+				serverIP := currentServerIP(context.Background(), db, cfg.SMTPServerIP)
 				log.Printf("[mx-recheck] checking %d active domains", len(activeDomains))
 				for _, d := range activeDomains {
 					matched, _, mxStatus := store.CheckDomainMX(d.Domain, serverIP)
@@ -372,4 +368,28 @@ func main() {
 		log.Fatalf("Server forced to shutdown: %v", err)
 	}
 	log.Println("Server exited")
+}
+
+// currentServerIP 返回 MX 校验/SPF 所用的服务器 IP：DB 的 smtp_server_ip 优先，其次启动时的环境变量快照。
+// 与 handler/domain.go 的 getServerIP 保持一致，确保管理员在后台更新 server_ip 后，下次 MX 巡检即生效。
+func currentServerIP(ctx context.Context, db *store.Store, cfgIP string) string {
+	if ip, err := db.GetSetting(ctx, "smtp_server_ip"); err == nil {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			return ip
+		}
+	}
+	return cfgIP
+}
+
+// currentServerHostname 返回 MX 记录应指向的 hostname：DB 的 smtp_hostname 优先，其次启动时的环境变量快照。
+// 目前 CheckDomainMX 未使用，但 helper 预留以便后续扩展。
+func currentServerHostname(ctx context.Context, db *store.Store, cfgHN string) string {
+	if hn, err := db.GetSetting(ctx, "smtp_hostname"); err == nil {
+		hn = strings.TrimSpace(hn)
+		if hn != "" {
+			return hn
+		}
+	}
+	return cfgHN
 }

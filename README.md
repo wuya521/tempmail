@@ -192,16 +192,27 @@ X-RateLimit-Reset: 1735000000
 
 | 文件 | 用途 |
 |------|------|
-| `sql/init.sql` | 全量初始化（新库使用）|
-| `sql/migrate_v2.sql` | v1 → v2：添加邮箱 `expires_at` 字段 |
-| `sql/migrate_v3.sql` | v2 → v3：域名 `status`、`mx_checked_at`，新增系统配置项（含 `smtp_hostname`）|
+| `sql/init.sql` | 全量初始化（新库使用，已含 v2–v9 的所有字段）|
+| `sql/migrate_v2.sql` | v1 → v2：邮箱 `expires_at` 字段 |
+| `sql/migrate_v3.sql` | v2 → v3：域名 `status`、`mx_checked_at`，系统配置项（`smtp_hostname` 等）|
+| `sql/migrate_v4.sql` | v3 → v4：账户 `last_seen_at` 等 |
+| `sql/migrate_v5.sql` | v4 → v5：Claude 自助售号初版（`claude_orders` / `claude_inventory` / `claude_shop_config`）|
+| `sql/migrate_v6.sql` | v5 → v6：库存批次 `claude_inventory.batch_label`|
+| `sql/migrate_v7.sql` | v6 → v7：支付宝当面付字段（`claude_orders.payment_channel` / `alipay_trade_no`；`claude_shop_config.static_payment_manual_confirm`）|
+| `sql/migrate_v8.sql` | v7 → v8：静态收款码总开关 `static_qr_enabled`、多 SKU `claude_shop_products`、订单商品快照 |
+| `sql/migrate_v9.sql` | v8 → v9：**商品独立卡券池** `claude_inventory.product_id`，订单优先专属池 + 通用池兜底 |
 
-对已运行的库执行迁移：
+对已运行的库按版本号顺序执行缺失的 migrate，例如首次补到最新：
 
 ```bash
-docker exec -i $(docker compose ps -q postgres) \
-  psql -U tempmail -d tempmail < sql/migrate_v3.sql
+for v in 2 3 4 5 6 7 8 9; do
+  docker exec -i $(docker compose ps -q postgres) \
+    psql -U tempmail -d tempmail < sql/migrate_v${v}.sql
+done
 ```
+
+> 上线变更数据库前请先 `pg_dump` 备份；`docs/backup-template.sh` 提供了定期备份脚本模板。
+> 账户认证：本项目使用 API Key（不使用传统密码），用户可在"我的 API Key"页自助重置，管理员也可在"账户管理"每行点"重置 Key"。
 
 ---
 

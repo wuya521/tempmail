@@ -48,7 +48,7 @@ func centsToYuan(c int) float64 {
 }
 
 func shopProductToResponse(p *model.ClaudeShopProduct) gin.H {
-	return gin.H{
+	out := gin.H{
 		"id":                    p.ID.String(),
 		"sort_order":            p.SortOrder,
 		"enabled":               p.Enabled,
@@ -60,9 +60,16 @@ func shopProductToResponse(p *model.ClaudeShopProduct) gin.H {
 		"wholesale_min_qty":     p.WholesaleMinQty,
 		"retail_price_cents":    p.RetailPriceCents,
 		"wholesale_price_cents": p.WholesalePriceCents,
+		"delivery_type":         p.DeliveryType,
+		"delivery_schema":       p.DeliverySchema,
 		"created_at":            p.CreatedAt,
 		"updated_at":            p.UpdatedAt,
 	}
+	if p.SVIPPriceCents != nil {
+		out["svip_price_cents"] = *p.SVIPPriceCents
+		out["svip_price_yuan"] = centsToYuan(*p.SVIPPriceCents)
+	}
+	return out
 }
 
 // GET /public/claude-shop
@@ -84,9 +91,8 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 	products := make([]gin.H, 0, len(plist))
 	for _, p := range plist {
 		ps := stockMap[p.ID.String()]
-		// 用户看到的"可下单"= 专属池 + 通用池兜底；专属池单独用 stock_dedicated 展示
 		available := ps.Dedicated + unassigned
-		products = append(products, gin.H{
+		row := gin.H{
 			"id":                    p.ID.String(),
 			"title":                 p.Title,
 			"description":           p.Description,
@@ -96,9 +102,15 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 			"wholesale_price_yuan":  centsToYuan(p.WholesalePriceCents),
 			"retail_price_cents":    p.RetailPriceCents,
 			"wholesale_price_cents": p.WholesalePriceCents,
+			"delivery_type":         p.DeliveryType,
 			"stock_dedicated":       ps.Dedicated,
 			"stock_available":       available,
-		})
+		}
+		if p.SVIPPriceCents != nil {
+			row["svip_price_cents"] = *p.SVIPPriceCents
+			row["svip_price_yuan"] = centsToYuan(*p.SVIPPriceCents)
+		}
+		products = append(products, row)
 	}
 	out := gin.H{
 		"enabled":                       cfg.Enabled,
@@ -303,13 +315,15 @@ func (h *ClaudeShopHandler) GetMyOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"order": o, "payment": pay})
 }
 
-// POST /api/shop/orders  body: { "quantity": n, "payment_method": "static" | "alipay", "product_id": "uuid?" }
+// POST /api/shop/orders  body: { "quantity": n, "payment_method": "static" | "alipay", "product_id": "uuid?", "user_coupon_id": "uuid?" }
+// v10：新增 user_coupon_id 让用户应用优惠券；SVIP 价由服务端自动判断
 func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 	acc := middleware.GetAccount(c)
 	var req struct {
 		Quantity      int     `json:"quantity" binding:"required,min=1,max=999"`
 		PaymentMethod string  `json:"payment_method"` // 默认 static；alipay 表示当面付 precreate
 		ProductID     *string `json:"product_id"`
+		UserCouponID  *string `json:"user_coupon_id"` // v10：用户已领取的优惠券 id
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -355,25 +369,48 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 		prodPtr = &pid
 	}
 
-	o, err := h.store.CreateClaudeOrder(ctx, acc.ID, req.Quantity, payCh, prodPtr)
+	var userCouponPtr *uuid.UUID
+	if req.UserCouponID != nil && strings.TrimSpace(*req.UserCouponID) != "" {
+		ucid, perr := parseUUID(strings.TrimSpace(*req.UserCouponID))
+		if perr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "user_coupon_id 无效"})
+			return
+		}
+		userCouponPtr = &ucid
+	}
+
+	o, err := h.store.CreateClaudeOrder(ctx, acc.ID, req.Quantity, payCh, prodPtr, store.CreateClaudeOrderOptions{
+		SVIPActive:   acc.IsSVIP(),
+		UserCouponID: userCouponPtr,
+	})
 	if err != nil {
-		switch err.Error() {
-		case "shop_disabled":
+		switch {
+		case err.Error() == "shop_disabled":
 			c.JSON(http.StatusForbidden, gin.H{"error": "自助购号已关闭"})
-		case "insufficient_stock":
+		case err.Error() == "insufficient_stock":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "库存不足"})
-		case "invalid_quantity":
+		case err.Error() == "invalid_quantity":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "数量无效"})
-		case "invalid_payment_channel":
+		case err.Error() == "invalid_payment_channel":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "无效的支付渠道"})
-		case "exceeds_purchase_limit":
+		case err.Error() == "exceeds_purchase_limit":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "超过每用户限购数量"})
-		case "pending_order_exists":
+		case err.Error() == "pending_order_exists":
 			c.JSON(http.StatusConflict, gin.H{"error": "您已有一笔待管理员确认的静态收款订单，请先处理后再使用静态码下单；或使用支付宝当面付继续购买。"})
-		case "product_required":
+		case err.Error() == "product_required":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "请先选择商品"})
-		case "invalid_product":
+		case err.Error() == "invalid_product":
 			c.JSON(http.StatusBadRequest, gin.H{"error": "商品不存在或已下架"})
+		case err.Error() == "invalid_user_coupon":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "优惠券不存在或不属于当前账户"})
+		case err.Error() == "coupon_not_available":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "该优惠券已被使用或已过期"})
+		case err.Error() == "coupon_expired":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "该优惠券已过期"})
+		case err.Error() == "coupon_min_order_not_met":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "订单金额未达到该优惠券的使用门槛"})
+		case strings.HasPrefix(err.Error(), "coupon_lock_failed"):
+			c.JSON(http.StatusConflict, gin.H{"error": "优惠券锁定失败，请刷新页面后重试"})
 		default:
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		}
@@ -609,19 +646,16 @@ func (h *ClaudeShopHandler) AdminUploadQR(c *gin.Context) {
 	})
 }
 
-// POST /api/admin/shop/inventory/import  Content-Type: text/plain
+// POST /api/admin/shop/inventory/import  Content-Type: text/plain 或 application/json
+// v10：
+//   - Content-Type: text/plain          → 传统卡密导入（自动识别 #### 分隔 / CSV）
+//   - Content-Type: application/json    → 自定义发货导入；body 形如:
+//     {
+//       "delivery_type": "text" | "custom_kv",
+//       "items": [ { "text": "..." } | { "url":"...","code":"..." } , ... ]
+//     }
 // Query: ?batch=xxx&product_id=<uuid>   product_id 留空 = 导入到通用池
 func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
-	body, err := io.ReadAll(c.Request.Body)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "read body"})
-		return
-	}
-	pairs, warns := store.ParseInventoryImport(string(body))
-	if len(pairs) == 0 {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "没有解析到有效行", "warnings": warns})
-		return
-	}
 	batch := strings.TrimSpace(c.Query("batch"))
 	if len(batch) > 64 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识最长 64 字符"})
@@ -651,6 +685,82 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		}
 		prodPtr = &pid
 	}
+
+	contentType := strings.ToLower(c.ContentType())
+	if strings.Contains(contentType, "application/json") {
+		var req struct {
+			DeliveryType string                   `json:"delivery_type"`
+			Items        []map[string]interface{} `json:"items"`
+		}
+		if err := c.ShouldBindJSON(&req); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "JSON 解析失败: " + err.Error()})
+			return
+		}
+		dt := strings.TrimSpace(req.DeliveryType)
+		if dt != "text" && dt != "custom_kv" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_type 必须是 text 或 custom_kv"})
+			return
+		}
+		cleaned := make([]map[string]interface{}, 0, len(req.Items))
+		for _, it := range req.Items {
+			if len(it) == 0 {
+				continue
+			}
+			// text 模式只保留 text 字段；custom_kv 原样透传
+			if dt == "text" {
+				if s, ok := it["text"].(string); ok && strings.TrimSpace(s) != "" {
+					cleaned = append(cleaned, map[string]interface{}{"text": s})
+				}
+			} else {
+				hasNonEmpty := false
+				for _, v := range it {
+					if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+						hasNonEmpty = true
+						break
+					}
+				}
+				if hasNonEmpty {
+					cleaned = append(cleaned, it)
+				}
+			}
+		}
+		if len(cleaned) == 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "没有可导入的有效项"})
+			return
+		}
+		n, err := h.store.ImportClaudeInventoryPayload(c.Request.Context(), cleaned, batch, prodPtr)
+		if err != nil {
+			if err.Error() == "invalid_batch_label" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识无效"})
+				return
+			}
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		resp := gin.H{
+			"delivery_type": dt,
+			"recognized":    len(req.Items),
+			"inserted":      n,
+			"batch_label":   batch,
+		}
+		if prodPtr != nil {
+			resp["product_id"] = prodPtr.String()
+		}
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+
+	// 默认路径：按卡密 text/plain 解析
+	body, err := io.ReadAll(c.Request.Body)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "read body"})
+		return
+	}
+	pairs, warns := store.ParseInventoryImport(string(body))
+	if len(pairs) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "没有解析到有效行", "warnings": warns})
+		return
+	}
 	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs, batch, prodPtr)
 	if err != nil {
 		if err.Error() == "invalid_batch_label" {
@@ -661,11 +771,12 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		return
 	}
 	resp := gin.H{
-		"recognized":  len(pairs),
-		"inserted":    n,
-		"skipped":     len(warns),
-		"warnings":    warns,
-		"batch_label": batch,
+		"delivery_type": "card_key",
+		"recognized":    len(pairs),
+		"inserted":      n,
+		"skipped":       len(warns),
+		"warnings":      warns,
+		"batch_label":   batch,
 	}
 	if prodPtr != nil {
 		resp["product_id"] = prodPtr.String()
@@ -869,16 +980,20 @@ func (h *ClaudeShopHandler) AdminListShopProducts(c *gin.Context) {
 }
 
 // POST /api/admin/shop/products
+// v10 新增字段: delivery_type(card_key|text|custom_kv), delivery_schema, svip_price_yuan/svip_price_cents
 func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 	var req struct {
-		SortOrder          int     `json:"sort_order"`
-		Enabled            *bool   `json:"enabled"`
-		Title              string  `json:"title" binding:"required"`
-		Description        string  `json:"description"`
-		Tag                string  `json:"tag"`
-		RetailPriceYuan    float64 `json:"retail_price_yuan"`
-		WholesalePriceYuan float64 `json:"wholesale_price_yuan"`
-		WholesaleMinQty    int     `json:"wholesale_min_qty"`
+		SortOrder          int      `json:"sort_order"`
+		Enabled            *bool    `json:"enabled"`
+		Title              string   `json:"title" binding:"required"`
+		Description        string   `json:"description"`
+		Tag                string   `json:"tag"`
+		RetailPriceYuan    float64  `json:"retail_price_yuan"`
+		WholesalePriceYuan float64  `json:"wholesale_price_yuan"`
+		WholesaleMinQty    int      `json:"wholesale_min_qty"`
+		DeliveryType       string   `json:"delivery_type"`
+		DeliverySchema     *model.DeliverySchema `json:"delivery_schema"`
+		SVIPPriceYuan      *float64 `json:"svip_price_yuan"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -903,6 +1018,19 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "价格无效"})
 		return
 	}
+	var svipPrice *int
+	if req.SVIPPriceYuan != nil {
+		sp := int(*req.SVIPPriceYuan*100 + 0.5)
+		if sp < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "SVIP 价格无效"})
+			return
+		}
+		svipPrice = &sp
+	}
+	schema := model.DeliverySchema{}
+	if req.DeliverySchema != nil {
+		schema = *req.DeliverySchema
+	}
 	p := &model.ClaudeShopProduct{
 		SortOrder:           req.SortOrder,
 		Enabled:             en,
@@ -912,8 +1040,15 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		RetailPriceCents:    rp,
 		WholesaleMinQty:     wsq,
 		WholesalePriceCents: wp,
+		DeliveryType:        strings.TrimSpace(req.DeliveryType),
+		DeliverySchema:      schema,
+		SVIPPriceCents:      svipPrice,
 	}
 	if err := h.store.InsertClaudeShopProduct(c.Request.Context(), p); err != nil {
+		if err.Error() == "invalid_delivery_type" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_type 必须是 card_key / text / custom_kv"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
@@ -945,6 +1080,10 @@ func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
 		RetailPriceYuan    *float64 `json:"retail_price_yuan"`
 		WholesalePriceYuan *float64 `json:"wholesale_price_yuan"`
 		WholesaleMinQty    *int     `json:"wholesale_min_qty"`
+		DeliveryType       *string  `json:"delivery_type"`
+		DeliverySchema     *model.DeliverySchema `json:"delivery_schema"`
+		SVIPPriceYuan      *float64 `json:"svip_price_yuan"`
+		ClearSVIPPrice     *bool    `json:"clear_svip_price"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -977,6 +1116,22 @@ func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
 			cur.WholesaleMinQty = 1
 		}
 	}
+	if req.DeliveryType != nil {
+		cur.DeliveryType = strings.TrimSpace(*req.DeliveryType)
+	}
+	if req.DeliverySchema != nil {
+		cur.DeliverySchema = *req.DeliverySchema
+	}
+	if req.ClearSVIPPrice != nil && *req.ClearSVIPPrice {
+		cur.SVIPPriceCents = nil
+	} else if req.SVIPPriceYuan != nil {
+		sp := int(*req.SVIPPriceYuan*100 + 0.5)
+		if sp < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "SVIP 价格无效"})
+			return
+		}
+		cur.SVIPPriceCents = &sp
+	}
 	if strings.TrimSpace(cur.Title) == "" {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "标题不能为空"})
 		return
@@ -988,6 +1143,10 @@ func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
 	if err := h.store.UpdateClaudeShopProduct(c.Request.Context(), cur); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+			return
+		}
+		if err.Error() == "invalid_delivery_type" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_type 必须是 card_key / text / custom_kv"})
 			return
 		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})

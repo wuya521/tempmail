@@ -16,7 +16,11 @@
 | API Key 鉴权 | 每用户独立 API Key（`X-API-Key` 头），速率限制 500 次/分钟 |
 | 管理后台 | Web GUI 管理账户、域名、邮件、系统配置（含 SMTP Hostname）|
 | Dashboard 统计 | 实时展示邮箱数、邮件数、域名数、账户数 |
-| 公告系统 | 管理员可设置公告，用户登录后显示 |
+| 公告系统 | 玻璃拟态卡片 + Markdown + 四级配色 + 可关闭（v10 升级）|
+| SVIP 会员 | 管理员可授权 SVIP，金色闪动徽章，享专享价 / 无限邮箱 / 更长 TTL / 专属券（v10）|
+| 优惠券 | 公开领取码 / 定向派发 / SVIP 赠 / 新用户赠；支持百分比/满减，下单自动应用（v10）|
+| 自定义发货 | 卡密 / 长文本 / 自定义字段三种模式，适配网盘/激活码/多字段内容（v10）|
+| 账户筛选 | 管理员可按正常/已封禁/SVIP 筛选账户（v10）|
 | 速率限制 | Redis 滑动窗口，默认 500 请求/60 秒/令牌 |
 | 连接池 | PgBouncer 事务模式，支持 2000 并发客户端 |
 
@@ -201,11 +205,12 @@ X-RateLimit-Reset: 1735000000
 | `sql/migrate_v7.sql` | v6 → v7：支付宝当面付字段（`claude_orders.payment_channel` / `alipay_trade_no`；`claude_shop_config.static_payment_manual_confirm`）|
 | `sql/migrate_v8.sql` | v7 → v8：静态收款码总开关 `static_qr_enabled`、多 SKU `claude_shop_products`、订单商品快照 |
 | `sql/migrate_v9.sql` | v8 → v9：**商品独立卡券池** `claude_inventory.product_id`，订单优先专属池 + 通用池兜底 |
+| `sql/migrate_v10.sql` | v9 → v10：**SVIP 体系**（`svip_level`/`svip_expires_at`/`mailbox_quota`/`mailbox_ttl_minutes`）、**自定义发货**（`delivery_type` / `delivery_schema` / `claude_inventory.payload`）、**优惠券系统**（`coupons` / `user_coupons`）、订单优惠快照、公告标题与级别 |
 
 对已运行的库按版本号顺序执行缺失的 migrate，例如首次补到最新：
 
 ```bash
-for v in 2 3 4 5 6 7 8 9; do
+for v in 2 3 4 5 6 7 8 9 10; do
   docker exec -i $(docker compose ps -q postgres) \
     psql -U tempmail -d tempmail < sql/migrate_v${v}.sql
 done

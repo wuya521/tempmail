@@ -59,12 +59,16 @@ func (s *Store) Close() {
 
 // ==================== Account ====================
 
+// accountColumns v10：统一 SELECT 列表顺序必须与 model.Account 字段顺序一致（pgx.RowToStructByPos 使用位置映射）
+const accountColumns = `id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at,
+	svip_level, svip_expires_at, mailbox_quota, mailbox_ttl_minutes`
+
 func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.Account, error) {
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
-		 FROM accounts WHERE api_key = $1 AND is_active = TRUE`, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+		`SELECT `+accountColumns+` FROM accounts WHERE api_key = $1 AND is_active = TRUE`, apiKey,
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -75,9 +79,9 @@ func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.A
 func (s *Store) GetAccountByAPIKeyAny(ctx context.Context, apiKey string) (*model.Account, error) {
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
-		 FROM accounts WHERE api_key = $1`, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+		`SELECT `+accountColumns+` FROM accounts WHERE api_key = $1`, apiKey,
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -112,9 +116,9 @@ func (s *Store) SetAccountActive(ctx context.Context, accountID uuid.UUID, activ
 func (s *Store) GetAccountByID(ctx context.Context, id uuid.UUID) (*model.Account, error) {
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
-		`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
-		 FROM accounts WHERE id = $1`, id,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+		`SELECT `+accountColumns+` FROM accounts WHERE id = $1`, id,
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -126,9 +130,10 @@ func (s *Store) CreateAccount(ctx context.Context, username string) (*model.Acco
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
 		`INSERT INTO accounts (username, api_key) VALUES ($1, $2)
-		 RETURNING id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at`,
+		 RETURNING `+accountColumns,
 		username, apiKey,
-	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt)
+	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
 	if err != nil {
 		return nil, err
 	}
@@ -169,39 +174,48 @@ func (s *Store) RotateAPIKey(ctx context.Context, accountID uuid.UUID) (string, 
 	return "", fmt.Errorf("rotate api key: unknown error")
 }
 
-func (s *Store) ListAccounts(ctx context.Context, page, size int, search string) ([]model.Account, int, error) {
-	var total int
-	var err error
-	q := strings.TrimSpace(search)
-	if q != "" {
-		pattern := "%" + q + "%"
-		err = s.pool.QueryRow(ctx,
-			`SELECT COUNT(*) FROM accounts WHERE username ILIKE $1 OR api_key ILIKE $1`,
-			pattern,
-		).Scan(&total)
-	} else {
-		err = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`).Scan(&total)
+// AccountListFilter v10：列表筛选条件
+//
+//	Status: "" | "all" = 不限；"active" = 正常；"banned" = 已封禁；"svip" = 仅 SVIP
+//	Search: 模糊匹配 username / api_key
+type AccountListFilter struct {
+	Status string
+	Search string
+}
+
+// ListAccounts 列出账户（支持封禁状态/SVIP 过滤 + 用户名/Key 模糊搜索）
+func (s *Store) ListAccounts(ctx context.Context, page, size int, filter AccountListFilter) ([]model.Account, int, error) {
+	conds := []string{}
+	args := []interface{}{}
+	q := strings.TrimSpace(filter.Search)
+	switch strings.ToLower(strings.TrimSpace(filter.Status)) {
+	case "active":
+		conds = append(conds, "is_active = TRUE")
+	case "banned":
+		conds = append(conds, "is_active = FALSE")
+	case "svip":
+		conds = append(conds, "svip_level > 0 AND (svip_expires_at IS NULL OR svip_expires_at > NOW())")
 	}
-	if err != nil {
+	if q != "" {
+		args = append(args, "%"+q+"%")
+		conds = append(conds, fmt.Sprintf("(username ILIKE $%d OR api_key ILIKE $%d)", len(args), len(args)))
+	}
+	where := ""
+	if len(conds) > 0 {
+		where = " WHERE " + strings.Join(conds, " AND ")
+	}
+
+	var total int
+	if err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM accounts`+where, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	var rows pgx.Rows
-	if q != "" {
-		pattern := "%" + q + "%"
-		rows, err = s.pool.Query(ctx,
-			`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
-			 FROM accounts WHERE username ILIKE $1 OR api_key ILIKE $1
-			 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
-			pattern, size, (page-1)*size,
-		)
-	} else {
-		rows, err = s.pool.Query(ctx,
-			`SELECT id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at
-			 FROM accounts ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-			size, (page-1)*size,
-		)
-	}
+	limitArgs := append([]interface{}{}, args...)
+	limitArgs = append(limitArgs, size, (page-1)*size)
+	sql := `SELECT ` + accountColumns + ` FROM accounts` + where +
+		fmt.Sprintf(` ORDER BY created_at DESC LIMIT $%d OFFSET $%d`, len(limitArgs)-1, len(limitArgs))
+
+	rows, err := s.pool.Query(ctx, sql, limitArgs...)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -212,6 +226,74 @@ func (s *Store) ListAccounts(ctx context.Context, page, size int, search string)
 		return nil, 0, err
 	}
 	return accounts, total, nil
+}
+
+// ==================== v10：SVIP / 配额 ====================
+
+// GrantSVIP 授予/续期 SVIP
+//
+//	level > 0 表示 SVIP 等级；expiresAt nil = 永久
+//	返回操作后的账户快照，便于上层同步赠送券等副作用
+func (s *Store) GrantSVIP(ctx context.Context, accountID uuid.UUID, level int, expiresAt *time.Time) (*model.Account, error) {
+	if level <= 0 {
+		return nil, fmt.Errorf("svip level must be > 0 (use RevokeSVIP to downgrade)")
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET svip_level = $2, svip_expires_at = $3, updated_at = NOW() WHERE id = $1`,
+		accountID, level, expiresAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return s.GetAccountByID(ctx, accountID)
+}
+
+// RevokeSVIP 撤销 SVIP，降级为普通用户
+func (s *Store) RevokeSVIP(ctx context.Context, accountID uuid.UUID) error {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET svip_level = 0, svip_expires_at = NULL, updated_at = NOW() WHERE id = $1`,
+		accountID,
+	)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return pgx.ErrNoRows
+	}
+	return nil
+}
+
+// SetMailboxQuota 设置账户邮箱配额（0=默认，-1=无限，正数=专属上限）
+func (s *Store) SetMailboxQuota(ctx context.Context, accountID uuid.UUID, quota int) error {
+	if quota < -1 {
+		return fmt.Errorf("invalid quota: %d", quota)
+	}
+	_, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET mailbox_quota = $2, updated_at = NOW() WHERE id = $1`,
+		accountID, quota,
+	)
+	return err
+}
+
+// SetMailboxTTLMinutes 设置账户专属邮箱 TTL（NULL=默认，0=永不过期，正数=分钟）
+func (s *Store) SetMailboxTTLMinutes(ctx context.Context, accountID uuid.UUID, ttlMinutes *int) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET mailbox_ttl_minutes = $2, updated_at = NOW() WHERE id = $1`,
+		accountID, ttlMinutes,
+	)
+	return err
+}
+
+// ExpireSVIPSweep 批量降级过期 SVIP 账户（后台定时任务可调用）
+func (s *Store) ExpireSVIPSweep(ctx context.Context) (int64, error) {
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET svip_level = 0, updated_at = NOW()
+		 WHERE svip_level > 0 AND svip_expires_at IS NOT NULL AND svip_expires_at <= NOW()`,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // GetAdminAPIKey 获取第一个管理员账号的 API Key（用于写入 admin.key 文件）

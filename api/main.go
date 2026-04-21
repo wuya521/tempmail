@@ -86,6 +86,9 @@ func main() {
 	settingH := handler.NewSettingHandler(db)
 	registerH := handler.NewRegisterHandler(db)
 	statsH   := handler.NewStatsHandler(db)
+	couponH  := handler.NewCouponHandler(db)
+	// v10：授予 SVIP 成功时自动发放 svip_gift 优惠券
+	handler.SetSVIPGiftHook(handler.GrantSVIPGiftsHook)
 	var ali *alipay.Client
 	var alipayNotifyURL, alipayAppID string
 	if cfg.AlipayPrecreateConfigured() {
@@ -141,6 +144,11 @@ func main() {
 		api.GET("/shop/orders/:id", shopH.GetMyOrder)
 		api.POST("/shop/orders", shopH.CreateOrder)
 
+		// v10：优惠券（用户侧）
+		api.GET("/coupons/mine", couponH.MyList)
+		api.POST("/coupons/redeem", couponH.Redeem)
+		api.POST("/coupons/quote", couponH.Quote)
+
 		// 域名池（所有用户可查看）
 		api.GET("/domains", domainH.List)
 		api.GET("/domains/:id/status", domainH.GetStatus) // 任意用户可轮询域名状态
@@ -166,6 +174,17 @@ func main() {
 			admin.PATCH("/accounts/:id", accountH.Patch)
 			admin.DELETE("/accounts/:id", accountH.Delete)
 			admin.POST("/accounts/:id/rotate-key", accountH.AdminRotateKey)
+			// v10：SVIP 授权 + 账户配额
+			admin.POST("/accounts/:id/svip", accountH.GrantSVIP)
+			admin.POST("/accounts/:id/quota", accountH.SetQuota)
+
+			// v10：优惠券管理
+			admin.GET("/coupons", couponH.AdminList)
+			admin.POST("/coupons", couponH.AdminCreate)
+			admin.PUT("/coupons/:id", couponH.AdminUpdate)
+			admin.PATCH("/coupons/:id/toggle", couponH.AdminToggle)
+			admin.DELETE("/coupons/:id", couponH.AdminDelete)
+			admin.POST("/coupons/:id/grant", couponH.AdminGrant)
 
 			admin.GET("/shop/config", shopH.AdminGetConfig)
 			admin.PUT("/shop/config", shopH.AdminPutConfig)
@@ -313,6 +332,26 @@ func main() {
 					}
 				}
 			}
+		}
+	}()
+
+	// ==================== v10：SVIP / 优惠券过期扫描（每小时一次） ====================
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		log.Println("✓ SVIP & coupon expiry sweeper started (interval=1h)")
+		for {
+			if n, err := db.ExpireSVIPSweep(context.Background()); err != nil {
+				log.Printf("[svip-sweep] error: %v", err)
+			} else if n > 0 {
+				log.Printf("[svip-sweep] downgraded %d expired SVIP accounts", n)
+			}
+			if n, err := db.ExpireUserCoupons(context.Background()); err != nil {
+				log.Printf("[coupon-sweep] error: %v", err)
+			} else if n > 0 {
+				log.Printf("[coupon-sweep] expired %d user coupons", n)
+			}
+			<-ticker.C
 		}
 	}()
 

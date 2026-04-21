@@ -18,6 +18,12 @@ const state = {
   claudeShopEnabled: false,
   adminAccountsPage: 1,
   adminAccountsQ: '',
+  adminAccountsStatus: 'all',    // v10：all|active|banned|svip
+  // v10：优惠券
+  myCouponStatus: 'available',   // available|used|expired|all
+  adminCouponPage: 1,
+  adminCouponQ: '',
+  adminCouponStatus: '',         // ''=全部
   adminShopInventoryPage: 1,
   adminShopInventoryStatus: 'all',
   /** 库存列表批次筛选：''=全部 '__none__'=无批次 其它=批次号 */
@@ -72,6 +78,80 @@ function toast(msg, type = 'info') {
 
 function escHtml(s) {
   return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+/**
+ * 轻量 Markdown 渲染器（仅用于公告等可信来源文本）
+ * 支持：粗体 **x** / 斜体 *x* / 链接 [text](url) / 行内代码 `x` / 自动换行
+ * 先做 HTML 转义，再按 token 回填占位符，避免注入。
+ */
+function renderSimpleMarkdown(text) {
+  if (!text) return '';
+  let s = escHtml(text);
+  // 行内代码 `xxx`（最先处理，避免里面 * 被当成强调）
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>');
+  // 链接 [text](http...)
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,
+    '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  // 粗体 **x**
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
+  // 斜体 *x*（避免匹配已替换的 **）
+  s = s.replace(/(^|[^*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+  // 换行
+  s = s.replace(/\n/g, '<br />');
+  return s;
+}
+
+/** 公告关闭记忆（按内容 hash 去重，用户可永久关闭已读公告；内容变了会重新弹） */
+function announcementDismissKey(content, level, title) {
+  try {
+    const raw = String(level||'') + '|' + String(title||'') + '|' + String(content||'');
+    let h = 0;
+    for (let i = 0; i < raw.length; i++) {
+      h = ((h << 5) - h) + raw.charCodeAt(i);
+      h |= 0;
+    }
+    return 'tm_ann_dismissed_' + h.toString(36);
+  } catch { return null; }
+}
+function isAnnouncementDismissed(content, level, title) {
+  const k = announcementDismissKey(content, level, title);
+  return k ? localStorage.getItem(k) === '1' : false;
+}
+window.dismissAnnouncement = function(content, level, title) {
+  const k = announcementDismissKey(content, level, title);
+  if (k) localStorage.setItem(k, '1');
+  const card = document.getElementById('announcement-card');
+  if (card) {
+    card.style.transition = 'opacity .25s, transform .25s';
+    card.style.opacity = '0';
+    card.style.transform = 'translateY(-6px)';
+    setTimeout(() => card.remove(), 260);
+  }
+};
+
+/** 生成公告 HTML（Dashboard 使用）；content 为空返回空串 */
+function buildAnnouncementHtml(content, level, title) {
+  const c = (content || '').trim();
+  if (!c) return '';
+  if (isAnnouncementDismissed(c, level, title)) return '';
+  const lvl = ['info', 'success', 'warn', 'danger'].includes(level) ? level : 'info';
+  const iconMap = { info: '📣', success: '✓', warn: '⚠', danger: '!' };
+  const icon = iconMap[lvl] || '📣';
+  const titleHtml = title
+    ? `<div class="announcement-title">${escHtml(title)}</div>`
+    : '';
+  const bodyHtml = renderSimpleMarkdown(c);
+  const contentJs = JSON.stringify(c);
+  const lvlJs = JSON.stringify(lvl);
+  const titleJs = JSON.stringify(title || '');
+  return `
+    <div id="announcement-card" class="announcement-card level-${lvl}">
+      <span class="announcement-icon">${escHtml(icon)}</span>
+      ${titleHtml}
+      <div class="announcement-body">${bodyHtml}</div>
+      <button class="announcement-dismiss" onclick='dismissAnnouncement(${contentJs}, ${lvlJs}, ${titleJs})' title="关闭">×</button>
+    </div>`;
 }
 
 /** HTML 邮件在 sandbox iframe 内展示；外链若在当前 frame 打开，整页会加载进 iframe，而 claude.ai 等站点禁止被嵌入（X-Frame-Options / CSP），浏览器即显示「拒绝连接」。统一改为新标签页打开。 */
@@ -334,16 +414,40 @@ const api = {
   shopListOrders: (page=1,size=20) => apiFetch(API_BASE + '/shop/orders?page='+page+'&size='+size),
   shopGetOrder: id => apiFetch(API_BASE + '/shop/orders/' + id),
   shopCreateOrder: body => apiFetch(API_BASE + '/shop/orders', { method: 'POST', body: JSON.stringify(body) }),
+  // v10：优惠券（用户侧）
+  couponMine:   (status='all') => apiFetch(API_BASE + '/coupons/mine?status=' + encodeURIComponent(status)),
+  couponRedeem: code           => apiFetch(API_BASE + '/coupons/redeem', { method: 'POST', body: JSON.stringify({ code }) }),
+  couponQuote:  (userCouponId, originalCents) => apiFetch(API_BASE + '/coupons/quote', {
+    method: 'POST',
+    body: JSON.stringify({ user_coupon_id: userCouponId, original_cents: originalCents }),
+  }),
   admin: {
-    listAccounts:  (page=1,size=10,q='') => {
+    // v10：账户列表支持 status 筛选（all/active/banned/svip）
+    listAccounts:  (page=1,size=10,q='',status='') => {
       let u = API_BASE + '/admin/accounts?page='+page+'&size='+size;
       if (q) u += '&q=' + encodeURIComponent(q);
+      if (status && status !== 'all') u += '&status=' + encodeURIComponent(status);
       return apiFetch(u);
     },
     patchAccount: (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'PATCH', body: JSON.stringify(body) }),
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
     rotateAccountKey: id => apiFetch(API_BASE + '/admin/accounts/' + id + '/rotate-key', { method: 'POST', body: '{}' }),
+    // v10：SVIP 授权/撤销 + 配额
+    grantSVIP:    (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id + '/svip',  { method: 'POST', body: JSON.stringify(body || {}) }),
+    setAccountQuota: (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id + '/quota', { method: 'POST', body: JSON.stringify(body || {}) }),
+    // v10：优惠券管理
+    couponList:   (status='', q='', page=1, size=20) => {
+      let u = API_BASE + '/admin/coupons?page='+page+'&size='+size;
+      if (status) u += '&status=' + encodeURIComponent(status);
+      if (q) u += '&q=' + encodeURIComponent(q);
+      return apiFetch(u);
+    },
+    couponCreate: body => apiFetch(API_BASE + '/admin/coupons', { method: 'POST', body: JSON.stringify(body) }),
+    couponUpdate: (id, body) => apiFetch(API_BASE + '/admin/coupons/' + id, { method: 'PUT', body: JSON.stringify(body) }),
+    couponToggle: (id, enabled) => apiFetch(API_BASE + '/admin/coupons/' + id + '/toggle', { method: 'PATCH', body: JSON.stringify({ enabled }) }),
+    couponDelete: id => apiFetch(API_BASE + '/admin/coupons/' + id, { method: 'DELETE' }),
+    couponGrant:  (id, accountIds) => apiFetch(API_BASE + '/admin/coupons/' + id + '/grant', { method: 'POST', body: JSON.stringify({ account_ids: accountIds }) }),
     shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
     shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
     shopListProducts: () => apiFetch(API_BASE + '/admin/shop/products'),
@@ -365,6 +469,15 @@ const api = {
       if (!res.ok) throw new Error(data.error || '导入失败');
       return data;
     });
+    },
+    // v10：导入 text / custom_kv 模式的库存（JSON）
+    shopImportInventoryJSON: (payload, batch, productId) => {
+      let u = API_BASE + '/admin/shop/inventory/import';
+      const qs = [];
+      if (batch) qs.push('batch=' + encodeURIComponent(batch));
+      if (productId) qs.push('product_id=' + encodeURIComponent(productId));
+      if (qs.length) u += '?' + qs.join('&');
+      return apiFetch(u, { method: 'POST', body: JSON.stringify(payload) });
     },
     shopUploadQR: (formData) => fetch(API_BASE + '/admin/shop/qrcodes', {
       method: 'POST',
@@ -643,6 +756,8 @@ function buildMainLayout() {
 
   const isAdmin = state.account?.is_admin;
   const username = state.account?.username || '用户';
+  const isSVIP = (state.account?.svip_level || 0) > 0 &&
+    (!state.account?.svip_expires_at || new Date(state.account.svip_expires_at) > new Date());
 
   // sidebar
   layout.innerHTML = `
@@ -667,10 +782,16 @@ function buildMainLayout() {
           <span class="nav-icon">📖</span><span>API 文档</span>
         </button>
         <div id="nav-claude-shop-slot"></div>
+        <button class="nav-item" data-page="my-coupons" onclick="navigate('my-coupons')">
+          <span class="nav-icon">🎟</span><span>我的优惠券</span>
+        </button>
         ${isAdmin ? `
         <div class="nav-section">管理</div>
         <button class="nav-item" data-page="admin-accounts" onclick="navigate('admin-accounts')">
           <span class="nav-icon">👥</span><span>账户管理</span>
+        </button>
+        <button class="nav-item" data-page="admin-coupons" onclick="navigate('admin-coupons')">
+          <span class="nav-icon">🎫</span><span>优惠券管理</span>
         </button>
         <button class="nav-item" data-page="admin-domains" onclick="navigate('admin-domains')">
           <span class="nav-icon">🌐</span><span>域名管理</span>
@@ -694,10 +815,13 @@ function buildMainLayout() {
       </div>
       <div class="sidebar-bottom">
         <div class="user-chip">
-          <div class="user-avatar">${username.charAt(0).toUpperCase()}</div>
+          <div class="user-avatar ${isSVIP ? 'svip-avatar-ring' : ''}">${username.charAt(0).toUpperCase()}</div>
           <div class="user-chip-info">
-            <div class="user-chip-name">${escHtml(username)}</div>
-            <div class="user-chip-role">${isAdmin ? '管理员' : '普通用户'}</div>
+            <div class="user-chip-name">
+              ${escHtml(username)}
+              ${isSVIP ? '<span class="svip-badge svip-badge-sm" style="margin-left:4px">SVIP</span>' : ''}
+            </div>
+            <div class="user-chip-role">${isAdmin ? '管理员' : (isSVIP ? 'SVIP 会员' : '普通用户')}</div>
           </div>
         </div>
         <button class="btn-logout" onclick="logout()">⏏ 退出登录</button>
@@ -772,6 +896,8 @@ async function renderPage(page) {
     'admin-shop-orders': ['订单与发货', '待确认与历史订单'],
     'apikey-show':    ['API Key', ''],
     'api-docs':       ['API 接口文档', '查看所有可用 API 及调用示例'],
+    'my-coupons':     ['我的优惠券', '查看、领取与使用您的优惠券'],
+    'admin-coupons':  ['优惠券管理', '创建、派发、审计营销活动'],
   };
   const [t, s] = titles[page] || ['—', ''];
   const title = $('topbar-title'); if (title) title.textContent = t;
@@ -795,6 +921,8 @@ async function renderPage(page) {
       case 'admin-shop-orders': await renderAdminShopOrders(container); break;
       case 'apikey-show':    renderApiKeyShow(container); break;
       case 'api-docs':       renderApiDocs(container); break;
+      case 'my-coupons':     await renderMyCoupons(container); break;
+      case 'admin-coupons':  await renderAdminCoupons(container); break;
       default: container.innerHTML = '<div class="page"><p>页面未找到</p></div>';
     }
   } catch(e) {
@@ -836,12 +964,15 @@ async function renderDashboard(container) {
     ] : []),
   ];
 
-  // 公告栏
-  const announcement = (await api.publicSettings().catch(() => ({}))).announcement || '';
+  // v10：公告栏（玻璃拟态 + Markdown + 级别图标 + 可关闭）
+  const pub = await api.publicSettings().catch(() => ({}));
+  const annContent = (pub.announcement || '').trim();
+  const annLevel   = (pub.announcement_level || 'info').trim();
+  const annTitle   = (pub.announcement_title || '').trim();
+  const annHtml    = buildAnnouncementHtml(annContent, annLevel, annTitle);
 
   container.innerHTML = `
-    ${announcement ? `<div class="card" style="margin-bottom:1rem;background:var(--clr-primary,#4f6ef7);color:#fff;padding:0.7rem 1rem;font-size:0.84rem">
-      📢 ${escHtml(announcement)}</div>` : ''}
+    ${annHtml}
     <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr))">
       ${statCards.map(s => `
         <div class="stat-card">
@@ -1387,6 +1518,13 @@ window.adminAccGoPage = function(p) {
   navigate('admin-accounts');
 };
 
+// v10：按状态筛选（all/active/banned/svip）
+window.adminAccSetStatus = function(status) {
+  state.adminAccountsStatus = status || 'all';
+  state.adminAccountsPage = 1;
+  navigate('admin-accounts');
+};
+
 window.toggleBanAccount = function(id, username, ban) {
   const act = ban ? '封禁' : '解除封禁';
   showModal(act + '账户', `<p>确定对 <strong>${escHtml(username)}</strong> ${act}？封禁后该用户无法登录。</p>`, async () => {
@@ -1400,9 +1538,135 @@ window.toggleBanAccount = function(id, username, ban) {
   });
 };
 
+// v10：授予 / 撤销 SVIP
+window.showGrantSVIPModal = function(id, username, curLevel, curExpires) {
+  const isSVIP = (curLevel || 0) > 0;
+  const defaultDays = 30;
+  showModal(isSVIP ? '管理 SVIP' : '授予 SVIP', `
+    <div style="font-size:0.88rem;margin-bottom:0.8rem">为 <strong>${escHtml(username)}</strong> 设置 SVIP 身份</div>
+    <div class="form-group">
+      <label class="form-label">有效期</label>
+      <select class="form-input" id="svip-duration" onchange="document.getElementById('svip-custom-wrap').style.display=this.value==='custom'?'block':'none'">
+        <option value="30">30 天</option>
+        <option value="90">90 天</option>
+        <option value="180">180 天</option>
+        <option value="365">365 天</option>
+        <option value="forever">永久</option>
+        <option value="custom">自定义天数…</option>
+      </select>
+    </div>
+    <div id="svip-custom-wrap" class="form-group" style="display:none">
+      <label class="form-label">自定义天数</label>
+      <input type="number" min="1" class="form-input" id="svip-custom-days" placeholder="如 60" />
+    </div>
+    ${isSVIP && curExpires ? `<div class="form-hint">当前到期：${formatDate(curExpires)}</div>` : ''}
+    ${isSVIP && !curExpires && curLevel>0 ? `<div class="form-hint">当前为永久 SVIP</div>` : ''}
+    ${isSVIP ? `<div style="margin-top:1rem"><button class="btn btn-danger btn-sm" onclick="revokeSVIP('${id}', ${JSON.stringify(username)})">撤销 SVIP</button></div>` : ''}
+  `, async () => {
+    const sel = $('svip-duration')?.value || '30';
+    let days = null;
+    let forever = false;
+    if (sel === 'forever') { forever = true; }
+    else if (sel === 'custom') {
+      const v = parseInt($('svip-custom-days')?.value || '0', 10);
+      if (!v || v < 1) { toast('请输入有效天数', 'warn'); return false; }
+      days = v;
+    } else { days = parseInt(sel, 10) || defaultDays; }
+    try {
+      const body = { level: 1 };
+      if (forever) {} else if (days) body.duration_days = days;
+      await api.admin.grantSVIP(id, body);
+      toast('SVIP 已更新', 'success');
+      navigate('admin-accounts');
+    } catch(e) { toast('失败：' + (e.message||''), 'error'); return false; }
+  });
+};
+
+window.revokeSVIP = async function(id, username) {
+  if (!confirm('确定撤销 ' + username + ' 的 SVIP 身份？')) return;
+  try {
+    await api.admin.grantSVIP(id, { level: 0 });
+    toast('SVIP 已撤销', 'success');
+    closeModal();
+    navigate('admin-accounts');
+  } catch(e) { toast('撤销失败：' + (e.message||''), 'error'); }
+};
+
+// v10：配额管理
+window.showQuotaModal = function(id, username, curQuota, curTTL) {
+  const qStr = curQuota === -1 ? 'unlimited' : (curQuota === 0 ? 'default' : 'custom');
+  const ttlStr = curTTL === null || curTTL === undefined ? 'default' : (curTTL === 0 ? 'forever' : 'custom');
+  showModal('配额管理', `
+    <div style="font-size:0.88rem;margin-bottom:0.6rem">为 <strong>${escHtml(username)}</strong> 设置专属配额（0=跟随全局设置）</div>
+    <div class="form-group">
+      <label class="form-label">邮箱数量上限</label>
+      <select class="form-input" id="quota-mode" onchange="document.getElementById('quota-custom').style.display=this.value==='custom'?'block':'none'">
+        <option value="default" ${qStr==='default'?'selected':''}>跟随全局设置</option>
+        <option value="unlimited" ${qStr==='unlimited'?'selected':''}>无限（SVIP 推荐）</option>
+        <option value="custom" ${qStr==='custom'?'selected':''}>自定义…</option>
+      </select>
+    </div>
+    <div id="quota-custom" class="form-group" style="display:${qStr==='custom'?'block':'none'}">
+      <input type="number" min="1" class="form-input" id="quota-val" placeholder="如 50" value="${qStr==='custom'?curQuota:''}" />
+    </div>
+    <div class="form-group">
+      <label class="form-label">邮箱保留时长</label>
+      <select class="form-input" id="ttl-mode" onchange="document.getElementById('ttl-custom').style.display=this.value==='custom'?'block':'none'">
+        <option value="default" ${ttlStr==='default'?'selected':''}>跟随全局（默认 30 分钟）</option>
+        <option value="forever" ${ttlStr==='forever'?'selected':''}>永不过期</option>
+        <option value="custom" ${ttlStr==='custom'?'selected':''}>自定义分钟数…</option>
+      </select>
+    </div>
+    <div id="ttl-custom" class="form-group" style="display:${ttlStr==='custom'?'block':'none'}">
+      <input type="number" min="1" class="form-input" id="ttl-val" placeholder="如 120（=2 小时）" value="${ttlStr==='custom'?curTTL:''}" />
+    </div>
+  `, async () => {
+    const body = {};
+    const qm = $('quota-mode').value;
+    if (qm === 'default') body.mailbox_quota = 0;
+    else if (qm === 'unlimited') body.mailbox_quota = -1;
+    else {
+      const v = parseInt($('quota-val').value || '0', 10);
+      if (!v || v < 1) { toast('配额无效', 'warn'); return false; }
+      body.mailbox_quota = v;
+    }
+    const tm = $('ttl-mode').value;
+    if (tm === 'default') body.use_default_ttl = true;
+    else if (tm === 'forever') body.mailbox_ttl_minutes = 0;
+    else {
+      const v = parseInt($('ttl-val').value || '0', 10);
+      if (!v || v < 1) { toast('TTL 无效', 'warn'); return false; }
+      body.mailbox_ttl_minutes = v;
+    }
+    try {
+      await api.admin.setAccountQuota(id, body);
+      toast('配额已更新', 'success');
+      navigate('admin-accounts');
+    } catch(e) { toast('失败：' + (e.message||''), 'error'); return false; }
+  });
+};
+
+/** 根据账号数据渲染徽章（管理员/SVIP/正常/封禁） */
+function renderAccountBadges(a) {
+  const parts = [];
+  if (a.is_admin) {
+    parts.push('<span class="badge badge-gold">管理员</span>');
+  } else {
+    parts.push('<span class="badge badge-gray">普通用户</span>');
+  }
+  if ((a.svip_level || 0) > 0) {
+    const expHint = a.svip_expires_at
+      ? ` title="到期 ${formatDate(a.svip_expires_at)}"`
+      : ' title="永久 SVIP"';
+    parts.push(`<span class="svip-badge svip-badge-sm"${expHint}>SVIP</span>`);
+  }
+  return parts.join(' ');
+}
+
 async function renderAdminAccounts(container) {
   const page = state.adminAccountsPage || 1;
   const q = state.adminAccountsQ || '';
+  const status = state.adminAccountsStatus || 'all';
   const actions = $('topbar-actions');
   if (actions) {
     actions.innerHTML = `
@@ -1413,26 +1677,39 @@ async function renderAdminAccounts(container) {
     `;
   }
 
-  const res = await api.admin.listAccounts(page, 10, q);
+  const res = await api.admin.listAccounts(page, 10, q, status);
   const accounts = res.data || [];
   const total = res.total ?? 0;
   const size = res.size || 10;
   const maxPage = Math.max(1, Math.ceil(total / size) || 1);
 
+  const pills = [
+    { k: 'all',    label: '全部' },
+    { k: 'active', label: '正常' },
+    { k: 'banned', label: '已封禁' },
+    { k: 'svip',   label: 'SVIP' },
+  ].map(o => `<button class="filter-pill ${status===o.k?'active':''}" onclick="adminAccSetStatus('${o.k}')">${o.label}</button>`).join('');
+
   container.innerHTML = `
-    <div class="card" style="max-width:920px">
+    <div class="card" style="max-width:980px">
       <div class="card-header">
         <div class="card-title">👥 账户列表</div>
         <div style="font-size:0.78rem;color:var(--text-muted)">共 ${total} 个账户 · 每页 ${size} 条 · 第 ${page}/${maxPage} 页</div>
       </div>
+      <div style="padding:0.7rem 1.3rem 0.4rem;border-bottom:1px solid var(--border-light)">
+        <div class="filter-pills">${pills}</div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>用户名 / Key</th><th>角色</th><th>状态</th><th>创建</th><th>最近活跃</th><th>操作</th></tr>
+            <tr><th>用户名 / Key</th><th>角色 / 等级</th><th>状态</th><th>创建</th><th>最近活跃</th><th>操作</th></tr>
           </thead>
           <tbody>
             ${accounts.map(a => {
               const keyJs = JSON.stringify(a.api_key || '');
+              const uJs = JSON.stringify(a.username||'');
+              const svip = (a.svip_level || 0) > 0;
+              const svipLbl = svip ? '管理 SVIP' : '授予 SVIP';
               return `
               <tr>
                 <td>
@@ -1442,26 +1719,26 @@ async function renderAdminAccounts(container) {
                     <button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⎘</button>
                   </div>
                 </td>
-                <td>${a.is_admin
-                  ? '<span class="badge badge-gold">管理员</span>'
-                  : '<span class="badge badge-gray">普通用户</span>'}</td>
+                <td style="white-space:nowrap">${renderAccountBadges(a)}</td>
                 <td>${a.is_active === false
                   ? '<span class="badge" style="background:var(--clr-danger);color:#fff">已封禁</span>'
                   : '<span class="badge badge-green">正常</span>'}</td>
                 <td style="font-size:0.8rem">${formatDate(a.created_at)}</td>
                 <td style="font-size:0.8rem">${formatLastSeen(a.last_seen_at)}</td>
                 <td style="white-space:nowrap">
-                  ${!a.is_admin && a.is_active ? `<button class="btn btn-ghost btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, true)'>封禁</button>` : ''}
-                  ${!a.is_admin && a.is_active === false ? `<button class="btn btn-success btn-sm" onclick='toggleBanAccount("${a.id}", ${JSON.stringify(a.username||'')}, false)'>解除</button>` : ''}
-                  ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='adminRotateAccountKey("${a.id}", ${JSON.stringify(a.username||'')})' title="重置该账户的 API Key，旧 Key 立即失效">⟳ 重置 Key</button>` : ''}
-                  ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick='confirmDeleteAccount("${a.id}", ${JSON.stringify(a.username||'')})'>删除</button>` : ''}
+                  ${!a.is_admin && a.is_active ? `<button class="btn btn-ghost btn-sm" onclick='toggleBanAccount("${a.id}", ${uJs}, true)'>封禁</button>` : ''}
+                  ${!a.is_admin && a.is_active === false ? `<button class="btn btn-success btn-sm" onclick='toggleBanAccount("${a.id}", ${uJs}, false)'>解除</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn ${svip?'btn-primary':'btn-ghost'} btn-sm" onclick='showGrantSVIPModal("${a.id}", ${uJs}, ${a.svip_level||0}, ${JSON.stringify(a.svip_expires_at||'')})'>✦ ${svipLbl}</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='showQuotaModal("${a.id}", ${uJs}, ${a.mailbox_quota||0}, ${a.mailbox_ttl_minutes === null || a.mailbox_ttl_minutes === undefined ? 'null' : a.mailbox_ttl_minutes})'>配额</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='adminRotateAccountKey("${a.id}", ${uJs})' title="重置该账户的 API Key，旧 Key 立即失效">⟳ Key</button>` : ''}
+                  ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick='confirmDeleteAccount("${a.id}", ${uJs})'>删除</button>` : ''}
                 </td>
               </tr>`;
             }).join('')}
           </tbody>
         </table>
       </div>
-      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:1rem;flex-wrap:wrap">
+      <div style="display:flex;gap:0.5rem;align-items:center;margin:1rem 1.3rem;flex-wrap:wrap">
         <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminAccGoPage(${page - 1})">上一页</button>
         <span style="font-size:0.85rem;color:var(--text-muted)">第 ${page} / ${maxPage} 页</span>
         <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminAccGoPage(${page + 1})">下一页</button>
@@ -1768,6 +2045,8 @@ async function renderAdminSettings(container) {
   const defDomain  = settings.default_domain        || '';
   const ttlMins    = settings.mailbox_ttl_minutes   || '30';
   const announce   = settings.announcement          || '';
+  const annTitle   = settings.announcement_title    || '';
+  const annLevel   = settings.announcement_level    || 'info';
   const maxMb      = settings.max_mailboxes_per_user|| '5';
 
   function inputRow(id, label, value, hint, placeholder = '', settingKey = '') {
@@ -1805,14 +2084,34 @@ async function renderAdminSettings(container) {
         ${inputRow('input-site-title', '站点名称', siteTitle, '保存后：浏览器标签标题、登录页大标题、侧栏 Logo 文案均来自 /public/settings 的 site_title；未设置时显示 TempMail', 'TempMail')}
         <div class="divider"></div>
 
-        <!-- 公告 -->
+        <!-- 公告 v10：标题 + 级别 + Markdown 正文 -->
         <div class="form-group">
-          <label class="form-label">公告内容</label>
+          <label class="form-label">公告标题（可选）</label>
           <div style="display:flex;gap:0.5rem">
-            <textarea class="form-input" id="input-announcement" rows="2" placeholder="留空则不显示公告" style="flex:1;resize:vertical">${escHtml(announce)}</textarea>
+            <input class="form-input" id="input-announcement-title" value="${escHtml(annTitle)}" placeholder="如「12 月系统维护公告」" style="flex:1" />
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-announcement-title','announcement_title')">✓ 保存</button>
+          </div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">公告级别</label>
+          <div style="display:flex;gap:0.5rem">
+            <select class="form-input" id="input-announcement-level" style="flex:1">
+              <option value="info"    ${annLevel==='info'?'selected':''}>info（提示 · 蓝金色调）</option>
+              <option value="success" ${annLevel==='success'?'selected':''}>success（成功 · 翠绿）</option>
+              <option value="warn"    ${annLevel==='warn'?'selected':''}>warn（注意 · 琥珀）</option>
+              <option value="danger"  ${annLevel==='danger'?'selected':''}>danger（警示 · 砖红）</option>
+            </select>
+            <button class="btn btn-primary btn-sm" onclick="saveSetting('input-announcement-level','announcement_level')">✓ 保存</button>
+          </div>
+          <div class="form-hint">不同级别显示不同的配色与图标动画</div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">公告正文（支持 Markdown）</label>
+          <div style="display:flex;gap:0.5rem">
+            <textarea class="form-input" id="input-announcement" rows="4" placeholder="留空则不显示公告。支持 **粗体** *斜体* \`行内代码\` [链接](https://example.com) 和换行" style="flex:1;resize:vertical">${escHtml(announce)}</textarea>
             <button class="btn btn-primary btn-sm" onclick="saveSetting('input-announcement','announcement')" style="align-self:flex-start">✓ 保存</button>
           </div>
-          <div class="form-hint">显示在已登录用户的 Dashboard 顶部</div>
+          <div class="form-hint">展示在 Dashboard 顶部 · 可点击 × 关闭（内容变更后会重新弹出）</div>
         </div>
         <div class="divider"></div>
 
@@ -1924,6 +2223,10 @@ function showModal(title, bodyHtml, onConfirm) {
     else confirmBtn.disabled = false;
   });
 }
+
+window.closeModal = function() {
+  document.querySelectorAll('.modal-overlay').forEach(o => o.remove());
+};
 
 // ─── MX 自动注册（全自动验证流程）──────────────────────────
 // 轮询待验证域名状态
@@ -2315,6 +2618,62 @@ function shopBuildQrBlockFromUrls(wechatUrl, alipayUrl) {
   return h;
 }
 
+/**
+ * v10：按 delivery_type 渲染发货凭证卡片
+ *   card_key  → 邮箱 + Key
+ *   text      → 大号长文本
+ *   custom_kv → 多字段（payload 对象）
+ */
+function renderShopDeliveryCard(ln) {
+  const dt = ln.delivery_type || 'card_key';
+  if (dt === 'card_key') {
+    const em = String(ln.email || '');
+    const ky = String(ln.api_key || '');
+    return `<div class="shop-credential-card">
+      <span class="shop-credential-label">邮箱</span>
+      <div class="shop-credential-value-row">
+        <span class="shop-credential-value" dir="ltr">${escHtml(em)}</span>
+        <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(em)})'>复制</button>
+      </div>
+      <span class="shop-credential-label" style="margin-top:0.9rem;display:block">登录 Key</span>
+      <div class="shop-credential-value-row">
+        <span class="shop-credential-value" dir="ltr">${escHtml(ky)}</span>
+        <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(ky)})'>复制</button>
+      </div>
+    </div>`;
+  }
+  if (dt === 'text') {
+    const text = (ln.payload && typeof ln.payload.text === 'string') ? ln.payload.text : '';
+    return `<div class="shop-credential-card">
+      <span class="shop-credential-label">发货内容</span>
+      <div class="shop-credential-value-row">
+        <span class="shop-credential-value multi" style="white-space:pre-wrap">${escHtml(text)}</span>
+        <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(text)})'>复制</button>
+      </div>
+    </div>`;
+  }
+  if (dt === 'custom_kv') {
+    const p = ln.payload || {};
+    const keys = Object.keys(p);
+    const items = keys.map(k => {
+      const v = String(p[k] ?? '');
+      const multi = v.includes('\n');
+      return `<div class="payload-item">
+        <span class="payload-label">${escHtml(k)}</span>
+        <div class="payload-value ${multi?'multi':''}">
+          <span>${escHtml(v)}</span>
+          <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(v)})'>复制</button>
+        </div>
+      </div>`;
+    }).join('');
+    return `<div class="shop-credential-card">
+      <span class="shop-credential-label">发货内容</span>
+      <div class="shop-payload-kv">${items || '<em style="color:var(--text-muted)">（空）</em>'}</div>
+    </div>`;
+  }
+  return '';
+}
+
 async function buildClaudeShopHighlightHtml() {
   if (!state.claudeHighlightOrderId) return '';
   try {
@@ -2324,23 +2683,8 @@ async function buildClaudeShopHighlightHtml() {
     const totalY = (o.total_cents / 100).toFixed(2);
     let body = '';
     if (o.status === 'fulfilled' && (o.lines || []).length) {
-      body += `<div class="shop-deliver-banner" role="status">⚠️ 请立即复制保存以下账号信息；页面关闭后仍可在「我的订单」中查看。</div>`;
-      body += (o.lines || []).map(ln => {
-        const em = String(ln.email || '');
-        const ky = String(ln.api_key || '');
-        return `<div class="shop-credential-card">
-          <span class="shop-credential-label">邮箱</span>
-          <div class="shop-credential-value-row">
-            <span class="shop-credential-value" dir="ltr">${escHtml(em)}</span>
-            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(em)})'>复制</button>
-          </div>
-          <span class="shop-credential-label" style="margin-top:0.9rem;display:block">登录 Key</span>
-          <div class="shop-credential-value-row">
-            <span class="shop-credential-value" dir="ltr">${escHtml(ky)}</span>
-            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(ky)})'>复制</button>
-          </div>
-        </div>`;
-      }).join('');
+      body += `<div class="shop-deliver-banner" role="status">⚠️ 请立即复制保存以下内容；页面关闭后仍可在「我的订单」中查看。</div>`;
+      body += (o.lines || []).map(ln => renderShopDeliveryCard(ln)).join('');
     } else if (o.payment_channel === 'alipay_precreate') {
       body += `<p style="font-size:0.95rem;margin-bottom:0.5rem;font-weight:700">订单号 <code style="font-size:0.85rem">${escHtml(o.id)}</code></p>`;
       body += `<p style="font-size:0.95rem;margin-bottom:0.6rem">订单应付：<strong style="color:var(--clr-primary)">¥${totalY}</strong>（数量 ${o.quantity}）</p>`;
@@ -2401,35 +2745,105 @@ window.claudeShopSelectProduct = function(id) {
   claudeShopPriceRefresh();
 };
 
+/** v10：当前账户是否 SVIP（用于 SVIP 专享价展示） */
+function currentAccountIsSVIP() {
+  const a = state.account;
+  if (!a || (a.svip_level || 0) <= 0) return false;
+  if (a.svip_expires_at && new Date(a.svip_expires_at) < new Date()) return false;
+  return true;
+}
+
 window.claudeShopPriceRefresh = function() {
   const s = state._claudeShopSummary;
   if (!s) return;
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   const picked = claudeShopGetSelectedProduct(s);
-  let minW, retailY, wholesaleY;
+  const isSVIP = currentAccountIsSVIP();
+  let minW, retailY, wholesaleY, svipY;
   if (picked) {
     minW = picked.wholesale_min_qty || 5;
     retailY = Number(picked.retail_price_yuan);
     wholesaleY = Number(picked.wholesale_price_yuan);
+    svipY = (picked.svip_price_yuan !== undefined && picked.svip_price_yuan !== null)
+      ? Number(picked.svip_price_yuan) : null;
   } else {
     minW = s.wholesale_min_qty || 5;
     retailY = Number(s.retail_price_yuan);
     wholesaleY = Number(s.wholesale_price_yuan);
+    svipY = null;
   }
   const isWs = qty >= minW;
-  const unit = isWs ? wholesaleY : retailY;
+  let unit = isWs ? wholesaleY : retailY;
+  let discountSource = null; // 'svip' | 'wholesale' | null
+  if (isSVIP && svipY !== null && svipY >= 0 && svipY < unit) {
+    unit = svipY;
+    discountSource = 'svip';
+  } else if (isWs) {
+    discountSource = 'wholesale';
+  }
   const total = unit * qty;
-  const txt = '¥' + total.toFixed(2);
+
+  // 应用优惠券（若已选）
+  let couponDiscount = 0;
+  const ucid = $('claude-shop-coupon-select')?.value || '';
+  const availCoupons = state._myAvailableCoupons || [];
+  let pickedCoupon = null;
+  if (ucid) {
+    pickedCoupon = availCoupons.find(c => c.id === ucid) || null;
+  }
+  if (pickedCoupon) {
+    const totalCents = Math.round(total * 100);
+    if (totalCents >= (pickedCoupon.snapshot_min_order_cents || 0)) {
+      let d = 0;
+      if (pickedCoupon.snapshot_discount_type === 'percentage') {
+        d = Math.floor(totalCents * (pickedCoupon.snapshot_discount_value / 100));
+        if (pickedCoupon.snapshot_max_discount_cents > 0 && d > pickedCoupon.snapshot_max_discount_cents) {
+          d = pickedCoupon.snapshot_max_discount_cents;
+        }
+      } else if (pickedCoupon.snapshot_discount_type === 'fixed') {
+        d = pickedCoupon.snapshot_discount_value;
+      }
+      if (d > totalCents) d = totalCents;
+      couponDiscount = d / 100;
+    }
+  }
+  const payable = Math.max(0, total - couponDiscount);
+  const totalTxt = '¥' + payable.toFixed(2);
   const el = $('claude-shop-pay-total');
-  if (el) el.textContent = txt;
+  if (el) {
+    if (couponDiscount > 0) {
+      el.innerHTML = `<span class="price-strike">¥${total.toFixed(2)}</span><strong style="color:var(--clr-danger)">${totalTxt}</strong>`;
+    } else {
+      el.textContent = totalTxt;
+    }
+  }
   const mel = $('claude-shop-modal-total');
-  if (mel) mel.textContent = txt;
+  if (mel) mel.textContent = totalTxt;
   const el2 = $('claude-shop-unit-hint');
   if (el2) {
-    el2.textContent = isWs
-      ? `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`
-      : `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${wholesaleY.toFixed(2)} / 件`;
+    if (discountSource === 'svip') {
+      el2.innerHTML = `<span class="svip-badge svip-badge-sm">SVIP</span> 已享 SVIP 专享价 ¥${unit.toFixed(2)} / 件 · 原价 <span style="text-decoration:line-through;color:var(--text-muted)">¥${retailY.toFixed(2)}</span>`;
+    } else if (isWs) {
+      el2.textContent = `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`;
+    } else {
+      const svipHint = svipY !== null && svipY >= 0 && svipY < retailY
+        ? ` · SVIP 专享 ¥${svipY.toFixed(2)} / 件`
+        : '';
+      el2.textContent = `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${wholesaleY.toFixed(2)} / 件${svipHint}`;
+    }
   }
+  // 优惠券说明区
+  const couponEl = $('claude-shop-coupon-hint');
+  if (couponEl) {
+    if (pickedCoupon && couponDiscount > 0) {
+      couponEl.innerHTML = `已应用「${escHtml(pickedCoupon.snapshot_name)}」，优惠 <span class="picker-discount">-¥${couponDiscount.toFixed(2)}</span>`;
+    } else if (pickedCoupon && couponDiscount === 0 && Math.round(total*100) < (pickedCoupon.snapshot_min_order_cents || 0)) {
+      couponEl.textContent = `差 ¥${((pickedCoupon.snapshot_min_order_cents - Math.round(total*100))/100).toFixed(2)} 即可使用该券`;
+    } else {
+      couponEl.textContent = '';
+    }
+  }
+
   const payBtn = document.querySelector('[data-claude-shop-pay]');
   if (payBtn) {
     const showStaticPay = s.static_qr_enabled && !!(s.wechat_qr_url || s.alipay_qr_url);
@@ -2439,6 +2853,10 @@ window.claudeShopPriceRefresh = function() {
     payBtn.disabled = !canPay || needPickMulti || needAckDefault;
   }
   syncClaudeShopModalGate();
+};
+
+window.claudeShopCouponRefresh = function() {
+  claudeShopPriceRefresh();
 };
 
 window.syncClaudeShopModalGate = function() {
@@ -2536,6 +2954,8 @@ window.openClaudeShopAlipayPayModal = async function() {
   try {
     const body = { quantity: qty, payment_method: 'alipay' };
     if (state.claudeSelectedProductId) body.product_id = state.claudeSelectedProductId;
+    const ucid = $('claude-shop-coupon-select')?.value;
+    if (ucid) body.user_coupon_id = ucid;
     const r = await api.shopCreateOrder(body);
     const qr = r.payment && r.payment.alipay_qr_code;
     const hint = (r.payment && r.payment.hint) || '请使用支付宝扫码支付。';
@@ -2645,6 +3065,8 @@ window.submitClaudeShopOrder = async function() {
   try {
     const body = { quantity: qty, payment_method: 'static' };
     if (state.claudeSelectedProductId) body.product_id = state.claudeSelectedProductId;
+    const ucid = $('claude-shop-coupon-select')?.value;
+    if (ucid) body.user_coupon_id = ucid;
     const r = await api.shopCreateOrder(body);
     closeClaudeShopPayModal();
     state.claudeHighlightOrderId = r.order.id;
@@ -2703,6 +3125,9 @@ async function renderClaudeShop(container) {
   const myOrders = await api.shopListOrders(1, 20).catch(() => ({ data: [] }));
   const orders = myOrders.data || [];
   const pendingStaticOrder = orders.find(o => o.status === 'awaiting_payment' && o.payment_channel !== 'alipay_precreate');
+  // v10：加载我的可用优惠券供下单页选择
+  const myCouponsRes = await api.couponMine('available').catch(() => ({ data: [] }));
+  state._myAvailableCoupons = (myCouponsRes.data || []).filter(uc => uc.status === 'available');
   const showStaticPay = summary.static_qr_enabled && !!(summary.wechat_qr_url || summary.alipay_qr_url);
   const alipayOk = !!summary.alipay_precreate_available;
   const blockCheckoutEntirely = !!pendingStaticOrder && !alipayOk;
@@ -2718,8 +3143,12 @@ async function renderClaudeShop(container) {
       const outOfStock = available <= 0;
       const stockStyle = outOfStock ? 'color:var(--clr-danger, #c0392b)' : 'color:var(--text-muted)';
       const stockText = outOfStock ? '暂无库存' : `剩余 <strong>${available}</strong> 件`;
+      const hasSVIPPrice = (p.svip_price_yuan !== undefined && p.svip_price_yuan !== null);
+      const svipPriceTag = hasSVIPPrice
+        ? `<span class="svip-price-tag">SVIP ¥${Number(p.svip_price_yuan).toFixed(2)}</span>`
+        : '';
       return `<button type="button" class="shop-product-card${sel ? ' shop-product-card--selected' : ''}${outOfStock ? ' shop-product-card--disabled' : ''}" data-product-id="${escHtml(p.id)}" ${outOfStock ? 'disabled aria-disabled="true"' : ''} onclick="${outOfStock ? '' : `claudeShopSelectProduct('${escHtml(p.id)}')`}">
-        <div class="shop-product-card-head">${tagHtml}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
+        <div class="shop-product-card-head">${tagHtml}${svipPriceTag}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
         <p class="shop-product-card-desc">${escHtml(p.description || '')}</p>
         <div class="shop-product-card-prices">
           <span class="shop-product-card-retail">¥${Number(p.retail_price_yuan).toFixed(2)}<small>/件</small></span>
@@ -2782,6 +3211,23 @@ async function renderClaudeShop(container) {
           <label class="form-label">购买数量</label>
           <input type="number" class="form-input" id="claude-shop-qty" min="1" max="999" value="1" style="max-width:120px" oninput="claudeShopPriceRefresh()" />
           <p id="claude-shop-unit-hint" style="font-size:0.8rem;color:var(--text-secondary);margin:0.5rem 0"></p>
+          ${state._myAvailableCoupons && state._myAvailableCoupons.length ? `
+          <div class="coupon-picker" style="margin:0.5rem 0 0.75rem">
+            <span class="picker-tag">🎟 优惠券</span>
+            <select class="form-input" id="claude-shop-coupon-select" onchange="claudeShopCouponRefresh()">
+              <option value="">不使用优惠券</option>
+              ${state._myAvailableCoupons.map(uc => {
+                const dv = uc.snapshot_discount_type === 'percentage'
+                  ? (uc.snapshot_discount_value + '% off')
+                  : ('-¥' + (uc.snapshot_discount_value/100).toFixed(2));
+                return `<option value="${escHtml(uc.id)}">${escHtml(uc.snapshot_name)}（${dv}）</option>`;
+              }).join('')}
+            </select>
+            <span id="claude-shop-coupon-hint" style="font-size:0.8rem"></span>
+            <a href="#" onclick="event.preventDefault();navigate('my-coupons')" style="font-size:0.8rem">我的优惠券 →</a>
+          </div>` : `
+          <div style="font-size:0.8rem;color:var(--text-muted);margin:0.3rem 0 0.7rem">暂无可用优惠券 · <a href="#" onclick="event.preventDefault();navigate('my-coupons')">去领取</a></div>
+          `}
           <p class="shop-checkout-total-line">应付金额：<span id="claude-shop-pay-total">—</span></p>
           ${payModeBlock}
           <button type="button" class="btn btn-primary" data-claude-shop-pay style="margin-top:0.25rem" onclick="openClaudeShopPayFlow()">${escHtml(payBtnLabel)}</button>
@@ -2938,8 +3384,50 @@ window.loadShopImportFile = async function() {
 };
 
 window.runShopImport = async function() {
+  const productSelect = $('shop-import-product');
+  const productId = (productSelect?.value || '').trim();
+  const batchTag = ($('shop-import-batch')?.value || '').trim();
+  const deliveryType = productSelect?.selectedOptions[0]?.dataset?.deliveryType || 'card_key';
+
+  if (deliveryType === 'text') {
+    const raw = ($('shop-import-text-ta')?.value || '').trim();
+    if (!raw) { toast('请粘贴发货内容', 'warn'); return; }
+    const items = raw.split(/^####\s*$/m)
+      .map(s => s.trim())
+      .filter(Boolean)
+      .map(text => ({ text }));
+    if (!items.length) { toast('没有可导入条目', 'warn'); return; }
+    try {
+      const r = await api.admin.shopImportInventoryJSON({ delivery_type: 'text', items }, batchTag, productId);
+      toast(`导入成功 ${r.inserted} 条`, 'success');
+      navigate('admin-shop-inventory');
+    } catch(e) { toast(e.message || '导入失败', 'error'); }
+    return;
+  }
+
+  if (deliveryType === 'custom_kv') {
+    const rows = document.querySelectorAll('#shop-import-kv-items .kv-item');
+    const items = [];
+    rows.forEach(r => {
+      const obj = {};
+      r.querySelectorAll('[data-field-key]').forEach(inp => {
+        const k = inp.getAttribute('data-field-key');
+        const v = inp.value;
+        if (String(v).trim() !== '') obj[k] = v;
+      });
+      if (Object.keys(obj).length > 0) items.push(obj);
+    });
+    if (!items.length) { toast('请至少填写一条', 'warn'); return; }
+    try {
+      const r = await api.admin.shopImportInventoryJSON({ delivery_type: 'custom_kv', items }, batchTag, productId);
+      toast(`导入成功 ${r.inserted} 条`, 'success');
+      navigate('admin-shop-inventory');
+    } catch(e) { toast(e.message || '导入失败', 'error'); }
+    return;
+  }
+
+  // 默认 card_key：走 text/plain
   const t = ($('shop-import-ta')?.value || '').trim();
-  const productId = ($('shop-import-product')?.value || '').trim();
   if (!t) {
     toast('请粘贴 .txt / .csv 内容', 'warn');
     return;
@@ -2949,8 +3437,6 @@ window.runShopImport = async function() {
     toast('未识别到可导入数据', 'warn');
     return;
   }
-  const batchTag = ($('shop-import-batch')?.value || '').trim();
-  // productId 留空 = 通用池
   try {
     const r = await api.admin.shopImportInventory(t, batchTag, productId);
     const recognized = Number.isFinite(r.recognized) ? r.recognized : preview.pairs.length;
@@ -2962,6 +3448,61 @@ window.runShopImport = async function() {
   } catch (e) {
     toast(e.message || '导入失败', 'error');
   }
+};
+
+/** v10：切换库存导入区域的 UI 模式（根据选中 SKU 的 delivery_type） */
+window.updateImportUIForProduct = function() {
+  const sel = $('shop-import-product');
+  if (!sel) return;
+  const opt = sel.selectedOptions[0];
+  const dt = opt?.dataset?.deliveryType || 'card_key';
+  ['cardkey', 'text', 'kv'].forEach(m => {
+    const box = $(`shop-import-mode-${m}`);
+    if (box) box.style.display = 'none';
+  });
+  if (dt === 'text') {
+    $('shop-import-mode-text').style.display = 'block';
+  } else if (dt === 'custom_kv') {
+    $('shop-import-mode-kv').style.display = 'block';
+    // 初始化至少一条
+    const box = $('shop-import-kv-items');
+    if (box && box.children.length === 0) addImportKVItem();
+  } else {
+    $('shop-import-mode-cardkey').style.display = 'block';
+  }
+};
+
+/** 根据当前 SKU 的 schema 新增一行 custom_kv 输入 */
+window.addImportKVItem = function() {
+  const sel = $('shop-import-product');
+  if (!sel) return;
+  const opt = sel.selectedOptions[0];
+  if (!opt) return;
+  const schemaStr = opt.dataset.schema || '';
+  let schema = {};
+  try { schema = JSON.parse(schemaStr || '{}'); } catch {}
+  const fields = (schema.fields || []).length ? schema.fields : [{ key: 'text', label: '内容', multiline: true }];
+
+  const box = $('shop-import-kv-items');
+  if (!box) return;
+  const div = document.createElement('div');
+  div.className = 'kv-item';
+  div.style.cssText = 'border:1px solid var(--border-light);padding:0.65rem;border-radius:var(--radius-sm);position:relative';
+  div.innerHTML = `
+    <button type="button" class="btn-kv-del" onclick="this.parentElement.remove()" style="position:absolute;top:0.4rem;right:0.4rem">✕</button>
+    ${fields.map(f => {
+      const isMulti = !!f.multiline;
+      const hint = f.hint ? `<div class="form-hint">${escHtml(f.hint)}</div>` : '';
+      return `<div class="form-group" style="margin-bottom:0.5rem">
+        <label class="form-label">${escHtml(f.label || f.key)}</label>
+        ${isMulti
+          ? `<textarea class="form-input" rows="2" data-field-key="${escHtml(f.key)}"></textarea>`
+          : `<input class="form-input" type="text" data-field-key="${escHtml(f.key)}" />`}
+        ${hint}
+      </div>`;
+    }).join('')}
+  `;
+  box.appendChild(div);
 };
 
 window.confirmShopOrderPaid = function(id) {
@@ -3073,22 +3614,7 @@ window.showAdminShopOrderDetail = async function(id) {
     body += `<p style="font-size:0.85rem"><strong>数量</strong> ${o.quantity} · <strong>应付</strong> ¥${(o.total_cents / 100).toFixed(2)}</p>`;
     if ((o.lines || []).length) {
       body += `<p class="form-label" style="margin-top:0.85rem">已发货账号</p>`;
-      body += (o.lines || []).map(ln => {
-        const em = String(ln.email || '');
-        const ky = String(ln.api_key || '');
-        return `<div class="shop-credential-card" style="margin-top:0.5rem">
-          <span class="shop-credential-label">邮箱</span>
-          <div class="shop-credential-value-row">
-            <span class="shop-credential-value" dir="ltr">${escHtml(em)}</span>
-            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(em)})'>复制</button>
-          </div>
-          <span class="shop-credential-label" style="margin-top:0.75rem;display:block">登录 Key</span>
-          <div class="shop-credential-value-row">
-            <span class="shop-credential-value" dir="ltr">${escHtml(ky)}</span>
-            <button type="button" class="btn btn-ghost btn-sm shop-credential-copy" onclick='copyText(${JSON.stringify(ky)})'>复制</button>
-          </div>
-        </div>`;
-      }).join('');
+      body += (o.lines || []).map(ln => renderShopDeliveryCard(ln)).join('');
     } else {
       body += `<p style="font-size:0.8rem;color:var(--text-muted);margin-top:0.65rem">暂无发货明细（订单待确认或未扣库存发货）。</p>`;
     }
@@ -3226,7 +3752,9 @@ async function renderAdminShopInventory(container) {
   const productMap = new Map(products.map(p => [p.id, p]));
   const productOptions = products.map(p => {
     const dedicated = Number(p.stock_dedicated ?? 0);
-    return `<option value="${escHtml(p.id)}">${escHtml(p.title || '—')}（专属待售 ${dedicated}）</option>`;
+    const dt = p.delivery_type || 'card_key';
+    const schemaAttr = p.delivery_schema ? ` data-schema='${escHtml(JSON.stringify(p.delivery_schema))}'` : '';
+    return `<option value="${escHtml(p.id)}" data-delivery-type="${escHtml(dt)}"${schemaAttr}>${escHtml(p.title || '—')}（专属待售 ${dedicated}）</option>`;
   }).join('');
   const productFilterOptions = products.map(p => {
     const sel = productFilter === p.id ? 'selected' : '';
@@ -3266,20 +3794,38 @@ async function renderAdminShopInventory(container) {
           </div>
           <div class="form-group">
             <label class="form-label">关联商品（库存池归属）</label>
-            <select class="form-input" id="shop-import-product" style="max-width:360px">
-              <option value="">通用池（任意 SKU 订单均可兜底取用）</option>
+            <select class="form-input" id="shop-import-product" style="max-width:360px" onchange="updateImportUIForProduct()">
+              <option value="" data-delivery-type="card_key">通用池（任意 SKU 订单均可兜底取用）</option>
               ${productOptions}
             </select>
-            <div class="form-hint">选择某商品 = 本批只供该 SKU 订单使用；留空 = 通用池（所有 SKU 订单的兜底）</div>
+            <div class="form-hint">选择某商品 = 本批只供该 SKU 订单使用；留空 = 通用池（所有 SKU 订单的兜底，仅支持卡密格式）</div>
           </div>
-          <div class="form-group">
-            <label class="form-label">文件导入</label>
-            <input type="file" id="shop-import-file" accept=".txt,.csv,text/plain,text/csv" onchange="loadShopImportFile()" />
-            <div class="form-hint">支持 txt / csv，载入后会自动统计识别条数</div>
+
+          <!-- card_key 模式（默认） -->
+          <div id="shop-import-mode-cardkey">
+            <div class="form-group">
+              <label class="form-label">文件导入</label>
+              <input type="file" id="shop-import-file" accept=".txt,.csv,text/plain,text/csv" onchange="loadShopImportFile()" />
+              <div class="form-hint">支持 txt / csv，载入后会自动统计识别条数</div>
+            </div>
+            <textarea class="form-input" id="shop-import-ta" rows="8" style="resize:vertical;font-family:var(--font-mono);font-size:0.78rem" placeholder="user@mail.com####tm_xxx" oninput="handleShopImportInput()"></textarea>
+            <div id="shop-import-stats" class="form-hint" style="margin-top:0.5rem"></div>
           </div>
-          <textarea class="form-input" id="shop-import-ta" rows="8" style="resize:vertical;font-family:var(--font-mono);font-size:0.78rem" placeholder="user@mail.com####tm_xxx" oninput="handleShopImportInput()"></textarea>
-          <div id="shop-import-stats" class="form-hint" style="margin-top:0.5rem"></div>
-          <div style="display:flex;flex-wrap:wrap;gap:0.6rem;align-items:center;margin-top:0.6rem">
+
+          <!-- text 模式 -->
+          <div id="shop-import-mode-text" style="display:none">
+            <div class="form-hint" style="margin-bottom:0.5rem">该商品的发货模式为 <strong>长文本</strong>：每条发货内容以 <code>####</code> 分隔；单条可以是多行（如网盘链接 + 提取码 + 备注）。</div>
+            <textarea class="form-input" id="shop-import-text-ta" rows="10" style="resize:vertical;font-size:0.82rem" placeholder="https://pan.example.com/xxx&#10;提取码：a1b2&#10;####&#10;https://pan.example.com/yyy&#10;提取码：c3d4"></textarea>
+          </div>
+
+          <!-- custom_kv 模式 -->
+          <div id="shop-import-mode-kv" style="display:none">
+            <div class="form-hint" style="margin-bottom:0.5rem">该商品的发货模式为 <strong>自定义字段</strong>：按下方表格每行一件添加；字段由 SKU 的 schema 决定。</div>
+            <div id="shop-import-kv-items" style="display:flex;flex-direction:column;gap:0.7rem"></div>
+            <button type="button" class="btn btn-ghost btn-sm" style="margin-top:0.5rem" onclick="addImportKVItem()">+ 再添加一条</button>
+          </div>
+
+          <div style="display:flex;flex-wrap:wrap;gap:0.6rem;align-items:center;margin-top:0.8rem">
             <button type="button" class="btn btn-primary btn-sm" onclick="runShopImport()">导入到待售池</button>
             <span style="font-size:0.75rem;color:var(--text-muted)">当前可售库存：<strong>${availableStock}</strong> 件（其中通用池 <strong>${unassignedStock}</strong>）/ 已售 <strong>${soldStock}</strong> 件 / 总计 <strong>${totalStock}</strong> 件</span>
           </div>
@@ -3361,6 +3907,7 @@ async function renderAdminShopInventory(container) {
     </div>
   `;
   updateShopImportStats($('shop-import-ta')?.value || '');
+  updateImportUIForProduct();
 }
 
 async function renderAdminShopOrders(container) {
@@ -3446,6 +3993,30 @@ window.adminShopProductCancelEdit = function() {
   navigate('admin-shop-products');
 };
 
+// v10：SKU 表单的 schema 行操作
+window.addKVSchemaRow = function(key = '', label = '', hint = '', multiline = false) {
+  const box = $('shop-prod-schema-rows');
+  if (!box) return;
+  const row = document.createElement('div');
+  row.className = 'kv-row';
+  row.innerHTML = `
+    <input type="text" placeholder="字段 key（英文）" value="${escHtml(key)}" class="kv-key" />
+    <input type="text" placeholder="展示名（如 网盘链接）" value="${escHtml(label)}" class="kv-label" />
+    <button type="button" class="btn-kv-del" onclick="this.parentElement.remove()">✕</button>
+    <input type="text" placeholder="可选提示" value="${escHtml(hint)}" class="kv-hint" style="grid-column:1 / -1;margin-top:-4px;padding:0.35rem 0.55rem;font-size:0.78rem" />
+    <label style="grid-column:1 / -1;font-size:0.78rem;color:var(--text-muted);display:flex;gap:0.35rem;align-items:center;margin-bottom:0.3rem">
+      <input type="checkbox" class="kv-multi" ${multiline?'checked':''} /> 多行文本
+    </label>
+  `;
+  box.appendChild(row);
+};
+
+window.handleDeliveryTypeChange = function() {
+  const v = $('shop-prod-delivery-type')?.value || 'card_key';
+  const kvBox = $('shop-prod-schema-wrap');
+  if (kvBox) kvBox.style.display = (v === 'custom_kv') ? 'block' : 'none';
+};
+
 window.submitAdminShopProductForm = async function() {
   const editId = ($('shop-prod-edit-id')?.value || '').trim();
   const body = {
@@ -3457,7 +4028,32 @@ window.submitAdminShopProductForm = async function() {
     wholesale_min_qty: parseInt($('shop-prod-wsqty')?.value || '5', 10) || 5,
     sort_order: parseInt($('shop-prod-sort')?.value || '0', 10) || 0,
     enabled: $('shop-prod-enabled')?.checked !== false,
+    // v10：发货模式 + SVIP 价
+    delivery_type: $('shop-prod-delivery-type')?.value || 'card_key',
   };
+  const svipYuan = ($('shop-prod-svip-price')?.value || '').trim();
+  if (svipYuan === '') {
+    body.clear_svip_price = true;
+  } else {
+    const n = parseFloat(svipYuan);
+    if (!isFinite(n) || n < 0) { toast('SVIP 价格无效', 'warn'); return; }
+    body.svip_price_yuan = n;
+  }
+  if (body.delivery_type === 'custom_kv') {
+    const rows = document.querySelectorAll('#shop-prod-schema-rows .kv-row');
+    const fields = [];
+    rows.forEach(r => {
+      const key = r.querySelector('.kv-key').value.trim();
+      const label = r.querySelector('.kv-label').value.trim();
+      const hint = r.querySelector('.kv-hint').value.trim();
+      const multi = r.querySelector('.kv-multi').checked;
+      if (key && label) fields.push({ key, label, hint, multiline: multi });
+    });
+    if (fields.length === 0) { toast('自定义 KV 至少需要 1 个字段', 'warn'); return; }
+    body.delivery_schema = { fields };
+  } else {
+    body.delivery_schema = { fields: [] };
+  }
   if (!body.title) {
     toast('请填写商品标题', 'warn');
     return;
@@ -3531,6 +4127,23 @@ async function renderAdminShopProducts(container) {
               <input type="number" class="form-input" id="shop-prod-wsqty" value="${v.wholesale_min_qty ?? 5}" /></div>
             <div class="form-group"><label class="form-label">排序（越小越靠前）</label>
               <input type="number" class="form-input" id="shop-prod-sort" value="${v.sort_order ?? 0}" /></div>
+            <div class="form-group"><label class="form-label">✦ SVIP 专享价（元/件，留空=不设）</label>
+              <input type="number" step="0.01" class="form-input" id="shop-prod-svip-price" value="${v.svip_price_yuan != null ? Number(v.svip_price_yuan).toFixed(2) : ''}" placeholder="例如 79.00" /></div>
+            <div class="form-group"><label class="form-label">发货模式</label>
+              <select class="form-input" id="shop-prod-delivery-type" onchange="handleDeliveryTypeChange()">
+                <option value="card_key"  ${(v.delivery_type||'card_key')==='card_key'?'selected':''}>邮箱 + 卡密（默认）</option>
+                <option value="text"      ${v.delivery_type==='text'?'selected':''}>长文本（适合网盘链接、激活码等）</option>
+                <option value="custom_kv" ${v.delivery_type==='custom_kv'?'selected':''}>自定义字段（URL + 口令 + 备注…）</option>
+              </select>
+            </div>
+          </div>
+          <div id="shop-prod-schema-wrap" style="display:${v.delivery_type==='custom_kv'?'block':'none'}">
+            <label class="form-label">自定义字段定义</label>
+            <div class="kv-schema-editor">
+              <div id="shop-prod-schema-rows"></div>
+              <button type="button" class="btn btn-ghost btn-sm" onclick="addKVSchemaRow()">+ 添加字段</button>
+              <p class="form-hint">例如「url=网盘链接 / code=提取码 / note=备注」；库存导入时管理员按这些字段填写。</p>
+            </div>
           </div>
           <label style="display:flex;align-items:center;gap:0.45rem;margin:0.6rem 0;cursor:pointer">
             <input type="checkbox" id="shop-prod-enabled" ${editing && v.enabled === false ? '' : 'checked'} />
@@ -3569,6 +4182,359 @@ async function renderAdminShopProducts(container) {
             </tbody>
           </table>
         </div>
+      </div>
+    </div>
+  `;
+
+  // v10：若正在编辑 custom_kv 模式的商品，把现有 schema 字段回填
+  if (editing && editing.delivery_type === 'custom_kv' && editing.delivery_schema && Array.isArray(editing.delivery_schema.fields)) {
+    editing.delivery_schema.fields.forEach(f => {
+      window.addKVSchemaRow(f.key || '', f.label || '', f.hint || '', !!f.multiline);
+    });
+  }
+}
+
+// ─── v10：我的优惠券（用户页）────────────────────────────────
+window.myCouponsSetStatus = function(status) {
+  state.myCouponStatus = status || 'available';
+  navigate('my-coupons');
+};
+
+window.redeemMyCouponCode = async function() {
+  const code = ($('my-coupon-code')?.value || '').trim();
+  if (!code) { toast('请输入领取码', 'warn'); return; }
+  try {
+    await api.couponRedeem(code);
+    toast('领取成功！', 'success');
+    navigate('my-coupons');
+  } catch(e) {
+    toast('领取失败：' + (e.message || ''), 'error');
+  }
+};
+
+/** 渲染单张用户优惠券卡片（参数是 user_coupon 对象） */
+function renderUserCouponCard(uc, opts = {}) {
+  const expired = uc.snapshot_expires_at && new Date(uc.snapshot_expires_at) < new Date();
+  const disabled = uc.status !== 'available' || expired;
+  const isPct = uc.snapshot_discount_type === 'percentage';
+  const amount = isPct
+    ? `<span class="coupon-card-amount">${uc.snapshot_discount_value}<small>%OFF</small></span>`
+    : `<span class="coupon-card-amount"><small>¥</small>${(uc.snapshot_discount_value / 100).toFixed(0)}</span>`;
+  const kind = isPct ? '折扣券' : '满减券';
+  const minY = (uc.snapshot_min_order_cents || 0) / 100;
+  const metaParts = [];
+  if (minY > 0) metaParts.push(`<span class="tag">满 ¥${minY.toFixed(0)}</span>`);
+  if (uc.snapshot_expires_at) metaParts.push(`过期：${formatDate(uc.snapshot_expires_at)}`);
+  if (uc.status === 'used') metaParts.push('已使用');
+  else if (uc.status === 'expired' || expired) metaParts.push('已过期');
+  else if (uc.status === 'revoked') metaParts.push('已撤销');
+
+  let actions = '';
+  if (!disabled && opts.showShopLink) {
+    actions = `<div class="coupon-card-actions"><button class="btn btn-primary btn-sm" onclick="navigate('claude-shop')">去使用</button></div>`;
+  }
+
+  return `<div class="coupon-card ${disabled?'is-disabled':''}">
+    <div class="coupon-card-left">
+      ${amount}
+      <div class="coupon-card-kind">${kind}</div>
+    </div>
+    <div class="coupon-card-right">
+      <div class="coupon-card-name">${escHtml(uc.snapshot_name || '优惠券')}</div>
+      <div class="coupon-card-desc">领取于 ${formatDate(uc.acquired_at)}${uc.used_at?' · 使用于 '+formatDate(uc.used_at):''}</div>
+      <div class="coupon-card-meta">${metaParts.join('')}</div>
+      ${actions}
+    </div>
+  </div>`;
+}
+
+async function renderMyCoupons(container) {
+  const status = state.myCouponStatus || 'available';
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `<button class="btn btn-ghost btn-sm" onclick="navigate('claude-shop')">🛒 自助商城</button>`;
+  }
+
+  const res = await api.couponMine(status).catch(() => ({ data: [] }));
+  const list = res.data || [];
+
+  const pills = [
+    { k: 'available', label: '可用' },
+    { k: 'used',      label: '已使用' },
+    { k: 'expired',   label: '已过期' },
+    { k: 'all',       label: '全部' },
+  ].map(o => `<button class="filter-pill ${status===o.k?'active':''}" onclick="myCouponsSetStatus('${o.k}')">${o.label}</button>`).join('');
+
+  const cards = list.map(uc => renderUserCouponCard(uc, { showShopLink: status === 'available' })).join('');
+
+  container.innerHTML = `
+    <div style="max-width:960px;display:flex;flex-direction:column;gap:1rem">
+      <div class="card">
+        <div class="card-header"><div class="card-title">🎟 输入优惠码领取</div></div>
+        <div class="card-body">
+          <div class="coupon-redeem-bar">
+            <input type="text" class="form-input" id="my-coupon-code" placeholder="请输入优惠码" onkeydown="if(event.key==='Enter')redeemMyCouponCode()" />
+            <button class="btn btn-primary" onclick="redeemMyCouponCode()">领取</button>
+          </div>
+          <p style="font-size:0.8rem;color:var(--text-muted);margin-top:0.2rem">领取成功后可在下方"可用"列表中查看；下单时选择使用。</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">我的优惠券</div>
+          <div class="filter-pills">${pills}</div>
+        </div>
+        <div class="card-body">
+          ${list.length ? `<div class="coupon-grid">${cards}</div>` : `<div class="empty-state"><span class="empty-icon">🎟</span><p>${status==='available'?'暂无可用券，输入优惠码领取吧！':'暂无记录'}</p></div>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ─── v10：优惠券管理（管理员页）────────────────────────────────
+window.adminCouponSetStatus = function(status) {
+  state.adminCouponStatus = status || '';
+  state.adminCouponPage = 1;
+  navigate('admin-coupons');
+};
+
+window.adminCouponSearch = function() {
+  state.adminCouponQ = ($('admin-coupon-q')?.value || '').trim();
+  state.adminCouponPage = 1;
+  navigate('admin-coupons');
+};
+
+window.adminCouponGoPage = function(p) {
+  state.adminCouponPage = Math.max(1, p);
+  navigate('admin-coupons');
+};
+
+window.adminCouponToggle = async function(id, enabled) {
+  try {
+    await api.admin.couponToggle(id, enabled);
+    toast('已更新', 'success');
+    navigate('admin-coupons');
+  } catch(e) { toast('操作失败：' + (e.message||''), 'error'); }
+};
+
+window.adminCouponDelete = function(id, name) {
+  showModal('删除优惠券', `<p>确定删除优惠券 <strong>${escHtml(name)}</strong>？已领取的记录会级联删除。</p>`, async () => {
+    try {
+      await api.admin.couponDelete(id);
+      toast('已删除', 'success');
+      navigate('admin-coupons');
+    } catch(e) { toast('删除失败：' + (e.message||''), 'error'); return false; }
+  });
+};
+
+window.adminCouponGrant = function(id, name) {
+  showModal('定向派发：' + name, `
+    <div class="form-group">
+      <label class="form-label">目标账户 UUID（每行一个）</label>
+      <textarea class="form-input" id="grant-account-ids" rows="6" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&#10;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></textarea>
+      <div class="form-hint">管理员在「账户管理」可复制 UUID；每张券按 per_user_limit 去重。</div>
+    </div>
+  `, async () => {
+    const raw = ($('grant-account-ids')?.value || '').trim();
+    if (!raw) { toast('请输入账户 UUID', 'warn'); return false; }
+    const ids = raw.split(/\s+/).filter(Boolean);
+    if (ids.length === 0) { toast('请输入账户 UUID', 'warn'); return false; }
+    try {
+      const r = await api.admin.couponGrant(id, ids);
+      const failed = (r.results || []).filter(x => !x.ok);
+      if (failed.length) {
+        toast(`成功 ${r.granted}/${r.total}；失败：${failed[0].error}`, 'warn');
+      } else {
+        toast(`已派发 ${r.granted} 张`, 'success');
+      }
+      navigate('admin-coupons');
+    } catch(e) { toast('派发失败：' + (e.message||''), 'error'); return false; }
+  });
+};
+
+window.showCouponEditor = function(existing) {
+  const c = existing || {
+    name: '', description: '', code: '',
+    discount_type: 'percentage', discount_value: 10,
+    min_order_cents: 0, max_discount_cents: 0,
+    total_quota: 0, per_user_limit: 1,
+    starts_at: null, expires_at: null,
+    svip_only: false, new_user_gift: false, svip_gift: false,
+    enabled: true,
+  };
+  const isEdit = !!existing;
+  const expires30 = new Date(Date.now() + 30*24*3600*1000).toISOString().slice(0, 16);
+  const title = isEdit ? '编辑优惠券' : '新建优惠券';
+  showModal(title, `
+    <div class="form-group">
+      <label class="form-label">名称 *</label>
+      <input type="text" class="form-input" id="c-name" value="${escHtml(c.name)}" placeholder="如「新人 9 折券」" />
+    </div>
+    <div class="form-group">
+      <label class="form-label">描述</label>
+      <textarea class="form-input" id="c-desc" rows="2" placeholder="向用户展示的说明">${escHtml(c.description || '')}</textarea>
+    </div>
+    <div class="form-group">
+      <label class="form-label">公开领取码（留空 = 仅管理员定向派发 / 自动赠送）</label>
+      <input type="text" class="form-input" id="c-code" value="${escHtml(c.code || '')}" placeholder="NEWYEAR2026" style="font-family:var(--font-mono)" />
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem">
+      <div class="form-group">
+        <label class="form-label">折扣类型</label>
+        <select class="form-input" id="c-type">
+          <option value="percentage" ${c.discount_type==='percentage'?'selected':''}>百分比折扣 (%)</option>
+          <option value="fixed"      ${c.discount_type==='fixed'?'selected':''}>固定金额 (分)</option>
+        </select>
+      </div>
+      <div class="form-group">
+        <label class="form-label">折扣值</label>
+        <input type="number" class="form-input" id="c-value" value="${c.discount_value || 10}" min="1" />
+        <div class="form-hint">百分比：1-100；固定：分（1 元 = 100）</div>
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem">
+      <div class="form-group">
+        <label class="form-label">最低订单金额（分）</label>
+        <input type="number" class="form-input" id="c-min" value="${c.min_order_cents || 0}" min="0" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">最高优惠封顶（分，0=不限）</label>
+        <input type="number" class="form-input" id="c-max" value="${c.max_discount_cents || 0}" min="0" />
+      </div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:0.6rem">
+      <div class="form-group">
+        <label class="form-label">总发放数量（0=无限）</label>
+        <input type="number" class="form-input" id="c-quota" value="${c.total_quota || 0}" min="0" />
+      </div>
+      <div class="form-group">
+        <label class="form-label">单用户可领次数</label>
+        <input type="number" class="form-input" id="c-peruser" value="${c.per_user_limit || 1}" min="1" />
+      </div>
+    </div>
+    <div class="form-group">
+      <label class="form-label">有效期至</label>
+      <input type="datetime-local" class="form-input" id="c-expires" value="${c.expires_at ? new Date(c.expires_at).toISOString().slice(0,16) : expires30}" />
+      <div class="form-hint">留空表示永不过期</div>
+    </div>
+    <div class="form-group">
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem"><input type="checkbox" id="c-svip-only" ${c.svip_only?'checked':''} /> 仅 SVIP 可领/使用</label>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-new-user" ${c.new_user_gift?'checked':''} /> 新用户注册自动赠送</label>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-svip-gift" ${c.svip_gift?'checked':''} /> 授予 SVIP 时自动赠送</label>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-enabled" ${c.enabled!==false?'checked':''} /> 启用</label>
+    </div>
+  `, async () => {
+    const body = {
+      name: ($('c-name').value || '').trim(),
+      description: ($('c-desc').value || '').trim(),
+      code: ($('c-code').value || '').trim() || null,
+      discount_type: $('c-type').value,
+      discount_value: parseInt($('c-value').value || '0', 10) || 0,
+      min_order_cents: parseInt($('c-min').value || '0', 10) || 0,
+      max_discount_cents: parseInt($('c-max').value || '0', 10) || 0,
+      total_quota: parseInt($('c-quota').value || '0', 10) || 0,
+      per_user_limit: parseInt($('c-peruser').value || '1', 10) || 1,
+      svip_only: $('c-svip-only').checked,
+      new_user_gift: $('c-new-user').checked,
+      svip_gift: $('c-svip-gift').checked,
+      enabled: $('c-enabled').checked,
+    };
+    const exp = ($('c-expires').value || '').trim();
+    if (exp) {
+      const dt = new Date(exp);
+      if (!isNaN(dt.getTime())) body.expires_at = dt.toISOString();
+    }
+    if (!body.name) { toast('请输入名称', 'warn'); return false; }
+    if (body.discount_value <= 0) { toast('折扣值必须 > 0', 'warn'); return false; }
+    if (body.discount_type === 'percentage' && body.discount_value > 100) { toast('百分比不得超过 100', 'warn'); return false; }
+    try {
+      if (isEdit) await api.admin.couponUpdate(existing.id, body);
+      else await api.admin.couponCreate(body);
+      toast('已保存', 'success');
+      navigate('admin-coupons');
+    } catch(e) { toast('保存失败：' + (e.message||''), 'error'); return false; }
+  });
+};
+
+async function renderAdminCoupons(container) {
+  const page = state.adminCouponPage || 1;
+  const status = state.adminCouponStatus || '';
+  const q = state.adminCouponQ || '';
+  const actions = $('topbar-actions');
+  if (actions) {
+    actions.innerHTML = `
+      <input class="form-input" id="admin-coupon-q" placeholder="搜名称 / 码" value="${escHtml(q)}"
+        style="max-width:180px;padding:0.35rem 0.5rem;font-size:0.82rem" onkeydown="if(event.key==='Enter')adminCouponSearch()" />
+      <button class="btn btn-ghost btn-sm" onclick="adminCouponSearch()">搜索</button>
+      <button class="btn btn-primary btn-sm" onclick="showCouponEditor()" style="margin-left:0.3rem">+ 新建优惠券</button>
+    `;
+  }
+
+  const res = await api.admin.couponList(status, q, page, 20).catch(() => ({ data: [], total: 0 }));
+  const list = res.data || [];
+  const total = res.total ?? list.length;
+  const size = res.size || 20;
+  const maxPage = Math.max(1, Math.ceil(total / size) || 1);
+
+  const pills = [
+    { k: '',          label: '全部' },
+    { k: 'enabled',   label: '启用中' },
+    { k: 'disabled',  label: '已停用' },
+    { k: 'expired',   label: '已过期' },
+  ].map(o => `<button class="filter-pill ${status===o.k?'active':''}" onclick="adminCouponSetStatus('${o.k}')">${o.label}</button>`).join('');
+
+  const rows = list.map(c => {
+    const isPct = c.discount_type === 'percentage';
+    const amt = isPct ? `${c.discount_value}% off` : `-¥${(c.discount_value/100).toFixed(2)}`;
+    const tags = [];
+    if (c.svip_only) tags.push('<span class="svip-badge svip-badge-sm">SVIP 专享</span>');
+    if (c.new_user_gift) tags.push('<span class="badge badge-green">新用户赠</span>');
+    if (c.svip_gift) tags.push('<span class="badge badge-gold">SVIP 赠</span>');
+    if (c.code) tags.push(`<span class="coupon-card-code">${escHtml(c.code)}</span>`);
+    const used = c.used_count || 0;
+    const quota = c.total_quota || 0;
+    const quotaStr = quota > 0 ? `${used} / ${quota}` : `${used} / ∞`;
+    const expStr = c.expires_at ? formatDate(c.expires_at) : '永久';
+    const enabled = c.enabled;
+    const nameJs = JSON.stringify(c.name || '');
+    return `<tr ${!enabled?'style="opacity:0.5"':''}>
+      <td>
+        <div style="font-weight:600">${escHtml(c.name)}</div>
+        <div style="font-size:0.76rem;color:var(--text-muted);margin-top:0.2rem;display:flex;gap:0.3rem;flex-wrap:wrap">${tags.join('')}</div>
+      </td>
+      <td><span class="badge ${isPct?'badge-green':'badge-gold'}">${escHtml(amt)}</span></td>
+      <td style="font-size:0.8rem">${quotaStr}</td>
+      <td style="font-size:0.8rem">${expStr}</td>
+      <td>${enabled ? '<span class="badge badge-green">启用</span>' : '<span class="badge badge-gray">停用</span>'}</td>
+      <td style="white-space:nowrap">
+        <button class="btn btn-ghost btn-sm" onclick='showCouponEditor(${JSON.stringify(c).replace(/'/g, "&#39;")})'>编辑</button>
+        <button class="btn btn-ghost btn-sm" onclick='adminCouponGrant("${c.id}", ${nameJs})'>📤 派发</button>
+        <button class="btn btn-ghost btn-sm" onclick='adminCouponToggle("${c.id}", ${!enabled})'>${enabled?'停用':'启用'}</button>
+        <button class="btn btn-danger btn-sm" onclick='adminCouponDelete("${c.id}", ${nameJs})'>删除</button>
+      </td>
+    </tr>`;
+  }).join('');
+
+  container.innerHTML = `
+    <div class="card" style="max-width:1040px">
+      <div class="card-header">
+        <div class="card-title">🎫 优惠券列表</div>
+        <div style="font-size:0.78rem;color:var(--text-muted)">共 ${total} 张</div>
+      </div>
+      <div style="padding:0.7rem 1.3rem 0.4rem;border-bottom:1px solid var(--border-light)">
+        <div class="filter-pills">${pills}</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>名称 / 标签</th><th>折扣</th><th>已领/总量</th><th>到期</th><th>状态</th><th>操作</th></tr></thead>
+          <tbody>${list.length ? rows : '<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:2rem">暂无优惠券</td></tr>'}</tbody>
+        </table>
+      </div>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin:1rem 1.3rem;flex-wrap:wrap">
+        <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminCouponGoPage(${page - 1})">上一页</button>
+        <span style="font-size:0.85rem;color:var(--text-muted)">第 ${page} / ${maxPage} 页</span>
+        <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminCouponGoPage(${page + 1})">下一页</button>
       </div>
     </div>
   `;

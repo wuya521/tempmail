@@ -39,6 +39,9 @@ func (h *RegisterHandler) Register(c *gin.Context) {
 		return
 	}
 
+	// v10：自动发放 new_user_gift 优惠券（失败不影响注册结果）
+	GrantNewUserGifts(c, h.store, account.ID)
+
 	c.JSON(http.StatusCreated, gin.H{
 		"id":       account.ID,
 		"username": account.Username,

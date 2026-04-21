@@ -5,12 +5,14 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"tempmail/middleware"
 	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 )
 
 type AccountHandler struct {
@@ -51,6 +53,9 @@ func (h *AccountHandler) Create(c *gin.Context) {
 		return
 	}
 
+	// v10：管理员创建的账户也按"新用户"处理，发放 new_user_gift 券
+	GrantNewUserGifts(c, h.store, account.ID)
+
 	out := gin.H{
 		"id":       account.ID,
 		"username": account.Username,
@@ -70,6 +75,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 }
 
 // GET /api/admin/accounts - 列出所有账号（管理员）
+// v10：新增 status 查询参数（all/active/banned/svip）配合前端筛选胶囊
 func (h *AccountHandler) List(c *gin.Context) {
 	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
 	size, _ := strconv.Atoi(c.DefaultQuery("size", "10"))
@@ -79,19 +85,24 @@ func (h *AccountHandler) List(c *gin.Context) {
 	if size < 1 || size > 100 {
 		size = 10
 	}
-	q := c.Query("q")
 
-	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size, q)
+	filter := store.AccountListFilter{
+		Status: c.Query("status"),
+		Search: c.Query("q"),
+	}
+
+	accounts, total, err := h.store.ListAccounts(c.Request.Context(), page, size, filter)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"data":  accounts,
-		"total": total,
-		"page":  page,
-		"size":  size,
+		"data":   accounts,
+		"total":  total,
+		"page":   page,
+		"size":   size,
+		"status": filter.Status,
 	})
 }
 
@@ -221,3 +232,131 @@ func apiKeyPrefix(k string) string {
 	}
 	return k[:10] + "…"
 }
+
+// ==================== v10：SVIP & 配额 ====================
+
+// svipGiftHook SVIP 授权成功后的异步副作用（如发放专属券）。由 main.go 注入，避免 handler 直依赖 coupon 包。
+var svipGiftHook func(ctx *gin.Context, s *store.Store, account *model.Account)
+
+// SetSVIPGiftHook 注册授权 SVIP 成功后的回调
+func SetSVIPGiftHook(hook func(ctx *gin.Context, s *store.Store, account *model.Account)) {
+	svipGiftHook = hook
+}
+
+// POST /api/admin/accounts/:id/svip  body: { "level": 1, "expires_at": "2026-12-31T23:59:59Z"|null, "duration_days": 30 }
+// 规则：
+//   - level > 0 即授权 SVIP（目前仅支持 1）；level <= 0 撤销
+//   - expires_at 优先于 duration_days；二者都未传 = 永久
+//   - 返回最新账户快照
+func (h *AccountHandler) GrantSVIP(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+	var req struct {
+		Level        int     `json:"level"`
+		ExpiresAt    *string `json:"expires_at"`
+		DurationDays *int    `json:"duration_days"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	ctx := c.Request.Context()
+	if req.Level <= 0 {
+		if err := h.store.RevokeSVIP(ctx, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		acc, _ := h.store.GetAccountByID(ctx, id)
+		c.JSON(http.StatusOK, gin.H{"message": "SVIP 已撤销", "account": acc})
+		return
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != nil && strings.TrimSpace(*req.ExpiresAt) != "" {
+		t, parseErr := time.Parse(time.RFC3339, *req.ExpiresAt)
+		if parseErr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expires_at 必须为 RFC3339 格式"})
+			return
+		}
+		expiresAt = &t
+	} else if req.DurationDays != nil && *req.DurationDays > 0 {
+		t := time.Now().Add(time.Duration(*req.DurationDays) * 24 * time.Hour)
+		expiresAt = &t
+	}
+
+	acc, err := h.store.GrantSVIP(ctx, id, req.Level, expiresAt)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	if svipGiftHook != nil {
+		svipGiftHook(c, h.store, acc)
+	}
+
+	msg := "SVIP 已授权"
+	if expiresAt != nil {
+		msg += "，到期 " + expiresAt.Format("2006-01-02")
+	} else {
+		msg += "（永久）"
+	}
+	c.JSON(http.StatusOK, gin.H{"message": msg, "account": acc})
+}
+
+// POST /api/admin/accounts/:id/quota
+// body: {
+//   "mailbox_quota": -1|0|N,                  // 必填。-1=无限，0=默认，正数=专属上限
+//   "mailbox_ttl_minutes": null|0|N,           // 必填。null=默认（跟随全局），0=永久，正数=分钟
+//   "use_default_ttl": true|false              // 可选。true 时强制 ttl=NULL（与 mailbox_ttl_minutes=null 同义）
+// }
+func (h *AccountHandler) SetQuota(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+	var req struct {
+		MailboxQuota      *int  `json:"mailbox_quota"`
+		MailboxTTLMinutes *int  `json:"mailbox_ttl_minutes"`
+		UseDefaultTTL     *bool `json:"use_default_ttl"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+	if req.MailboxQuota != nil {
+		if err := h.store.SetMailboxQuota(ctx, id, *req.MailboxQuota); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	// TTL 更新策略：
+	//   - use_default_ttl == true  → ttl = NULL（跟随全局）
+	//   - req 中明确传入 mailbox_ttl_minutes → 使用该值（0=永久）
+	//   - 都没传 → 不动（跳过 UPDATE）
+	shouldSetTTL := false
+	var ttlPtr *int
+	if req.UseDefaultTTL != nil && *req.UseDefaultTTL {
+		shouldSetTTL = true
+		ttlPtr = nil
+	} else if req.MailboxTTLMinutes != nil {
+		shouldSetTTL = true
+		ttlPtr = req.MailboxTTLMinutes
+	}
+	if shouldSetTTL {
+		if err := h.store.SetMailboxTTLMinutes(ctx, id, ttlPtr); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	acc, _ := h.store.GetAccountByID(ctx, id)
+	c.JSON(http.StatusOK, gin.H{"message": "配额已更新", "account": acc})
+}
+
+// 保留 UUID 引用避免 unused import 报错（SetQuota/GrantSVIP 用的是 parseUUID 间接返回）
+var _ = uuid.UUID{}

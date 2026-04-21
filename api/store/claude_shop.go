@@ -4,10 +4,12 @@ import (
 	"context"
 	"database/sql"
 	"encoding/csv"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"tempmail/model"
 
@@ -15,6 +17,18 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// productColumns v10 起 SELECT 统一列表（顺序需与 scanClaudeShopProduct 一致）
+const productColumns = `id, sort_order, enabled, title, description, tag,
+	retail_price_cents, wholesale_min_qty, wholesale_price_cents,
+	delivery_type, delivery_schema, svip_price_cents,
+	created_at, updated_at`
+
+// orderColumns v10 订单 SELECT 列表
+const orderColumns = `id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+	payment_channel, alipay_trade_no, product_id, product_title_snapshot,
+	original_total_cents, discount_cents, coupon_id, coupon_code_snapshot, svip_snapshot,
+	created_at, fulfilled_at`
 
 var inventoryEmailRe = regexp.MustCompile(`^[^\s@]+@[^\s@]+\.[^\s@]+$`)
 
@@ -388,7 +402,7 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 
 	dataArgs := append(append([]interface{}{}, args...), size, offset)
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
-		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), product_id, created_at
+		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), product_id, payload, created_at
 		FROM claude_inventory
 		WHERE %s
 		ORDER BY created_at DESC
@@ -405,7 +419,8 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 		var item model.ClaudeInventoryItem
 		var orderIDText *string
 		var prodID *uuid.UUID
-		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &prodID, &item.CreatedAt); err != nil {
+		var payloadRaw []byte
+		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &prodID, &payloadRaw, &item.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		if orderIDText != nil && strings.TrimSpace(*orderIDText) != "" {
@@ -416,6 +431,9 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 		if prodID != nil {
 			pidCopy := *prodID
 			item.ProductID = &pidCopy
+		}
+		if len(payloadRaw) > 0 {
+			_ = json.Unmarshal(payloadRaw, &item.Payload)
 		}
 		list = append(list, item)
 	}
@@ -433,7 +451,7 @@ func (s *Store) DeleteClaudeInventory(ctx context.Context, id uuid.UUID) error {
 	return nil
 }
 
-// ImportClaudeInventory 批量导入卡券。productID 为 nil 表示通用池（任意 SKU 订单都能兜底取用）。
+// ImportClaudeInventory 批量导入卡密（card_key 模式，兼容旧调用）。productID 为 nil 表示通用池（任意 SKU 订单都能兜底取用）。
 func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair, batchLabel string, productID *uuid.UUID) (int, error) {
 	if len(pairs) == 0 {
 		return 0, nil
@@ -452,6 +470,45 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 		_, err := tx.Exec(ctx,
 			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id) VALUES ($1, $2, $3, $4)`,
 			p.Email, p.APIKey, batchLabel, productID,
+		)
+		if err != nil {
+			return n, err
+		}
+		n++
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+// ImportClaudeInventoryPayload v10：批量导入 text / custom_kv 模式的库存。
+// 每条 payload 作为 JSONB 写入 claude_inventory.payload；email 与 api_key 为空字符串。
+func (s *Store) ImportClaudeInventoryPayload(ctx context.Context, payloads []map[string]interface{}, batchLabel string, productID *uuid.UUID) (int, error) {
+	if len(payloads) == 0 {
+		return 0, nil
+	}
+	batchLabel = strings.TrimSpace(batchLabel)
+	if len(batchLabel) > 64 {
+		return 0, fmt.Errorf("invalid_batch_label")
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	n := 0
+	for _, p := range payloads {
+		if len(p) == 0 {
+			continue
+		}
+		raw, err := json.Marshal(p)
+		if err != nil {
+			return n, err
+		}
+		_, err = tx.Exec(ctx,
+			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, payload) VALUES ('', '', $1, $2, $3)`,
+			batchLabel, productID, raw,
 		)
 		if err != nil {
 			return n, err
@@ -533,8 +590,18 @@ func (s *Store) SumFulfilledClaudeQuantityForAccount(ctx context.Context, accoun
 	return n, err
 }
 
+// CreateClaudeOrderOptions v10：下单扩展参数
+//
+//	SVIPActive: 当前账户是否处于有效 SVIP 期（由上层传入，便于使用 svip_price_cents）
+//	UserCouponID: 用户选择的优惠券（user_coupons.id）；nil 表示不使用券
+type CreateClaudeOrderOptions struct {
+	SVIPActive   bool
+	UserCouponID *uuid.UUID
+}
+
 // CreateClaudeOrder 创建待支付订单（不预占库存）。paymentChannel: static | alipay_precreate；存在启用 SKU 时 productID 必填
-func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quantity int, paymentChannel string, productID *uuid.UUID) (*model.ClaudeOrder, error) {
+// v10：增加 opts 参数，兼容老调用（传 CreateClaudeOrderOptions{} 即可）。
+func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quantity int, paymentChannel string, productID *uuid.UUID, opts CreateClaudeOrderOptions) (*model.ClaudeOrder, error) {
 	cfg, err := s.GetClaudeShopConfig(ctx)
 	if err != nil {
 		return nil, err
@@ -545,8 +612,6 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 	if quantity < 1 || quantity > 999 {
 		return nil, fmt.Errorf("invalid_quantity")
 	}
-	// 混合池的精确预检放在解析完 productID 之后（见后文 CountClaudeInventoryAvailableFor）；
-	// 实际扣库存由 FulfillClaudeOrder 的 FOR UPDATE SKIP LOCKED 保证一致性。
 	if cfg.MaxPerUser > 0 {
 		bought, err := s.SumFulfilledClaudeQuantityForAccount(ctx, accountID)
 		if err != nil {
@@ -563,7 +628,6 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 	if paymentChannel != "static" && paymentChannel != "alipay_precreate" {
 		return nil, fmt.Errorf("invalid_payment_channel")
 	}
-	// 启用静态收款码时：仅「静态码」路径限制同一账号一笔待确认；当面付可并行多笔待支付
 	if cfg.StaticQREnabled && paymentChannel == "static" {
 		var pendingN int
 		if err := s.pool.QueryRow(ctx,
@@ -604,6 +668,13 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 		if wholesale {
 			unit = p.WholesalePriceCents
 		}
+		// v10：SVIP 专享价优先级高于 wholesale（若批发价更低则取批发价）
+		if opts.SVIPActive && p.SVIPPriceCents != nil {
+			svipUnit := *p.SVIPPriceCents
+			if svipUnit < unit {
+				unit = svipUnit
+			}
+		}
 	} else {
 		titleSnap = strings.TrimSpace(cfg.Title)
 		if titleSnap == "" {
@@ -615,7 +686,6 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 			unit = cfg.WholesalePriceCents
 		}
 	}
-	// 按选中商品的"专属池+通用池"（或无 SKU 时只看通用池）再精确预检一次
 	availFor, err := s.CountClaudeInventoryAvailableFor(ctx, prodRef)
 	if err != nil {
 		return nil, err
@@ -623,19 +693,103 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 	if availFor < quantity {
 		return nil, fmt.Errorf("insufficient_stock")
 	}
-	total := unit * quantity
+
+	originalTotal := unit * quantity
+	discount := 0
+	var couponIDRef *uuid.UUID
+	var couponCodeSnap string
+
+	// v10：应用优惠券（先验证后扣减）
+	if opts.UserCouponID != nil {
+		uc, err := s.GetUserCoupon(ctx, accountID, *opts.UserCouponID)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf("invalid_user_coupon")
+			}
+			return nil, err
+		}
+		if uc.Status != "available" {
+			return nil, fmt.Errorf("coupon_not_available")
+		}
+		if uc.SnapshotExpiresAt != nil && uc.SnapshotExpiresAt.Before(time.Now()) {
+			return nil, fmt.Errorf("coupon_expired")
+		}
+		if originalTotal < uc.SnapshotMinOrderCents {
+			return nil, fmt.Errorf("coupon_min_order_not_met")
+		}
+		discount = ComputeDiscountFromSnapshot(uc, originalTotal)
+		if discount > 0 {
+			cid := uc.CouponID
+			couponIDRef = &cid
+			if c, err := s.GetCouponByID(ctx, cid); err == nil && c != nil && c.Code != nil {
+				couponCodeSnap = *c.Code
+			}
+		}
+	}
+
+	payable := originalTotal - discount
+	if payable < 0 {
+		payable = 0
+	}
+
+	svipSnap := 0
+	if opts.SVIPActive {
+		svipSnap = 1
+	}
 
 	var id uuid.UUID
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO claude_orders (account_id, quantity, unit_price_cents, total_cents, is_wholesale, status, payment_channel, product_id, product_title_snapshot)
-		VALUES ($1, $2, $3, $4, $5, 'awaiting_payment', $6, $7, $8)
+		INSERT INTO claude_orders (
+			account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
+			payment_channel, product_id, product_title_snapshot,
+			original_total_cents, discount_cents, coupon_id, coupon_code_snapshot, svip_snapshot
+		)
+		VALUES ($1,$2,$3,$4,$5,'awaiting_payment',$6,$7,$8,$9,$10,$11,$12,$13)
 		RETURNING id`,
-		accountID, quantity, unit, total, wholesale, paymentChannel, prodRef, titleSnap,
+		accountID, quantity, unit, payable, wholesale, paymentChannel, prodRef, titleSnap,
+		originalTotal, discount, couponIDRef, couponCodeSnap, svipSnap,
 	).Scan(&id)
 	if err != nil {
 		return nil, err
 	}
+
+	// 锁定用户优惠券（若成功应用）
+	if couponIDRef != nil && opts.UserCouponID != nil {
+		if _, err := s.LockUserCouponForOrder(ctx, accountID, *opts.UserCouponID, id); err != nil {
+			// 锁定失败：回滚订单（避免券释放失败产生僵尸订单）
+			_, _ = s.pool.Exec(ctx, `DELETE FROM claude_orders WHERE id = $1 AND status = 'awaiting_payment'`, id)
+			return nil, fmt.Errorf("coupon_lock_failed: %v", err)
+		}
+	}
+
 	return s.getClaudeOrderByID(ctx, id)
+}
+
+// scanOrder 通用订单 Scan
+func scanOrder(row interface{ Scan(...interface{}) error }) (*model.ClaudeOrder, error) {
+	var o model.ClaudeOrder
+	var alipayTN sql.NullString
+	var prodID *uuid.UUID
+	var couponID *uuid.UUID
+	if err := row.Scan(
+		&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
+		&o.PaymentChannel, &alipayTN, &prodID, &o.ProductTitleSnapshot,
+		&o.OriginalTotalCents, &o.DiscountCents, &couponID, &o.CouponCodeSnapshot, &o.SVIPSnapshot,
+		&o.CreatedAt, &o.FulfilledAt,
+	); err != nil {
+		return nil, err
+	}
+	if prodID != nil {
+		o.ProductID = prodID
+	}
+	if couponID != nil {
+		o.CouponID = couponID
+	}
+	if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
+		v := alipayTN.String
+		o.AlipayTradeNo = &v
+	}
+	return &o, nil
 }
 
 // GetClaudeOrderByID 管理端按 ID 查询（含已发货的 lines）
@@ -644,24 +798,9 @@ func (s *Store) GetClaudeOrderByID(ctx context.Context, id uuid.UUID) (*model.Cl
 }
 
 func (s *Store) getClaudeOrderByID(ctx context.Context, id uuid.UUID) (*model.ClaudeOrder, error) {
-	var o model.ClaudeOrder
-	var alipayTN sql.NullString
-	var prodID *uuid.UUID
-	err := s.pool.QueryRow(ctx, `
-		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
-		       payment_channel, alipay_trade_no, product_id, product_title_snapshot, created_at, fulfilled_at
-		FROM claude_orders WHERE id = $1`, id,
-	).Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
-		&o.PaymentChannel, &alipayTN, &prodID, &o.ProductTitleSnapshot, &o.CreatedAt, &o.FulfilledAt)
+	o, err := scanOrder(s.pool.QueryRow(ctx, `SELECT `+orderColumns+` FROM claude_orders WHERE id = $1`, id))
 	if err != nil {
 		return nil, err
-	}
-	if prodID != nil {
-		o.ProductID = prodID
-	}
-	if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
-		s := alipayTN.String
-		o.AlipayTradeNo = &s
 	}
 	if o.Status == "fulfilled" {
 		lines, err := s.listClaudeOrderLines(ctx, id)
@@ -670,12 +809,12 @@ func (s *Store) getClaudeOrderByID(ctx context.Context, id uuid.UUID) (*model.Cl
 		}
 		o.Lines = lines
 	}
-	return &o, nil
+	return o, nil
 }
 
 func (s *Store) listClaudeOrderLines(ctx context.Context, orderID uuid.UUID) ([]model.ClaudeOrderLine, error) {
 	rows, err := s.pool.Query(ctx,
-		`SELECT line_index, email, api_key FROM claude_order_lines WHERE order_id = $1 ORDER BY line_index ASC`,
+		`SELECT line_index, email, api_key, delivery_type, payload FROM claude_order_lines WHERE order_id = $1 ORDER BY line_index ASC`,
 		orderID,
 	)
 	if err != nil {
@@ -685,8 +824,15 @@ func (s *Store) listClaudeOrderLines(ctx context.Context, orderID uuid.UUID) ([]
 	var out []model.ClaudeOrderLine
 	for rows.Next() {
 		var ln model.ClaudeOrderLine
-		if err := rows.Scan(&ln.LineIndex, &ln.Email, &ln.APIKey); err != nil {
+		var payloadRaw []byte
+		if err := rows.Scan(&ln.LineIndex, &ln.Email, &ln.APIKey, &ln.DeliveryType, &payloadRaw); err != nil {
 			return nil, err
+		}
+		if strings.TrimSpace(ln.DeliveryType) == "" {
+			ln.DeliveryType = "card_key"
+		}
+		if len(payloadRaw) > 0 {
+			_ = json.Unmarshal(payloadRaw, &ln.Payload)
 		}
 		out = append(out, ln)
 	}
@@ -712,8 +858,7 @@ func (s *Store) ListClaudeOrdersForAccount(ctx context.Context, accountID uuid.U
 		return nil, 0, err
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
-		       payment_channel, alipay_trade_no, product_id, product_title_snapshot, created_at, fulfilled_at
+		SELECT `+orderColumns+`
 		FROM claude_orders WHERE account_id = $1
 		ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
 		accountID, size, (page-1)*size,
@@ -722,23 +867,13 @@ func (s *Store) ListClaudeOrdersForAccount(ctx context.Context, accountID uuid.U
 		return nil, 0, err
 	}
 	defer rows.Close()
-	var list []model.ClaudeOrder
+	list := []model.ClaudeOrder{}
 	for rows.Next() {
-		var o model.ClaudeOrder
-		var alipayTN sql.NullString
-		var prodID *uuid.UUID
-		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
-			&o.PaymentChannel, &alipayTN, &prodID, &o.ProductTitleSnapshot, &o.CreatedAt, &o.FulfilledAt); err != nil {
+		o, err := scanOrder(rows)
+		if err != nil {
 			return nil, 0, err
 		}
-		if prodID != nil {
-			o.ProductID = prodID
-		}
-		if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
-			s := alipayTN.String
-			o.AlipayTradeNo = &s
-		}
-		list = append(list, o)
+		list = append(list, *o)
 	}
 	return list, total, rows.Err()
 }
@@ -753,8 +888,7 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 			return nil, 0, err
 		}
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
-			       payment_channel, alipay_trade_no, product_id, product_title_snapshot, created_at, fulfilled_at
+			SELECT `+orderColumns+`
 			FROM claude_orders WHERE status = $1
 			ORDER BY created_at ASC LIMIT $2 OFFSET $3`,
 			statusFilter, size, (page-1)*size,
@@ -765,8 +899,7 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 			return nil, 0, err
 		}
 		rows, err = s.pool.Query(ctx, `
-			SELECT id, account_id, quantity, unit_price_cents, total_cents, is_wholesale, status,
-			       payment_channel, alipay_trade_no, product_id, product_title_snapshot, created_at, fulfilled_at
+			SELECT `+orderColumns+`
 			FROM claude_orders ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
 			size, (page-1)*size,
 		)
@@ -775,23 +908,13 @@ func (s *Store) ListClaudeOrdersAdmin(ctx context.Context, statusFilter string, 
 		return nil, 0, err
 	}
 	defer rows.Close()
-	var list []model.ClaudeOrder
+	list := []model.ClaudeOrder{}
 	for rows.Next() {
-		var o model.ClaudeOrder
-		var alipayTN sql.NullString
-		var prodID *uuid.UUID
-		if err := rows.Scan(&o.ID, &o.AccountID, &o.Quantity, &o.UnitPriceCents, &o.TotalCents, &o.IsWholesale, &o.Status,
-			&o.PaymentChannel, &alipayTN, &prodID, &o.ProductTitleSnapshot, &o.CreatedAt, &o.FulfilledAt); err != nil {
+		o, err := scanOrder(rows)
+		if err != nil {
 			return nil, 0, err
 		}
-		if prodID != nil {
-			o.ProductID = prodID
-		}
-		if alipayTN.Valid && strings.TrimSpace(alipayTN.String) != "" {
-			s := alipayTN.String
-			o.AlipayTradeNo = &s
-		}
-		list = append(list, o)
+		list = append(list, *o)
 	}
 	return list, total, rows.Err()
 }
@@ -830,6 +953,8 @@ func (s *Store) SetClaudeOrderAlipayTradeNo(ctx context.Context, orderID uuid.UU
 }
 
 // FulfillClaudeOrder 管理员/支付回调确认收款后扣库存并发货（混合池：先订单 SKU 专属池，再通用池兜底）
+// v10：同步把 claude_inventory.payload 和订单 SKU 的 delivery_type 写入 claude_order_lines；
+// 发货成功后标记关联的 user_coupons 为 used。
 func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -851,16 +976,29 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		return fmt.Errorf("order_not_awaiting_payment")
 	}
 
-	type pick struct {
-		id     uuid.UUID
-		email  string
-		apiKey string
+	// 查订单商品的发货类型（订单无 SKU 时默认 card_key）
+	deliveryType := "card_key"
+	if prodID != nil {
+		if err := tx.QueryRow(ctx,
+			`SELECT COALESCE(delivery_type, 'card_key') FROM claude_shop_products WHERE id = $1`,
+			*prodID,
+		).Scan(&deliveryType); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
 	}
-	// Step 1: 同 SKU 专属池优先（订单无 SKU 时跳过）
+
+	type pick struct {
+		id      uuid.UUID
+		email   string
+		apiKey  string
+		payload []byte
+	}
 	var picks []pick
+
+	// Step 1: 同 SKU 专属池优先（订单无 SKU 时跳过）
 	if prodID != nil {
 		rows, err := tx.Query(ctx, `
-			SELECT id, email, api_key FROM claude_inventory
+			SELECT id, email, api_key, payload FROM claude_inventory
 			WHERE status = 'available' AND product_id = $1
 			ORDER BY created_at ASC LIMIT $2 FOR UPDATE SKIP LOCKED`,
 			*prodID, qty,
@@ -870,7 +1008,7 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		}
 		for rows.Next() {
 			var p pick
-			if err := rows.Scan(&p.id, &p.email, &p.apiKey); err != nil {
+			if err := rows.Scan(&p.id, &p.email, &p.apiKey, &p.payload); err != nil {
 				rows.Close()
 				return err
 			}
@@ -882,7 +1020,7 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 	if len(picks) < qty {
 		rest := qty - len(picks)
 		rows, err := tx.Query(ctx, `
-			SELECT id, email, api_key FROM claude_inventory
+			SELECT id, email, api_key, payload FROM claude_inventory
 			WHERE status = 'available' AND product_id IS NULL
 			ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
 			rest,
@@ -892,7 +1030,7 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		}
 		for rows.Next() {
 			var p pick
-			if err := rows.Scan(&p.id, &p.email, &p.apiKey); err != nil {
+			if err := rows.Scan(&p.id, &p.email, &p.apiKey, &p.payload); err != nil {
 				rows.Close()
 				return err
 			}
@@ -908,15 +1046,28 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		if _, err := tx.Exec(ctx, `UPDATE claude_inventory SET status = 'sold', order_id = $1 WHERE id = $2`, orderID, p.id); err != nil {
 			return err
 		}
+		// 空 payload 落库为 NULL（复用 SQL 默认值），否则原样写入
+		var payloadArg interface{}
+		if len(p.payload) > 0 {
+			payloadArg = p.payload
+		}
 		if _, err := tx.Exec(ctx, `
-			INSERT INTO claude_order_lines (order_id, line_index, email, api_key) VALUES ($1, $2, $3, $4)`,
-			orderID, i, p.email, p.apiKey,
+			INSERT INTO claude_order_lines (order_id, line_index, email, api_key, delivery_type, payload)
+			VALUES ($1, $2, $3, $4, $5, $6)`,
+			orderID, i, p.email, p.apiKey, deliveryType, payloadArg,
 		); err != nil {
 			return err
 		}
 	}
 
 	if _, err := tx.Exec(ctx, `UPDATE claude_orders SET status = 'fulfilled', fulfilled_at = NOW() WHERE id = $1`, orderID); err != nil {
+		return err
+	}
+	// 优惠券核销
+	if _, err := tx.Exec(ctx,
+		`UPDATE user_coupons SET status = 'used', used_at = NOW() WHERE order_id = $1 AND status = 'available'`,
+		orderID,
+	); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -931,17 +1082,32 @@ func (s *Store) CountEnabledClaudeShopProducts(ctx context.Context) (int, error)
 
 func scanClaudeShopProduct(row interface{ Scan(...interface{}) error }) (*model.ClaudeShopProduct, error) {
 	var p model.ClaudeShopProduct
-	if err := row.Scan(&p.ID, &p.SortOrder, &p.Enabled, &p.Title, &p.Description, &p.Tag,
-		&p.RetailPriceCents, &p.WholesaleMinQty, &p.WholesalePriceCents, &p.CreatedAt, &p.UpdatedAt); err != nil {
+	var schemaRaw []byte
+	var svipPrice sql.NullInt32
+	if err := row.Scan(
+		&p.ID, &p.SortOrder, &p.Enabled, &p.Title, &p.Description, &p.Tag,
+		&p.RetailPriceCents, &p.WholesaleMinQty, &p.WholesalePriceCents,
+		&p.DeliveryType, &schemaRaw, &svipPrice,
+		&p.CreatedAt, &p.UpdatedAt,
+	); err != nil {
 		return nil, err
+	}
+	if len(schemaRaw) > 0 {
+		_ = json.Unmarshal(schemaRaw, &p.DeliverySchema)
+	}
+	if svipPrice.Valid {
+		v := int(svipPrice.Int32)
+		p.SVIPPriceCents = &v
+	}
+	if strings.TrimSpace(p.DeliveryType) == "" {
+		p.DeliveryType = "card_key"
 	}
 	return &p, nil
 }
 
 // GetClaudeShopProductByID 查询 SKU；enabledOnly 为 true 时仅返回启用行
 func (s *Store) GetClaudeShopProductByID(ctx context.Context, id uuid.UUID, enabledOnly bool) (*model.ClaudeShopProduct, error) {
-	q := `SELECT id, sort_order, enabled, title, description, tag, retail_price_cents, wholesale_min_qty, wholesale_price_cents, created_at, updated_at
-		FROM claude_shop_products WHERE id = $1`
+	q := `SELECT ` + productColumns + ` FROM claude_shop_products WHERE id = $1`
 	if enabledOnly {
 		q += ` AND enabled = TRUE`
 	}
@@ -951,7 +1117,7 @@ func (s *Store) GetClaudeShopProductByID(ctx context.Context, id uuid.UUID, enab
 // ListClaudeShopProductsPublic 用户侧仅启用 SKU
 func (s *Store) ListClaudeShopProductsPublic(ctx context.Context) ([]model.ClaudeShopProduct, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, sort_order, enabled, title, description, tag, retail_price_cents, wholesale_min_qty, wholesale_price_cents, created_at, updated_at
+		SELECT `+productColumns+`
 		FROM claude_shop_products WHERE enabled = TRUE
 		ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil {
@@ -972,7 +1138,7 @@ func (s *Store) ListClaudeShopProductsPublic(ctx context.Context) ([]model.Claud
 // ListClaudeShopProductsAdmin 管理端全部 SKU
 func (s *Store) ListClaudeShopProductsAdmin(ctx context.Context) ([]model.ClaudeShopProduct, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, sort_order, enabled, title, description, tag, retail_price_cents, wholesale_min_qty, wholesale_price_cents, created_at, updated_at
+		SELECT `+productColumns+`
 		FROM claude_shop_products
 		ORDER BY sort_order ASC, created_at ASC`)
 	if err != nil {
@@ -990,25 +1156,73 @@ func (s *Store) ListClaudeShopProductsAdmin(ctx context.Context) ([]model.Claude
 	return out, rows.Err()
 }
 
+// normalizeDeliveryType 兼容空值并校验
+func normalizeDeliveryType(t string) (string, error) {
+	t = strings.TrimSpace(t)
+	if t == "" {
+		return "card_key", nil
+	}
+	switch t {
+	case "card_key", "text", "custom_kv":
+		return t, nil
+	}
+	return "", fmt.Errorf("invalid_delivery_type")
+}
+
 // InsertClaudeShopProduct 新建 SKU
 func (s *Store) InsertClaudeShopProduct(ctx context.Context, p *model.ClaudeShopProduct) error {
+	dt, err := normalizeDeliveryType(p.DeliveryType)
+	if err != nil {
+		return err
+	}
+	p.DeliveryType = dt
+	schemaJSON, err := json.Marshal(p.DeliverySchema)
+	if err != nil {
+		return err
+	}
+	var svipPrice interface{}
+	if p.SVIPPriceCents != nil {
+		svipPrice = *p.SVIPPriceCents
+	}
 	return s.pool.QueryRow(ctx, `
-		INSERT INTO claude_shop_products (sort_order, enabled, title, description, tag, retail_price_cents, wholesale_min_qty, wholesale_price_cents)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+		INSERT INTO claude_shop_products (
+			sort_order, enabled, title, description, tag,
+			retail_price_cents, wholesale_min_qty, wholesale_price_cents,
+			delivery_type, delivery_schema, svip_price_cents
+		)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
 		RETURNING id, created_at, updated_at`,
-		p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag, p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
+		p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
+		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
+		p.DeliveryType, schemaJSON, svipPrice,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
 // UpdateClaudeShopProduct 更新 SKU（按 id）
 func (s *Store) UpdateClaudeShopProduct(ctx context.Context, p *model.ClaudeShopProduct) error {
+	dt, err := normalizeDeliveryType(p.DeliveryType)
+	if err != nil {
+		return err
+	}
+	p.DeliveryType = dt
+	schemaJSON, err := json.Marshal(p.DeliverySchema)
+	if err != nil {
+		return err
+	}
+	var svipPrice interface{}
+	if p.SVIPPriceCents != nil {
+		svipPrice = *p.SVIPPriceCents
+	}
 	tag, err := s.pool.Exec(ctx, `
 		UPDATE claude_shop_products SET
 		  sort_order = $2, enabled = $3, title = $4, description = $5, tag = $6,
-		  retail_price_cents = $7, wholesale_min_qty = $8, wholesale_price_cents = $9, updated_at = NOW()
+		  retail_price_cents = $7, wholesale_min_qty = $8, wholesale_price_cents = $9,
+		  delivery_type = $10, delivery_schema = $11, svip_price_cents = $12,
+		  updated_at = NOW()
 		WHERE id = $1`,
 		p.ID, p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
 		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
+		p.DeliveryType, schemaJSON, svipPrice,
 	)
 	if err != nil {
 		return err

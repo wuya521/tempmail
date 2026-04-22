@@ -266,9 +266,11 @@ input, textarea, select { font-family: inherit; }
   font-size: 0.8rem;
   color: #FAEBD7;
   font-weight: 500;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  flex-wrap: wrap;
+  line-height: 1.35;
 }
 .user-chip-role {
   font-size: 0.65rem;
@@ -649,12 +651,15 @@ tr:hover td { background: rgba(184,92,56,0.04); }
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 1.8rem;
-  max-width: 480px;
+  max-width: 560px;
   width: 100%;
+  max-height: calc(100vh - 2rem);
+  overflow-y: auto;
   box-shadow: 0 12px 60px var(--shadow);
   position: relative;
 }
 .modal-title { font-size: 1.05rem; font-weight: 700; margin-bottom: 1.2rem; color: var(--text); }
+.modal-body { min-width: 0; }
 .modal-close {
   position: absolute;
   top: 1rem; right: 1rem;
@@ -665,7 +670,18 @@ tr:hover td { background: rgba(184,92,56,0.04); }
   cursor: pointer;
   line-height: 1;
 }
-.modal-actions { display: flex; justify-content: flex-end; gap: 0.6rem; margin-top: 1.3rem; }
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.6rem;
+  margin: 1.3rem -1.8rem -1.8rem;
+  padding: 0.9rem 1.8rem 1rem;
+  position: sticky;
+  bottom: -1.8rem;
+  background: linear-gradient(180deg, rgba(255,255,255,0), var(--bg-card) 24%, var(--bg-card) 100%);
+  border-top: 1px solid var(--border-light);
+  z-index: 2;
+}
 
 /* 分割线 */
 .divider {
@@ -899,6 +915,11 @@ tr:hover td { background: rgba(184,92,56,0.04); }
     overflow-y: auto;
     padding: 1.4rem 1.2rem 2rem;
     max-width: 100%;
+  }
+  .modal-actions {
+    margin: 1rem -1.2rem -2rem;
+    padding: 0.85rem 1.2rem 1rem;
+    bottom: -2rem;
   }
 
   /* Toast */
@@ -1342,6 +1363,110 @@ tr:hover td { background: rgba(184,92,56,0.04); }
 }
 .svip-price-tag::before { content: '✦'; font-size: 0.75rem; }
 
+/* ---------- 专属老粉动感勋章 ---------- */
+@keyframes fan-rainbow-shift {
+  0%   { background-position: 0% 50%; transform: translateZ(0); }
+  50%  { background-position: 100% 50%; transform: translateZ(0) scale(1.02); }
+  100% { background-position: 0% 50%; transform: translateZ(0); }
+}
+@keyframes fan-soft-pulse {
+  0%, 100% { box-shadow: 0 0 8px rgba(209, 88, 255, 0.35), 0 0 18px rgba(73, 190, 255, 0.22); }
+  50%      { box-shadow: 0 0 16px rgba(209, 88, 255, 0.62), 0 0 28px rgba(73, 190, 255, 0.45); }
+}
+@keyframes shine-sweep {
+  0%, 35%   { transform: translateX(-120%); }
+  60%, 100% { transform: translateX(120%); }
+}
+.fan-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.7rem;
+  font-weight: 850;
+  letter-spacing: 0.04em;
+  color: #fff;
+  background: linear-gradient(120deg, #8a4fff, #ff5fc8, #49beff, #6ee7b7, #8a4fff);
+  background-size: 320% 100%;
+  animation: fan-rainbow-shift 3.6s ease-in-out infinite, fan-soft-pulse 2.6s ease-in-out infinite;
+  border: 1px solid rgba(255,255,255,0.38);
+  text-shadow: 0 1px 6px rgba(0,0,0,0.28);
+  white-space: nowrap;
+}
+.fan-badge::before {
+  content: '💎';
+  font-size: 0.8rem;
+  filter: drop-shadow(0 0 4px rgba(255,255,255,0.7));
+}
+.fan-badge-sm { font-size: 0.62rem; padding: 0.12rem 0.45rem; }
+.fan-badge-lg { font-size: 0.82rem; padding: 0.3rem 0.8rem; }
+
+.fan-avatar-ring {
+  position: relative;
+}
+.fan-avatar-ring::before {
+  content: '';
+  position: absolute;
+  inset: -5px;
+  border-radius: inherit;
+  background: conic-gradient(from 0deg, #8a4fff, #ff5fc8, #49beff, #6ee7b7, #8a4fff);
+  animation: fan-rainbow-shift 4s linear infinite;
+  z-index: -2;
+  opacity: 0.85;
+}
+.user-chip-fan {
+  background: linear-gradient(135deg, rgba(138,79,255,0.18), rgba(255,95,200,0.12), rgba(73,190,255,0.12));
+}
+.fan-price-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.22rem 0.55rem;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  font-weight: 800;
+  color: #fff;
+  background: linear-gradient(120deg, #8a4fff, #ff5fc8, #49beff, #8a4fff);
+  background-size: 320% 100%;
+  animation: fan-rainbow-shift 3.8s ease-in-out infinite;
+  border: 1px solid rgba(255,255,255,0.3);
+}
+.fan-price-tag::before { content: '💎'; font-size: 0.75rem; }
+
+.fan-claim-card {
+  position: relative;
+  overflow: hidden;
+  border: 1px solid rgba(138,79,255,0.28);
+  background:
+    radial-gradient(circle at 10% 0%, rgba(255,95,200,0.16), transparent 30%),
+    radial-gradient(circle at 90% 20%, rgba(73,190,255,0.14), transparent 28%),
+    var(--bg-card);
+}
+.fan-claim-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(110deg, transparent 0%, rgba(255,255,255,0.12) 45%, transparent 60%);
+  transform: translateX(-100%);
+  animation: shine-sweep 4.6s ease-in-out infinite;
+  pointer-events: none;
+}
+.fan-progress {
+  height: 8px;
+  background: rgba(138,79,255,0.12);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-top: 0.6rem;
+}
+.fan-progress > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #8a4fff, #ff5fc8, #49beff);
+  transition: width .25s ease;
+}
+
 /* ---------- 公告卡片（玻璃拟态大升级） ---------- */
 @keyframes announcement-pulse {
   0%, 100% { transform: scale(1); }
@@ -1734,4 +1859,3 @@ tr:hover td { background: rgba(184,92,56,0.04); }
   margin-right: 0.35rem;
   font-weight: 500;
 }
-

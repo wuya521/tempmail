@@ -88,6 +88,7 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 	}
 	plist, _ := h.store.ListClaudeShopProductsPublic(ctx)
 	stockMap, unassigned, _ := h.store.GetProductStockMap(ctx)
+	fanCfg := h.store.GetExclusiveFanConfig(ctx)
 	products := make([]gin.H, 0, len(plist))
 	for _, p := range plist {
 		ps := stockMap[p.ID.String()]
@@ -136,6 +137,10 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		"static_qr_enabled":             cfg.StaticQREnabled,
 		"products":                      products,
 		"product_pick_required":         len(products) > 0,
+		"exclusive_fan_enabled":         fanCfg.Enabled,
+		"exclusive_fan_min_orders":      fanCfg.MinOrders,
+		"exclusive_fan_discount_bps":    fanCfg.DiscountBps,
+		"exclusive_fan_discount_fold":   fanDiscountFold(fanCfg.DiscountBps),
 	}
 	c.JSON(http.StatusOK, out)
 }
@@ -379,9 +384,12 @@ func (h *ClaudeShopHandler) CreateOrder(c *gin.Context) {
 		userCouponPtr = &ucid
 	}
 
+	fanCfg := h.store.GetExclusiveFanConfig(ctx)
 	o, err := h.store.CreateClaudeOrder(ctx, acc.ID, req.Quantity, payCh, prodPtr, store.CreateClaudeOrderOptions{
-		SVIPActive:   acc.IsSVIP(),
-		UserCouponID: userCouponPtr,
+		SVIPActive:              acc.IsSVIP(),
+		ExclusiveFanActive:      acc.IsExclusiveFan() && fanCfg.Enabled,
+		ExclusiveFanDiscountBps: fanCfg.DiscountBps,
+		UserCouponID:            userCouponPtr,
 	})
 	if err != nil {
 		switch {

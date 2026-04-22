@@ -22,12 +22,16 @@ CREATE TABLE accounts (
     svip_level          SMALLINT    NOT NULL DEFAULT 0,       -- 0=普通 1=SVIP
     svip_expires_at     TIMESTAMPTZ,                          -- NULL 且 level>0=永久
     mailbox_quota       INT         NOT NULL DEFAULT 0,       -- 0=默认, -1=无限, 正数=专属上限
-    mailbox_ttl_minutes INT                                    -- NULL=默认, 0=永久, 正数=专属 TTL
+    mailbox_ttl_minutes INT,                                   -- NULL=默认, 0=永久, 正数=专属 TTL
+    -- v11：专属老粉认证
+    exclusive_fan_level      SMALLINT   NOT NULL DEFAULT 0,    -- 0=未认证 1=专属老粉
+    exclusive_fan_claimed_at TIMESTAMPTZ
 );
 
 -- API Key 查询走 B-tree 索引（认证热路径）
 CREATE INDEX idx_accounts_api_key ON accounts (api_key);
 CREATE INDEX idx_accounts_svip    ON accounts (svip_level) WHERE svip_level > 0;
+CREATE INDEX idx_accounts_exclusive_fan ON accounts (exclusive_fan_level) WHERE exclusive_fan_level > 0;
 
 -- ============================================================
 -- 2. 域名池表 (domains)
@@ -111,6 +115,9 @@ INSERT INTO app_settings (key, value) VALUES ('announcement', '') ON CONFLICT DO
 INSERT INTO app_settings (key, value) VALUES ('announcement_title', '') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('announcement_level', 'info') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('site_title', 'TempMail') ON CONFLICT DO NOTHING;
+INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_enabled', 'true') ON CONFLICT DO NOTHING;
+INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_min_orders', '3') ON CONFLICT DO NOTHING;
+INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_discount_bps', '9500') ON CONFLICT DO NOTHING;
 
 -- ============================================================
 -- 8. Claude 自助售号（店铺配置、库存、订单）
@@ -235,6 +242,7 @@ CREATE TABLE coupons (
     svip_only            BOOLEAN      NOT NULL DEFAULT FALSE,
     new_user_gift        BOOLEAN      NOT NULL DEFAULT FALSE,
     svip_gift            BOOLEAN      NOT NULL DEFAULT FALSE,
+    fan_gift             BOOLEAN      NOT NULL DEFAULT FALSE,
     enabled              BOOLEAN      NOT NULL DEFAULT TRUE,
     created_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
     updated_at           TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
@@ -245,6 +253,7 @@ CREATE INDEX idx_coupons_code      ON coupons (code)    WHERE code IS NOT NULL;
 CREATE INDEX idx_coupons_enabled   ON coupons (enabled) WHERE enabled = TRUE;
 CREATE INDEX idx_coupons_new_user  ON coupons (new_user_gift, enabled) WHERE new_user_gift = TRUE AND enabled = TRUE;
 CREATE INDEX idx_coupons_svip_gift ON coupons (svip_gift,     enabled) WHERE svip_gift     = TRUE AND enabled = TRUE;
+CREATE INDEX idx_coupons_fan_gift  ON coupons (fan_gift,      enabled) WHERE fan_gift      = TRUE AND enabled = TRUE;
 
 -- 订单优惠券外键
 ALTER TABLE claude_orders

@@ -33,7 +33,7 @@ var (
 
 const couponColumns = `id, code, name, description, discount_type, discount_value,
 	min_order_cents, max_discount_cents, total_quota, used_count, per_user_limit,
-	starts_at, expires_at, svip_only, new_user_gift, svip_gift, enabled, created_at, updated_at`
+	starts_at, expires_at, svip_only, new_user_gift, svip_gift, fan_gift, enabled, created_at, updated_at`
 
 const userCouponColumns = `id, account_id, coupon_id, status, order_id, acquired_at, used_at,
 	snapshot_name, snapshot_discount_type, snapshot_discount_value,
@@ -48,7 +48,7 @@ func scanCoupon(row interface {
 	if err := row.Scan(
 		&c.ID, &code, &c.Name, &c.Description, &c.DiscountType, &c.DiscountValue,
 		&c.MinOrderCents, &c.MaxDiscountCents, &c.TotalQuota, &c.UsedCount, &c.PerUserLimit,
-		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.Enabled,
+		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.FanGift, &c.Enabled,
 		&c.CreatedAt, &c.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -175,12 +175,12 @@ func (s *Store) CreateCoupon(ctx context.Context, c *model.Coupon) (*model.Coupo
 		INSERT INTO coupons (
 			code, name, description, discount_type, discount_value,
 			min_order_cents, max_discount_cents, total_quota, per_user_limit,
-			starts_at, expires_at, svip_only, new_user_gift, svip_gift, enabled
-		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+			starts_at, expires_at, svip_only, new_user_gift, svip_gift, fan_gift, enabled
+		) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)
 		RETURNING `+couponColumns,
 		code, c.Name, c.Description, c.DiscountType, c.DiscountValue,
 		c.MinOrderCents, c.MaxDiscountCents, c.TotalQuota, c.PerUserLimit,
-		c.StartsAt, c.ExpiresAt, c.SVIPOnly, c.NewUserGift, c.SVIPGift, c.Enabled,
+		c.StartsAt, c.ExpiresAt, c.SVIPOnly, c.NewUserGift, c.SVIPGift, c.FanGift, c.Enabled,
 	)
 	return scanCoupon(row)
 }
@@ -199,12 +199,12 @@ func (s *Store) UpdateCoupon(ctx context.Context, c *model.Coupon) (*model.Coupo
 			code = $2, name = $3, description = $4, discount_type = $5, discount_value = $6,
 			min_order_cents = $7, max_discount_cents = $8, total_quota = $9, per_user_limit = $10,
 			starts_at = $11, expires_at = $12, svip_only = $13, new_user_gift = $14,
-			svip_gift = $15, enabled = $16, updated_at = NOW()
+			svip_gift = $15, fan_gift = $16, enabled = $17, updated_at = NOW()
 		WHERE id = $1
 		RETURNING `+couponColumns,
 		c.ID, code, c.Name, c.Description, c.DiscountType, c.DiscountValue,
 		c.MinOrderCents, c.MaxDiscountCents, c.TotalQuota, c.PerUserLimit,
-		c.StartsAt, c.ExpiresAt, c.SVIPOnly, c.NewUserGift, c.SVIPGift, c.Enabled,
+		c.StartsAt, c.ExpiresAt, c.SVIPOnly, c.NewUserGift, c.SVIPGift, c.FanGift, c.Enabled,
 	)
 	return scanCoupon(row)
 }
@@ -269,7 +269,7 @@ func (s *Store) RedeemCoupon(ctx context.Context, accountID uuid.UUID, code stri
 	err = tx.QueryRow(ctx, `SELECT `+couponColumns+` FROM coupons WHERE code = $1 FOR UPDATE`, code).Scan(
 		&c.ID, &nc, &c.Name, &c.Description, &c.DiscountType, &c.DiscountValue,
 		&c.MinOrderCents, &c.MaxDiscountCents, &c.TotalQuota, &c.UsedCount, &c.PerUserLimit,
-		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.Enabled,
+		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.FanGift, &c.Enabled,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
@@ -346,7 +346,7 @@ func (s *Store) GrantCouponDirect(ctx context.Context, accountID uuid.UUID, coup
 	err = tx.QueryRow(ctx, `SELECT `+couponColumns+` FROM coupons WHERE id = $1 FOR UPDATE`, couponID).Scan(
 		&c.ID, &nc, &c.Name, &c.Description, &c.DiscountType, &c.DiscountValue,
 		&c.MinOrderCents, &c.MaxDiscountCents, &c.TotalQuota, &c.UsedCount, &c.PerUserLimit,
-		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.Enabled,
+		&c.StartsAt, &c.ExpiresAt, &c.SVIPOnly, &c.NewUserGift, &c.SVIPGift, &c.FanGift, &c.Enabled,
 		&c.CreatedAt, &c.UpdatedAt,
 	)
 	if err != nil {
@@ -515,6 +515,8 @@ func (s *Store) GrantAutoGifts(ctx context.Context, accountID uuid.UUID, flag st
 		col = "new_user_gift"
 	case "svip":
 		col = "svip_gift"
+	case "fan":
+		col = "fan_gift"
 	default:
 		return 0, fmt.Errorf("invalid flag: %s", flag)
 	}

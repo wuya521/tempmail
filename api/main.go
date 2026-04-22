@@ -87,6 +87,7 @@ func main() {
 	registerH := handler.NewRegisterHandler(db)
 	statsH   := handler.NewStatsHandler(db)
 	couponH  := handler.NewCouponHandler(db)
+	fanH     := handler.NewFanHandler(db)
 	// v10：授予 SVIP 成功时自动发放 svip_gift 优惠券
 	handler.SetSVIPGiftHook(handler.GrantSVIPGiftsHook)
 	var ali *alipay.Client
@@ -148,6 +149,8 @@ func main() {
 		api.GET("/coupons/mine", couponH.MyList)
 		api.POST("/coupons/redeem", couponH.Redeem)
 		api.POST("/coupons/quote", couponH.Quote)
+		api.GET("/fan/status", fanH.Status)
+		api.POST("/fan/claim", fanH.Claim)
 
 		// 域名池（所有用户可查看）
 		api.GET("/domains", domainH.List)

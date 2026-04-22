@@ -43,6 +43,8 @@ const state = {
   _claudeShopSummary: null,
   /** 支付宝当面付订单轮询定时器 */
   claudeAlipayPollTimer: null,
+  /** 专属老粉认证状态缓存 */
+  exclusiveFanStatus: null,
   /** 站点显示名（来自 /public/settings site_title，用于标题栏与登录页等） */
   siteTitle: 'TempMail',
   // 当前邮箱
@@ -178,6 +180,26 @@ function formatDate(s) {
   if (!s) return '—';
   const d = new Date(s);
   return d.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+}
+
+function accountIsSVIP(a = state.account) {
+  if (!a || (a.svip_level || 0) <= 0) return false;
+  if (a.svip_expires_at && new Date(a.svip_expires_at) < new Date()) return false;
+  return true;
+}
+
+function accountIsExclusiveFan(a = state.account) {
+  return !!(a && (a.exclusive_fan_level || 0) > 0);
+}
+
+function fanDiscountFoldFromBps(bps) {
+  const n = Number(bps || 10000);
+  return Math.max(1, Math.min(10, n / 1000));
+}
+
+function formatFanDiscount(bps) {
+  const fold = fanDiscountFoldFromBps(bps);
+  return `${Number.isInteger(fold) ? fold.toFixed(0) : fold.toFixed(1)} 折`;
 }
 
 function timeAgo(s) {
@@ -421,6 +443,8 @@ const api = {
     method: 'POST',
     body: JSON.stringify({ user_coupon_id: userCouponId, original_cents: originalCents }),
   }),
+  fanStatus: () => apiFetch(API_BASE + '/fan/status'),
+  fanClaim:  () => apiFetch(API_BASE + '/fan/claim', { method: 'POST', body: '{}' }),
   admin: {
     // v10：账户列表支持 status 筛选（all/active/banned/svip）
     listAccounts:  (page=1,size=10,q='',status='') => {
@@ -551,10 +575,18 @@ function applyTheme(t) {
 }
 
 // ─── 认证 ─────────────────────────────────────────────────────
+async function refreshAccountSnapshot() {
+  if (!state.apiKey) return null;
+  const acct = await api.me();
+  state.account = acct;
+  localStorage.setItem('tm_account', JSON.stringify(acct));
+  return acct;
+}
+
 async function tryLogin(key) {
   state.apiKey = key;
   try {
-    const acct = await apiFetch(API_BASE + '/me');
+    const acct = await refreshAccountSnapshot();
     state.account = acct;
     localStorage.setItem('tm_apikey', key);
     localStorage.setItem('tm_account', JSON.stringify(acct));
@@ -756,8 +788,12 @@ function buildMainLayout() {
 
   const isAdmin = state.account?.is_admin;
   const username = state.account?.username || '用户';
-  const isSVIP = (state.account?.svip_level || 0) > 0 &&
-    (!state.account?.svip_expires_at || new Date(state.account.svip_expires_at) > new Date());
+  const isSVIP = accountIsSVIP();
+  const isFan = accountIsExclusiveFan();
+  const roleText = isAdmin ? '管理员' : [
+    isSVIP ? 'SVIP 会员' : '',
+    isFan ? '专属老粉' : '',
+  ].filter(Boolean).join(' · ') || '普通用户';
 
   // sidebar
   layout.innerHTML = `
@@ -814,14 +850,15 @@ function buildMainLayout() {
         ` : ''}
       </div>
       <div class="sidebar-bottom">
-        <div class="user-chip">
-          <div class="user-avatar ${isSVIP ? 'svip-avatar-ring' : ''}">${username.charAt(0).toUpperCase()}</div>
+        <div class="user-chip ${isFan ? 'user-chip-fan' : ''}">
+          <div class="user-avatar ${isSVIP ? 'svip-avatar-ring' : ''} ${isFan ? 'fan-avatar-ring' : ''}">${username.charAt(0).toUpperCase()}</div>
           <div class="user-chip-info">
             <div class="user-chip-name">
               ${escHtml(username)}
               ${isSVIP ? '<span class="svip-badge svip-badge-sm" style="margin-left:4px">SVIP</span>' : ''}
+              ${isFan ? '<span class="fan-badge fan-badge-sm" style="margin-left:4px">专属老粉</span>' : ''}
             </div>
-            <div class="user-chip-role">${isAdmin ? '管理员' : (isSVIP ? 'SVIP 会员' : '普通用户')}</div>
+            <div class="user-chip-role">${escHtml(roleText)}</div>
           </div>
         </div>
         <button class="btn-logout" onclick="logout()">⏏ 退出登录</button>
@@ -972,6 +1009,7 @@ async function renderDashboard(container) {
   const annHtml    = buildAnnouncementHtml(annContent, annLevel, annTitle);
 
   container.innerHTML = `
+    ${buildIdentityHero()}
     ${annHtml}
     <div class="stat-grid" style="grid-template-columns:repeat(auto-fill,minmax(140px,1fr))">
       ${statCards.map(s => `
@@ -1000,6 +1038,29 @@ async function renderDashboard(container) {
       </div>
     `}
   `;
+}
+
+function buildIdentityHero() {
+  const badges = [];
+  if (accountIsSVIP()) {
+    const exp = state.account?.svip_expires_at ? ` · 到期 ${formatDate(state.account.svip_expires_at)}` : ' · 永久有效';
+    badges.push(`<span class="svip-badge">SVIP${exp}</span>`);
+  }
+  if (accountIsExclusiveFan()) {
+    const claimed = state.account?.exclusive_fan_claimed_at ? ` · 领取于 ${formatDate(state.account.exclusive_fan_claimed_at)}` : '';
+    badges.push(`<span class="fan-badge">专属老粉${claimed}</span>`);
+  }
+  if (!badges.length) return '';
+  return `
+    <div class="card fan-claim-card" style="margin-bottom:0.8rem">
+      <div class="card-body" style="display:flex;align-items:center;justify-content:space-between;gap:0.8rem;flex-wrap:wrap">
+        <div>
+          <div style="font-weight:800;margin-bottom:0.35rem">身份已点亮</div>
+          <div style="display:flex;gap:0.45rem;flex-wrap:wrap">${badges.join('')}</div>
+        </div>
+        <button class="btn btn-ghost btn-sm" onclick="navigate('my-coupons')">查看权益</button>
+      </div>
+    </div>`;
 }
 
 function buildMailboxCard(mb) {
@@ -1561,7 +1622,7 @@ window.showGrantSVIPModal = function(id, username, curLevel, curExpires) {
     </div>
     ${isSVIP && curExpires ? `<div class="form-hint">当前到期：${formatDate(curExpires)}</div>` : ''}
     ${isSVIP && !curExpires && curLevel>0 ? `<div class="form-hint">当前为永久 SVIP</div>` : ''}
-    ${isSVIP ? `<div style="margin-top:1rem"><button class="btn btn-danger btn-sm" onclick="revokeSVIP('${id}', ${JSON.stringify(username)})">撤销 SVIP</button></div>` : ''}
+    ${isSVIP ? `<div style="margin-top:1rem"><button type="button" class="btn btn-danger btn-sm" onclick="revokeSVIP('${id}', ${JSON.stringify(username)})">撤销 SVIP</button></div>` : ''}
   `, async () => {
     const sel = $('svip-duration')?.value || '30';
     let days = null;
@@ -1575,8 +1636,13 @@ window.showGrantSVIPModal = function(id, username, curLevel, curExpires) {
     try {
       const body = { level: 1 };
       if (forever) {} else if (days) body.duration_days = days;
-      await api.admin.grantSVIP(id, body);
-      toast('SVIP 已更新', 'success');
+      const r = await api.admin.grantSVIP(id, body);
+      if (state.account && String(state.account.id) === String(id) && r.account) {
+        state.account = r.account;
+        localStorage.setItem('tm_account', JSON.stringify(r.account));
+        await showMainLayout();
+      }
+      toast(r.message || 'SVIP 已更新', 'success');
       navigate('admin-accounts');
     } catch(e) { toast('失败：' + (e.message||''), 'error'); return false; }
   });
@@ -1585,8 +1651,13 @@ window.showGrantSVIPModal = function(id, username, curLevel, curExpires) {
 window.revokeSVIP = async function(id, username) {
   if (!confirm('确定撤销 ' + username + ' 的 SVIP 身份？')) return;
   try {
-    await api.admin.grantSVIP(id, { level: 0 });
-    toast('SVIP 已撤销', 'success');
+    const r = await api.admin.grantSVIP(id, { level: 0 });
+    if (state.account && String(state.account.id) === String(id) && r.account) {
+      state.account = r.account;
+      localStorage.setItem('tm_account', JSON.stringify(r.account));
+      await showMainLayout();
+    }
+    toast(r.message || 'SVIP 已撤销', 'success');
     closeModal();
     navigate('admin-accounts');
   } catch(e) { toast('撤销失败：' + (e.message||''), 'error'); }
@@ -1659,6 +1730,12 @@ function renderAccountBadges(a) {
       ? ` title="到期 ${formatDate(a.svip_expires_at)}"`
       : ' title="永久 SVIP"';
     parts.push(`<span class="svip-badge svip-badge-sm"${expHint}>SVIP</span>`);
+  }
+  if ((a.exclusive_fan_level || 0) > 0) {
+    const fanHint = a.exclusive_fan_claimed_at
+      ? ` title="领取于 ${formatDate(a.exclusive_fan_claimed_at)}"`
+      : ' title="专属老粉"';
+    parts.push(`<span class="fan-badge fan-badge-sm"${fanHint}>专属老粉</span>`);
   }
   return parts.join(' ');
 }
@@ -2048,6 +2125,9 @@ async function renderAdminSettings(container) {
   const annTitle   = settings.announcement_title    || '';
   const annLevel   = settings.announcement_level    || 'info';
   const maxMb      = settings.max_mailboxes_per_user|| '5';
+  const fanEnabled = settings.exclusive_fan_enabled !== 'false';
+  const fanMinOrders = settings.exclusive_fan_min_orders || '3';
+  const fanDiscountFold = fanDiscountFoldFromBps(settings.exclusive_fan_discount_bps || 9500);
 
   function inputRow(id, label, value, hint, placeholder = '', settingKey = '') {
     const key = settingKey || id.replace(/^input-/, '').replace(/-/g, '_');
@@ -2135,6 +2215,34 @@ async function renderAdminSettings(container) {
         ${inputRow('input-max-mailboxes-per-user', '每账户邮箱上限', maxMb, '每个账户同时存在的邮箱数量上限', '5')}
         <div class="divider"></div>
 
+        <!-- 专属老粉认证 -->
+        <div class="form-group">
+          <label class="form-label">💎 专属老粉认证</label>
+          <div class="toggle-wrap" style="margin-bottom:0.8rem">
+            <label class="toggle">
+              <input type="checkbox" id="fan-enabled" ${fanEnabled ? 'checked' : ''}>
+              <span class="toggle-slider"></span>
+            </label>
+            <div>
+              <div class="toggle-label">开放用户自行领取</div>
+              <span class="toggle-desc">达到购买次数后，用户可在「我的优惠券」页面领取专属老粉身份</span>
+            </div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0.6rem;align-items:end">
+            <div>
+              <label class="form-label" style="font-size:0.78rem">已发货订单满几笔</label>
+              <input type="number" min="1" class="form-input" id="fan-min-orders" value="${escHtml(fanMinOrders)}" />
+            </div>
+            <div>
+              <label class="form-label" style="font-size:0.78rem">商品折扣（几折）</label>
+              <input type="number" min="1" max="10" step="0.1" class="form-input" id="fan-discount-fold" value="${fanDiscountFold.toFixed(1)}" />
+            </div>
+            <button class="btn btn-primary btn-sm" onclick="saveExclusiveFanSettings()">✓ 保存</button>
+          </div>
+          <div class="form-hint">例如 9.5 = 九五折，8.8 = 八八折；需要赠送优惠券时，在「优惠券管理」勾选“专属老粉认证时自动赠送”。</div>
+        </div>
+        <div class="divider"></div>
+
         <!-- 服务信息 -->
         <div style="font-size:0.82rem;color:var(--text-secondary)">
           <strong>服务信息</strong>
@@ -2181,6 +2289,23 @@ window.saveSetting = async function(inputId, settingKey) {
   } catch(e) { toast('保存失败: ' + e.message, 'error'); }
 };
 
+window.saveExclusiveFanSettings = async function() {
+  const enabled = $('fan-enabled')?.checked ? 'true' : 'false';
+  const minOrders = Math.max(1, parseInt($('fan-min-orders')?.value || '3', 10) || 3);
+  const fold = Math.max(1, Math.min(10, parseFloat($('fan-discount-fold')?.value || '9.5') || 9.5));
+  const bps = Math.round(fold * 1000); // 10折=10000，9.5折=9500
+  try {
+    await api.admin.saveSettings({
+      exclusive_fan_enabled: enabled,
+      exclusive_fan_min_orders: String(minOrders),
+      exclusive_fan_discount_bps: String(bps),
+    });
+    toast('专属老粉规则已保存', 'success');
+  } catch(e) {
+    toast('保存失败: ' + e.message, 'error');
+  }
+};
+
 // 兼容旧调用
 window.saveSmtpIp = async function() { await window.saveSetting('input-smtp-ip', 'smtp_server_ip'); };
 
@@ -2205,7 +2330,7 @@ function showModal(title, bodyHtml, onConfirm) {
     <div class="modal">
       <div class="modal-title">${escHtml(title)}</div>
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
-      ${bodyHtml}
+      <div class="modal-body">${bodyHtml}</div>
       <div class="modal-actions">
         <button class="btn btn-ghost" onclick="this.closest('.modal-overlay').remove()">取消</button>
         <button class="btn btn-primary" id="modal-confirm-btn">确认</button>
@@ -2218,7 +2343,7 @@ function showModal(title, bodyHtml, onConfirm) {
   const confirmBtn = overlay.querySelector('#modal-confirm-btn');
   confirmBtn.addEventListener('click', async () => {
     confirmBtn.disabled = true;
-    const result = await onConfirm();
+    const result = onConfirm ? await onConfirm() : undefined;
     if (result !== false) overlay.remove();
     else confirmBtn.disabled = false;
   });
@@ -2747,10 +2872,12 @@ window.claudeShopSelectProduct = function(id) {
 
 /** v10：当前账户是否 SVIP（用于 SVIP 专享价展示） */
 function currentAccountIsSVIP() {
-  const a = state.account;
-  if (!a || (a.svip_level || 0) <= 0) return false;
-  if (a.svip_expires_at && new Date(a.svip_expires_at) < new Date()) return false;
-  return true;
+  return accountIsSVIP();
+}
+
+/** v11：当前账户是否专属老粉 */
+function currentAccountIsExclusiveFan() {
+  return accountIsExclusiveFan();
 }
 
 window.claudeShopPriceRefresh = function() {
@@ -2759,6 +2886,8 @@ window.claudeShopPriceRefresh = function() {
   const qty = Math.max(1, Math.min(999, parseInt($('claude-shop-qty')?.value || '1', 10) || 1));
   const picked = claudeShopGetSelectedProduct(s);
   const isSVIP = currentAccountIsSVIP();
+  const isFan = currentAccountIsExclusiveFan() && s.exclusive_fan_enabled !== false;
+  const fanBps = Number(s.exclusive_fan_discount_bps || 10000);
   let minW, retailY, wholesaleY, svipY;
   if (picked) {
     minW = picked.wholesale_min_qty || 5;
@@ -2774,12 +2903,19 @@ window.claudeShopPriceRefresh = function() {
   }
   const isWs = qty >= minW;
   let unit = isWs ? wholesaleY : retailY;
-  let discountSource = null; // 'svip' | 'wholesale' | null
+  let discountSource = null; // 'svip' | 'fan' | 'wholesale' | null
   if (isSVIP && svipY !== null && svipY >= 0 && svipY < unit) {
     unit = svipY;
     discountSource = 'svip';
   } else if (isWs) {
     discountSource = 'wholesale';
+  }
+  if (isFan && fanBps > 0 && fanBps < 10000) {
+    const fanUnit = Math.round(unit * fanBps) / 10000;
+    if (fanUnit < unit) {
+      unit = fanUnit;
+      discountSource = 'fan';
+    }
   }
   const total = unit * qty;
 
@@ -2823,13 +2959,18 @@ window.claudeShopPriceRefresh = function() {
   if (el2) {
     if (discountSource === 'svip') {
       el2.innerHTML = `<span class="svip-badge svip-badge-sm">SVIP</span> 已享 SVIP 专享价 ¥${unit.toFixed(2)} / 件 · 原价 <span style="text-decoration:line-through;color:var(--text-muted)">¥${retailY.toFixed(2)}</span>`;
+    } else if (discountSource === 'fan') {
+      el2.innerHTML = `<span class="fan-badge fan-badge-sm">专属老粉</span> 已享 ${formatFanDiscount(fanBps)} 商品权益 · 单价 ¥${unit.toFixed(2)} / 件`;
     } else if (isWs) {
       el2.textContent = `已享批发价（满 ${minW} 件）· 单价 ¥${unit.toFixed(2)}`;
     } else {
       const svipHint = svipY !== null && svipY >= 0 && svipY < retailY
         ? ` · SVIP 专享 ¥${svipY.toFixed(2)} / 件`
         : '';
-      el2.textContent = `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${wholesaleY.toFixed(2)} / 件${svipHint}`;
+      const fanHint = s.exclusive_fan_enabled && fanBps > 0 && fanBps < 10000
+        ? ` · 专属老粉 ${formatFanDiscount(fanBps)}`
+        : '';
+      el2.textContent = `零售单价 ¥${unit.toFixed(2)} · 满 ${minW} 件可享批发 ¥${wholesaleY.toFixed(2)} / 件${svipHint}${fanHint}`;
     }
   }
   // 优惠券说明区
@@ -3147,8 +3288,11 @@ async function renderClaudeShop(container) {
       const svipPriceTag = hasSVIPPrice
         ? `<span class="svip-price-tag">SVIP ¥${Number(p.svip_price_yuan).toFixed(2)}</span>`
         : '';
+      const fanPriceTag = summary.exclusive_fan_enabled && Number(summary.exclusive_fan_discount_bps || 10000) < 10000
+        ? `<span class="fan-price-tag">老粉 ${formatFanDiscount(summary.exclusive_fan_discount_bps)}</span>`
+        : '';
       return `<button type="button" class="shop-product-card${sel ? ' shop-product-card--selected' : ''}${outOfStock ? ' shop-product-card--disabled' : ''}" data-product-id="${escHtml(p.id)}" ${outOfStock ? 'disabled aria-disabled="true"' : ''} onclick="${outOfStock ? '' : `claudeShopSelectProduct('${escHtml(p.id)}')`}">
-        <div class="shop-product-card-head">${tagHtml}${svipPriceTag}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
+        <div class="shop-product-card-head">${tagHtml}${svipPriceTag}${fanPriceTag}<span class="shop-product-card-title">${escHtml(p.title)}</span></div>
         <p class="shop-product-card-desc">${escHtml(p.description || '')}</p>
         <div class="shop-product-card-prices">
           <span class="shop-product-card-retail">¥${Number(p.retail_price_yuan).toFixed(2)}<small>/件</small></span>
@@ -3159,8 +3303,11 @@ async function renderClaudeShop(container) {
     }).join('');
   } else {
     const selDef = state.claudeShopDefaultAck;
+    const fanDefaultTag = summary.exclusive_fan_enabled && Number(summary.exclusive_fan_discount_bps || 10000) < 10000
+      ? `<span class="fan-price-tag">老粉 ${formatFanDiscount(summary.exclusive_fan_discount_bps)}</span>`
+      : '';
     productGridHtml = `<button type="button" class="shop-product-card shop-product-card--default${selDef ? ' shop-product-card--selected' : ''}" data-default-product="1" onclick="claudeShopAckDefaultProduct()" aria-label="店铺默认商品，点击确认选购">
-      <div class="shop-product-card-head"><span class="shop-product-card-title">${escHtml(summary.title || 'Claude 账号')}</span></div>
+      <div class="shop-product-card-head">${fanDefaultTag}<span class="shop-product-card-title">${escHtml(summary.title || 'Claude 账号')}</span></div>
       <p class="shop-product-card-desc">${escHtml(summary.description || '')}</p>
       <div class="shop-product-card-prices">
         <span class="shop-product-card-retail">¥${Number(summary.retail_price_yuan).toFixed(2)}<small>/件</small></span>
@@ -4212,6 +4359,57 @@ window.redeemMyCouponCode = async function() {
   }
 };
 
+window.claimExclusiveFan = async function() {
+  try {
+    const r = await api.fanClaim();
+    if (r.account) {
+      state.account = r.account;
+      localStorage.setItem('tm_account', JSON.stringify(r.account));
+      await showMainLayout();
+    } else {
+      await refreshAccountSnapshot().catch(() => null);
+    }
+    const giftMsg = r.gifted_coupons > 0 ? `，并赠送 ${r.gifted_coupons} 张优惠券` : '';
+    toast((r.message || '领取成功') + giftMsg, 'success');
+    navigate('my-coupons');
+  } catch(e) {
+    toast(e.message || '领取失败，请稍后重试', e.status === 409 ? 'warn' : 'error');
+  }
+};
+
+function renderFanClaimCard(status) {
+  if (!status || !status.enabled) return '';
+  const min = Number(status.min_orders || 1);
+  const done = Number(status.fulfilled_orders || 0);
+  const pct = Math.max(0, Math.min(100, Math.round(done * 100 / Math.max(1, min))));
+  const claimed = !!status.claimed || accountIsExclusiveFan();
+  const discount = formatFanDiscount(status.exclusive_fan_discount_bps || 10000);
+  const title = claimed ? '💎 专属老粉认证已点亮' : '💎 专属老粉认证可领取';
+  const desc = claimed
+    ? `您已拥有专属老粉身份，购买商品自动享 ${discount} 权益。`
+    : `累计完成 ${min} 笔已发货订单后，可自行领取专属老粉认证，并自动点亮动感勋章。`;
+  const action = claimed
+    ? `<button class="btn btn-ghost btn-sm" onclick="navigate('claude-shop')">去商城享权益</button>`
+    : `<button class="btn btn-primary btn-sm" ${done >= min ? '' : 'disabled'} onclick="claimExclusiveFan()">${done >= min ? '立即领取认证' : `还差 ${Math.max(0, min - done)} 笔`}</button>`;
+  return `
+    <div class="card fan-claim-card">
+      <div class="card-body" style="position:relative;z-index:1">
+        <div style="display:flex;justify-content:space-between;gap:0.8rem;align-items:flex-start;flex-wrap:wrap">
+          <div style="min-width:240px;flex:1">
+            <div style="display:flex;align-items:center;gap:0.45rem;flex-wrap:wrap;margin-bottom:0.35rem">
+              <strong>${title}</strong>
+              ${claimed ? '<span class="fan-badge fan-badge-sm">专属老粉</span>' : `<span class="badge badge-gold">${escHtml(discount)}</span>`}
+            </div>
+            <div style="font-size:0.84rem;color:var(--text-secondary);line-height:1.65">${escHtml(desc)}</div>
+            <div class="fan-progress"><span style="width:${pct}%"></span></div>
+            <div style="font-size:0.76rem;color:var(--text-muted);margin-top:0.35rem">已完成 ${done} / ${min} 笔已发货订单</div>
+          </div>
+          <div style="display:flex;gap:0.45rem;align-items:center;flex-wrap:wrap">${action}</div>
+        </div>
+      </div>
+    </div>`;
+}
+
 /** 渲染单张用户优惠券卡片（参数是 user_coupon 对象） */
 function renderUserCouponCard(uc, opts = {}) {
   const expired = uc.snapshot_expires_at && new Date(uc.snapshot_expires_at) < new Date();
@@ -4255,7 +4453,11 @@ async function renderMyCoupons(container) {
     actions.innerHTML = `<button class="btn btn-ghost btn-sm" onclick="navigate('claude-shop')">🛒 自助商城</button>`;
   }
 
-  const res = await api.couponMine(status).catch(() => ({ data: [] }));
+  const [res, fanStatus] = await Promise.all([
+    api.couponMine(status).catch(() => ({ data: [] })),
+    api.fanStatus().catch(() => null),
+  ]);
+  state.exclusiveFanStatus = fanStatus;
   const list = res.data || [];
 
   const pills = [
@@ -4269,6 +4471,7 @@ async function renderMyCoupons(container) {
 
   container.innerHTML = `
     <div style="max-width:960px;display:flex;flex-direction:column;gap:1rem">
+      ${renderFanClaimCard(fanStatus)}
       <div class="card">
         <div class="card-header"><div class="card-title">🎟 输入优惠码领取</div></div>
         <div class="card-body">
@@ -4360,7 +4563,7 @@ window.showCouponEditor = function(existing) {
     min_order_cents: 0, max_discount_cents: 0,
     total_quota: 0, per_user_limit: 1,
     starts_at: null, expires_at: null,
-    svip_only: false, new_user_gift: false, svip_gift: false,
+    svip_only: false, new_user_gift: false, svip_gift: false, fan_gift: false,
     enabled: true,
   };
   const isEdit = !!existing;
@@ -4422,6 +4625,7 @@ window.showCouponEditor = function(existing) {
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem"><input type="checkbox" id="c-svip-only" ${c.svip_only?'checked':''} /> 仅 SVIP 可领/使用</label>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-new-user" ${c.new_user_gift?'checked':''} /> 新用户注册自动赠送</label>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-svip-gift" ${c.svip_gift?'checked':''} /> 授予 SVIP 时自动赠送</label>
+      <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-fan-gift" ${c.fan_gift?'checked':''} /> 领取专属老粉认证时自动赠送</label>
       <label style="display:flex;align-items:center;gap:0.5rem;font-size:0.88rem;margin-top:0.3rem"><input type="checkbox" id="c-enabled" ${c.enabled!==false?'checked':''} /> 启用</label>
     </div>
   `, async () => {
@@ -4438,6 +4642,7 @@ window.showCouponEditor = function(existing) {
       svip_only: $('c-svip-only').checked,
       new_user_gift: $('c-new-user').checked,
       svip_gift: $('c-svip-gift').checked,
+      fan_gift: $('c-fan-gift').checked,
       enabled: $('c-enabled').checked,
     };
     const exp = ($('c-expires').value || '').trim();
@@ -4491,6 +4696,7 @@ async function renderAdminCoupons(container) {
     if (c.svip_only) tags.push('<span class="svip-badge svip-badge-sm">SVIP 专享</span>');
     if (c.new_user_gift) tags.push('<span class="badge badge-green">新用户赠</span>');
     if (c.svip_gift) tags.push('<span class="badge badge-gold">SVIP 赠</span>');
+    if (c.fan_gift) tags.push('<span class="fan-badge fan-badge-sm">老粉赠</span>');
     if (c.code) tags.push(`<span class="coupon-card-code">${escHtml(c.code)}</span>`);
     const used = c.used_count || 0;
     const quota = c.total_quota || 0;
@@ -4547,6 +4753,7 @@ async function init() {
   applySiteBranding();
 
   if (state.apiKey && state.account) {
+    try { await refreshAccountSnapshot(); } catch { /* 保留本地快照，后续接口失败会提示 */ }
     await showMainLayout();
     applySiteBranding();
     navigate('dashboard');

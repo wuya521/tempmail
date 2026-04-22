@@ -61,14 +61,16 @@ func (s *Store) Close() {
 
 // accountColumns v10：统一 SELECT 列表顺序必须与 model.Account 字段顺序一致（pgx.RowToStructByPos 使用位置映射）
 const accountColumns = `id, username, api_key, is_admin, is_active, created_at, updated_at, last_seen_at,
-	svip_level, svip_expires_at, mailbox_quota, mailbox_ttl_minutes`
+	svip_level, svip_expires_at, mailbox_quota, mailbox_ttl_minutes,
+	exclusive_fan_level, exclusive_fan_claimed_at`
 
 func (s *Store) GetAccountByAPIKey(ctx context.Context, apiKey string) (*model.Account, error) {
 	var a model.Account
 	err := s.pool.QueryRow(ctx,
 		`SELECT `+accountColumns+` FROM accounts WHERE api_key = $1 AND is_active = TRUE`, apiKey,
 	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
-		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes,
+		&a.ExclusiveFanLevel, &a.ExclusiveFanClaimedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +83,8 @@ func (s *Store) GetAccountByAPIKeyAny(ctx context.Context, apiKey string) (*mode
 	err := s.pool.QueryRow(ctx,
 		`SELECT `+accountColumns+` FROM accounts WHERE api_key = $1`, apiKey,
 	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
-		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes,
+		&a.ExclusiveFanLevel, &a.ExclusiveFanClaimedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -118,7 +121,8 @@ func (s *Store) GetAccountByID(ctx context.Context, id uuid.UUID) (*model.Accoun
 	err := s.pool.QueryRow(ctx,
 		`SELECT `+accountColumns+` FROM accounts WHERE id = $1`, id,
 	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
-		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes,
+		&a.ExclusiveFanLevel, &a.ExclusiveFanClaimedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +137,8 @@ func (s *Store) CreateAccount(ctx context.Context, username string) (*model.Acco
 		 RETURNING `+accountColumns,
 		username, apiKey,
 	).Scan(&a.ID, &a.Username, &a.APIKey, &a.IsAdmin, &a.IsActive, &a.CreatedAt, &a.UpdatedAt, &a.LastSeenAt,
-		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes)
+		&a.SVIPLevel, &a.SVIPExpiresAt, &a.MailboxQuota, &a.MailboxTTLMinutes,
+		&a.ExclusiveFanLevel, &a.ExclusiveFanClaimedAt)
 	if err != nil {
 		return nil, err
 	}

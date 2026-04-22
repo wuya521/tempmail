@@ -162,11 +162,17 @@ func (h *AccountHandler) Patch(c *gin.Context) {
 func (h *AccountHandler) Me(c *gin.Context) {
 	account := middleware.GetAccount(c)
 	out := gin.H{
-		"id":           account.ID,
-		"username":     account.Username,
-		"is_admin":     account.IsAdmin,
-		"created_at":   account.CreatedAt,
-		"last_seen_at": account.LastSeenAt,
+		"id":                       account.ID,
+		"username":                 account.Username,
+		"is_admin":                 account.IsAdmin,
+		"created_at":               account.CreatedAt,
+		"last_seen_at":             account.LastSeenAt,
+		"svip_level":               account.SVIPLevel,
+		"svip_expires_at":          account.SVIPExpiresAt,
+		"mailbox_quota":            account.MailboxQuota,
+		"mailbox_ttl_minutes":      account.MailboxTTLMinutes,
+		"exclusive_fan_level":      account.ExclusiveFanLevel,
+		"exclusive_fan_claimed_at": account.ExclusiveFanClaimedAt,
 	}
 	c.JSON(http.StatusOK, out)
 }

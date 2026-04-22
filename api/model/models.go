@@ -22,6 +22,9 @@ type Account struct {
 	SVIPExpiresAt     *time.Time `json:"svip_expires_at,omitempty"`
 	MailboxQuota      int        `json:"mailbox_quota"`              // 0=默认，-1=无限，正数=专属
 	MailboxTTLMinutes *int       `json:"mailbox_ttl_minutes,omitempty"` // NULL=默认
+	// v11：专属老粉认证
+	ExclusiveFanLevel     int        `json:"exclusive_fan_level"`
+	ExclusiveFanClaimedAt *time.Time `json:"exclusive_fan_claimed_at,omitempty"`
 }
 
 // IsSVIP 判断当前是否处于有效 SVIP 期
@@ -33,6 +36,11 @@ func (a *Account) IsSVIP() bool {
 		return false
 	}
 	return true
+}
+
+// IsExclusiveFan 判断当前账号是否已领取“专属老粉”认证。
+func (a *Account) IsExclusiveFan() bool {
+	return a != nil && a.ExclusiveFanLevel > 0
 }
 
 // ClaudeOrder 自助售号订单
@@ -245,6 +253,7 @@ type Coupon struct {
 	SVIPOnly          bool       `json:"svip_only"`
 	NewUserGift       bool       `json:"new_user_gift"`
 	SVIPGift          bool       `json:"svip_gift"`
+	FanGift           bool       `json:"fan_gift"`
 	Enabled           bool       `json:"enabled"`
 	CreatedAt         time.Time  `json:"created_at"`
 	UpdatedAt         time.Time  `json:"updated_at"`

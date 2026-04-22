@@ -149,6 +149,7 @@ type adminCouponReq struct {
 	SVIPOnly         bool    `json:"svip_only"`
 	NewUserGift      bool    `json:"new_user_gift"`
 	SVIPGift         bool    `json:"svip_gift"`
+	FanGift          bool    `json:"fan_gift"`
 	Enabled          *bool   `json:"enabled"`
 }
 
@@ -180,6 +181,7 @@ func (req *adminCouponReq) toModel(existing *model.Coupon) (*model.Coupon, error
 		SVIPOnly:         req.SVIPOnly,
 		NewUserGift:      req.NewUserGift,
 		SVIPGift:         req.SVIPGift,
+		FanGift:          req.FanGift,
 		Enabled:          true,
 	}
 	if req.PerUserLimit <= 0 {

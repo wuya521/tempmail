@@ -507,8 +507,8 @@ func (s *Store) ImportClaudeInventoryPayload(ctx context.Context, payloads []map
 			return n, err
 		}
 		_, err = tx.Exec(ctx,
-			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, payload) VALUES ('', '', $1, $2, $3)`,
-			batchLabel, productID, raw,
+			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, payload) VALUES ('', '', $1, $2, $3::jsonb)`,
+			batchLabel, productID, string(raw),
 		)
 		if err != nil {
 			return n, err
@@ -595,8 +595,10 @@ func (s *Store) SumFulfilledClaudeQuantityForAccount(ctx context.Context, accoun
 //	SVIPActive: 当前账户是否处于有效 SVIP 期（由上层传入，便于使用 svip_price_cents）
 //	UserCouponID: 用户选择的优惠券（user_coupons.id）；nil 表示不使用券
 type CreateClaudeOrderOptions struct {
-	SVIPActive   bool
-	UserCouponID *uuid.UUID
+	SVIPActive             bool
+	ExclusiveFanActive     bool
+	ExclusiveFanDiscountBps int
+	UserCouponID           *uuid.UUID
 }
 
 // CreateClaudeOrder 创建待支付订单（不预占库存）。paymentChannel: static | alipay_precreate；存在启用 SKU 时 productID 必填
@@ -684,6 +686,12 @@ func (s *Store) CreateClaudeOrder(ctx context.Context, accountID uuid.UUID, quan
 		unit = cfg.RetailPriceCents
 		if wholesale {
 			unit = cfg.WholesalePriceCents
+		}
+	}
+	if opts.ExclusiveFanActive && opts.ExclusiveFanDiscountBps > 0 && opts.ExclusiveFanDiscountBps < 10000 {
+		fanUnit := (unit*opts.ExclusiveFanDiscountBps + 5000) / 10000
+		if fanUnit < unit {
+			unit = fanUnit
 		}
 	}
 	availFor, err := s.CountClaudeInventoryAvailableFor(ctx, prodRef)
@@ -1049,11 +1057,11 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		// 空 payload 落库为 NULL（复用 SQL 默认值），否则原样写入
 		var payloadArg interface{}
 		if len(p.payload) > 0 {
-			payloadArg = p.payload
+			payloadArg = string(p.payload)
 		}
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO claude_order_lines (order_id, line_index, email, api_key, delivery_type, payload)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
+			VALUES ($1, $2, $3, $4, $5, $6::jsonb)`,
 			orderID, i, p.email, p.apiKey, deliveryType, payloadArg,
 		); err != nil {
 			return err
@@ -1180,6 +1188,7 @@ func (s *Store) InsertClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 	if err != nil {
 		return err
 	}
+	schemaArg := string(schemaJSON)
 	var svipPrice interface{}
 	if p.SVIPPriceCents != nil {
 		svipPrice = *p.SVIPPriceCents
@@ -1190,11 +1199,11 @@ func (s *Store) InsertClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 			retail_price_cents, wholesale_min_qty, wholesale_price_cents,
 			delivery_type, delivery_schema, svip_price_cents
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
 		RETURNING id, created_at, updated_at`,
 		p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
 		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
-		p.DeliveryType, schemaJSON, svipPrice,
+		p.DeliveryType, schemaArg, svipPrice,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -1209,6 +1218,7 @@ func (s *Store) UpdateClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 	if err != nil {
 		return err
 	}
+	schemaArg := string(schemaJSON)
 	var svipPrice interface{}
 	if p.SVIPPriceCents != nil {
 		svipPrice = *p.SVIPPriceCents
@@ -1217,12 +1227,12 @@ func (s *Store) UpdateClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 		UPDATE claude_shop_products SET
 		  sort_order = $2, enabled = $3, title = $4, description = $5, tag = $6,
 		  retail_price_cents = $7, wholesale_min_qty = $8, wholesale_price_cents = $9,
-		  delivery_type = $10, delivery_schema = $11, svip_price_cents = $12,
+		  delivery_type = $10, delivery_schema = $11::jsonb, svip_price_cents = $12,
 		  updated_at = NOW()
 		WHERE id = $1`,
 		p.ID, p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
 		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
-		p.DeliveryType, schemaJSON, svipPrice,
+		p.DeliveryType, schemaArg, svipPrice,
 	)
 	if err != nil {
 		return err

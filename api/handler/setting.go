@@ -26,12 +26,16 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 	smtpIP, _    := h.store.GetSetting(c.Request.Context(), "smtp_server_ip")
 	smtpHostname, _ := h.store.GetSetting(c.Request.Context(), "smtp_hostname")
 	announce, _  := h.store.GetSetting(c.Request.Context(), "announcement")
+	announceTitle, _ := h.store.GetSetting(c.Request.Context(), "announcement_title")
+	announceLevel, _ := h.store.GetSetting(c.Request.Context(), "announcement_level")
 	c.JSON(http.StatusOK, gin.H{
 		"registration_open": regOpen == "true",
 		"site_title":        siteTitle,
 		"smtp_server_ip":    smtpIP,
 		"smtp_hostname":     smtpHostname,
 		"announcement":      announce,
+		"announcement_title": announceTitle,
+		"announcement_level": announceLevel,
 	})
 }
 
@@ -64,6 +68,11 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		"announcement":           true,
 		"default_domain":         true,
 		"mailbox_ttl_minutes":    true,
+		"announcement_title":     true,
+		"announcement_level":     true,
+		"exclusive_fan_enabled":      true,
+		"exclusive_fan_min_orders":   true,
+		"exclusive_fan_discount_bps": true,
 	}
 
 	for k, v := range req {

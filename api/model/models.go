@@ -43,6 +43,21 @@ func (a *Account) IsExclusiveFan() bool {
 	return a != nil && a.ExclusiveFanLevel > 0
 }
 
+// SVIPActivationCode 是可售卖/兑换的 SVIP 激活码模板与用量记录。
+type SVIPActivationCode struct {
+	ID           uuid.UUID  `json:"id"`
+	Code         string     `json:"code"`
+	Level        int        `json:"level"`
+	DurationDays int        `json:"duration_days"` // 0=永久
+	MaxUses      int        `json:"max_uses"`
+	UsedCount    int        `json:"used_count"`
+	Enabled      bool       `json:"enabled"`
+	Note         string     `json:"note"`
+	ExpiresAt    *time.Time `json:"expires_at,omitempty"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+}
+
 // ClaudeOrder 自助售号订单
 type ClaudeOrder struct {
 	ID                   uuid.UUID  `json:"id"`
@@ -117,6 +132,7 @@ type ClaudeInventoryItem struct {
 	OrderID      *uuid.UUID             `json:"order_id,omitempty"`
 	BatchLabel   string                 `json:"batch_label"`
 	ProductID    *uuid.UUID             `json:"product_id,omitempty"` // nil = 通用池
+	DeliveryType string                 `json:"delivery_type"`        // card_key | text | custom_kv
 	Payload      map[string]interface{} `json:"payload,omitempty"`
 	CreatedAt    time.Time              `json:"created_at"`
 }

@@ -308,7 +308,10 @@ func (h *CouponHandler) AdminDelete(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 
-// POST /api/admin/coupons/:id/grant  body: { "account_ids": ["uuid", ...] }
+// POST /api/admin/coupons/:id/grant
+//
+//	body: { "account_identifiers": ["api_key / username / uuid", ...] }
+//	兼容旧字段 account_ids。管理员可以直接粘贴用户 API Key、用户名或 UUID。
 //
 //	定向派发：允许一次指定多个账户
 func (h *CouponHandler) AdminGrant(c *gin.Context) {
@@ -318,38 +321,55 @@ func (h *CouponHandler) AdminGrant(c *gin.Context) {
 		return
 	}
 	var req struct {
-		AccountIDs []string `json:"account_ids" binding:"required,min=1"`
+		APIKeys            []string `json:"api_keys"`
+		AccountIDs         []string `json:"account_ids"`
+		AccountIdentifiers []string `json:"account_identifiers"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	identifiers := append([]string{}, req.AccountIdentifiers...)
+	identifiers = append(identifiers, req.APIKeys...)
+	identifiers = append(identifiers, req.AccountIDs...)
+	if len(identifiers) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "请输入至少一个 API Key、用户名或 UUID"})
+		return
+	}
 	ctx := c.Request.Context()
 	type perResult struct {
-		AccountID string `json:"account_id"`
-		OK        bool   `json:"ok"`
-		Error     string `json:"error,omitempty"`
+		Identifier string `json:"identifier"`
+		AccountID   string `json:"account_id,omitempty"`
+		OK          bool   `json:"ok"`
+		Error       string `json:"error,omitempty"`
 	}
-	results := make([]perResult, 0, len(req.AccountIDs))
+	results := make([]perResult, 0, len(identifiers))
 	ok := 0
-	for _, s := range req.AccountIDs {
+	for _, s := range identifiers {
 		s = strings.TrimSpace(s)
-		aid, perr := uuid.Parse(s)
+		if s == "" {
+			continue
+		}
+		aid, perr := h.store.ResolveAccountIdentifier(ctx, s)
 		if perr != nil {
-			results = append(results, perResult{AccountID: s, OK: false, Error: "invalid uuid"})
+			msg := perr.Error()
+			if errors.Is(perr, store.ErrAccountIdentifierNotFound) {
+				msg = "未找到匹配的 API Key / 用户名 / UUID"
+			}
+			results = append(results, perResult{Identifier: s, OK: false, Error: msg})
 			continue
 		}
 		_, gerr := h.store.GrantCouponDirect(ctx, aid, id)
 		if gerr != nil {
-			results = append(results, perResult{AccountID: s, OK: false, Error: gerr.Error()})
+			results = append(results, perResult{Identifier: s, AccountID: aid.String(), OK: false, Error: gerr.Error()})
 			continue
 		}
-		results = append(results, perResult{AccountID: s, OK: true})
+		results = append(results, perResult{Identifier: s, AccountID: aid.String(), OK: true})
 		ok++
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"granted": ok,
-		"total":   len(req.AccountIDs),
+		"total":   len(results),
 		"results": results,
 	})
 }

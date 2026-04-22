@@ -33,6 +33,7 @@ const state = {
   adminShopOrdersPage: 1,
   /** 管理端订单筛选：''=全部 awaiting_payment fulfilled */
   adminShopOrdersStatus: '',
+  adminSVIPCodesPage: 1,
   /** 管理端「在售 SKU」正在编辑的商品 id */
   adminShopProductEditId: null,
   claudeHighlightOrderId: null,
@@ -445,6 +446,7 @@ const api = {
   }),
   fanStatus: () => apiFetch(API_BASE + '/fan/status'),
   fanClaim:  () => apiFetch(API_BASE + '/fan/claim', { method: 'POST', body: '{}' }),
+  svipRedeem: code => apiFetch(API_BASE + '/svip/redeem', { method: 'POST', body: JSON.stringify({ code }) }),
   admin: {
     // v10：账户列表支持 status 筛选（all/active/banned/svip）
     listAccounts:  (page=1,size=10,q='',status='') => {
@@ -471,7 +473,10 @@ const api = {
     couponUpdate: (id, body) => apiFetch(API_BASE + '/admin/coupons/' + id, { method: 'PUT', body: JSON.stringify(body) }),
     couponToggle: (id, enabled) => apiFetch(API_BASE + '/admin/coupons/' + id + '/toggle', { method: 'PATCH', body: JSON.stringify({ enabled }) }),
     couponDelete: id => apiFetch(API_BASE + '/admin/coupons/' + id, { method: 'DELETE' }),
-    couponGrant:  (id, accountIds) => apiFetch(API_BASE + '/admin/coupons/' + id + '/grant', { method: 'POST', body: JSON.stringify({ account_ids: accountIds }) }),
+    couponGrant:  (id, identifiers) => apiFetch(API_BASE + '/admin/coupons/' + id + '/grant', { method: 'POST', body: JSON.stringify({ api_keys: identifiers, account_identifiers: identifiers }) }),
+    svipCodeList: (page=1, size=30) => apiFetch(API_BASE + '/admin/svip-codes?page=' + page + '&size=' + size),
+    svipCodeGenerate: body => apiFetch(API_BASE + '/admin/svip-codes/generate', { method: 'POST', body: JSON.stringify(body || {}) }),
+    svipCodeToggle: (id, enabled) => apiFetch(API_BASE + '/admin/svip-codes/' + id + '/toggle', { method: 'PATCH', body: JSON.stringify({ enabled }) }),
     shopGetConfig: () => apiFetch(API_BASE + '/admin/shop/config'),
     shopPutConfig: body => apiFetch(API_BASE + '/admin/shop/config', { method: 'PUT', body: JSON.stringify(body) }),
     shopListProducts: () => apiFetch(API_BASE + '/admin/shop/products'),
@@ -829,6 +834,9 @@ function buildMainLayout() {
         <button class="nav-item" data-page="admin-coupons" onclick="navigate('admin-coupons')">
           <span class="nav-icon">🎫</span><span>优惠券管理</span>
         </button>
+        <button class="nav-item" data-page="admin-svip-codes" onclick="navigate('admin-svip-codes')">
+          <span class="nav-icon">💎</span><span>SVIP 激活码</span>
+        </button>
         <button class="nav-item" data-page="admin-domains" onclick="navigate('admin-domains')">
           <span class="nav-icon">🌐</span><span>域名管理</span>
         </button>
@@ -935,6 +943,7 @@ async function renderPage(page) {
     'api-docs':       ['API 接口文档', '查看所有可用 API 及调用示例'],
     'my-coupons':     ['我的优惠券', '查看、领取与使用您的优惠券'],
     'admin-coupons':  ['优惠券管理', '创建、派发、审计营销活动'],
+    'admin-svip-codes': ['SVIP 激活码', '生成、售卖与停用兑换码'],
   };
   const [t, s] = titles[page] || ['—', ''];
   const title = $('topbar-title'); if (title) title.textContent = t;
@@ -960,6 +969,7 @@ async function renderPage(page) {
       case 'api-docs':       renderApiDocs(container); break;
       case 'my-coupons':     await renderMyCoupons(container); break;
       case 'admin-coupons':  await renderAdminCoupons(container); break;
+      case 'admin-svip-codes': await renderAdminSVIPCodes(container); break;
       default: container.innerHTML = '<div class="page"><p>页面未找到</p></div>';
     }
   } catch(e) {
@@ -2799,6 +2809,34 @@ function renderShopDeliveryCard(ln) {
   return '';
 }
 
+function deliveryTypeLabel(dt) {
+  if (dt === 'text') return '长文本';
+  if (dt === 'custom_kv') return '自定义字段';
+  return '邮箱+Key';
+}
+
+function renderInventoryGoodsCell(item) {
+  const dt = item.delivery_type || 'card_key';
+  const badge = `<span class="badge badge-gray" style="margin-bottom:0.35rem">${deliveryTypeLabel(dt)}</span>`;
+  if (dt === 'text') {
+    const text = String(item.payload?.text || '');
+    return `${badge}<div class="code-box" style="font-size:0.72rem;white-space:pre-wrap;max-width:360px"><span>${escHtml(text || '—')}</span><button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(text)})'>⧉</button></div>`;
+  }
+  if (dt === 'custom_kv') {
+    const payload = item.payload || {};
+    const rows = Object.keys(payload).map(k => {
+      const v = String(payload[k] ?? '');
+      return `<div class="code-box" style="font-size:0.72rem;margin-top:0.25rem"><strong>${escHtml(k)}：</strong><span>${escHtml(v || '—')}</span><button type="button" class="copy-btn" onclick='copyText(${JSON.stringify(v)})'>⧉</button></div>`;
+    }).join('');
+    return `${badge}${rows || '<span style="color:var(--text-muted)">—</span>'}`;
+  }
+  const emailJs = JSON.stringify(item.email || '');
+  const keyJs = JSON.stringify(item.api_key || '');
+  return `${badge}
+    <div class="code-box" style="font-size:0.72rem"><span>${escHtml(item.email || '')}</span><button type="button" class="copy-btn" onclick='copyText(${emailJs})'>⧉</button></div>
+    <div class="code-box" style="margin-top:0.35rem;font-size:0.72rem"><span>${escHtml(item.api_key || '')}</span><button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⧉</button></div>`;
+}
+
 async function buildClaudeShopHighlightHtml() {
   if (!state.claudeHighlightOrderId) return '';
   try {
@@ -2852,6 +2890,12 @@ function claudeShopGetSelectedProduct(summary) {
   if (!summary.product_pick_required || !prods.length) return null;
   const id = state.claudeSelectedProductId;
   return prods.find(p => p.id === id) || null;
+}
+
+function claudeShopCurrentAvailableStock(summary) {
+  const picked = claudeShopGetSelectedProduct(summary);
+  if (picked) return Number(picked.stock_available ?? 0);
+  return Number(summary?.stock_available ?? 0);
 }
 
 window.claudeShopAckDefaultProduct = function() {
@@ -3057,7 +3101,7 @@ window.openClaudeShopAlipayPayModal = async function() {
     toast('支付宝当面付未启用', 'warn');
     return;
   }
-  const stock = s.stock_available ?? 0;
+  const stock = claudeShopCurrentAvailableStock(s);
   if (stock < 1) {
     toast('暂时缺货', 'warn');
     return;
@@ -3140,7 +3184,7 @@ window.openClaudeShopAlipayPayModal = async function() {
 window.openClaudeShopPayModal = function() {
   const s = state._claudeShopSummary;
   if (!s) return;
-  const stock = s.stock_available ?? 0;
+  const stock = claudeShopCurrentAvailableStock(s);
   if (stock < 1) {
     toast('暂时缺货', 'warn');
     return;
@@ -3396,7 +3440,7 @@ async function renderClaudeShop(container) {
         <section class="shop-product-panel" aria-label="商品信息">
           ${!pickReq ? `<div class="shop-tags-row" style="display:flex;flex-wrap:wrap;gap:0.45rem;margin-bottom:0.85rem">${tags.join('')}</div>` : `<p class="form-label" style="margin-bottom:0.65rem">选择商品 <span style="font-weight:400;color:var(--text-muted);font-size:0.82rem">（必选 · 点击卡片选中）</span></p>`}
           <div class="shop-product-grid">${productGridHtml}</div>
-          <div class="shop-stock-banner"><span class="text-muted">全站总可售</span> <strong>${summary.stock_available ?? 0}</strong> 件${(summary.stock_unassigned ?? 0) > 0 ? ` <span class="text-muted" style="font-size:0.78rem">（其中通用池 ${summary.stock_unassigned} 件，可作为任一 SKU 订单兜底）</span>` : ''}
+          <div class="shop-stock-banner"><span class="text-muted">全站总可售</span> <strong>${summary.stock_available ?? 0}</strong> 件${(summary.stock_unassigned ?? 0) > 0 ? ` <span class="text-muted" style="font-size:0.78rem">（通用池 ${summary.stock_unassigned} 件，按发货模式安全兜底）</span>` : ''}
             ${summary.tutorial_url ? `<span class="shop-stock-banner-tutorial"><a class="shop-tutorial-link" href="${escHtml(summary.tutorial_url)}" target="_blank" rel="noopener">📘 使用教程</a></span>` : ''}
           </div>
         </section>
@@ -3537,6 +3581,7 @@ window.runShopImport = async function() {
   const deliveryType = productSelect?.selectedOptions[0]?.dataset?.deliveryType || 'card_key';
 
   if (deliveryType === 'text') {
+    if (!productId) { toast('长文本发货请先选择对应 SKU，避免进入错误库存池', 'warn'); return; }
     const raw = ($('shop-import-text-ta')?.value || '').trim();
     if (!raw) { toast('请粘贴发货内容', 'warn'); return; }
     const items = raw.split(/^####\s*$/m)
@@ -3553,6 +3598,7 @@ window.runShopImport = async function() {
   }
 
   if (deliveryType === 'custom_kv') {
+    if (!productId) { toast('自定义字段发货请先选择对应 SKU，系统会按该 SKU 的字段入库', 'warn'); return; }
     const rows = document.querySelectorAll('#shop-import-kv-items .kv-item');
     const items = [];
     rows.forEach(r => {
@@ -3603,19 +3649,30 @@ window.updateImportUIForProduct = function() {
   if (!sel) return;
   const opt = sel.selectedOptions[0];
   const dt = opt?.dataset?.deliveryType || 'card_key';
+  const productId = (sel.value || '').trim();
+  const hint = $('shop-import-dynamic-hint');
   ['cardkey', 'text', 'kv'].forEach(m => {
     const box = $(`shop-import-mode-${m}`);
     if (box) box.style.display = 'none';
   });
   if (dt === 'text') {
     $('shop-import-mode-text').style.display = 'block';
+    if (hint) hint.innerHTML = productId
+      ? '当前 SKU 使用 <strong>长文本</strong> 发货；导入后只会供这个 SKU 自动发货。'
+      : '长文本发货请先选择具体 SKU。';
   } else if (dt === 'custom_kv') {
     $('shop-import-mode-kv').style.display = 'block';
-    // 初始化至少一条
     const box = $('shop-import-kv-items');
-    if (box && box.children.length === 0) addImportKVItem();
+    if (box) box.innerHTML = '';
+    addImportKVItem();
+    if (hint) hint.innerHTML = productId
+      ? '当前 SKU 使用 <strong>自定义字段</strong> 发货；字段会按 SKU schema 校验后入库。'
+      : '自定义字段发货请先选择具体 SKU。';
   } else {
     $('shop-import-mode-cardkey').style.display = 'block';
+    if (hint) hint.innerHTML = productId
+      ? '当前 SKU 使用 <strong>邮箱 + Key</strong> 发货；本批库存优先供该 SKU 使用。'
+      : '通用池只接收 <strong>邮箱 + Key</strong> 库存，并只给同类发货模式兜底。';
   }
 };
 
@@ -3899,14 +3956,15 @@ async function renderAdminShopInventory(container) {
   const productMap = new Map(products.map(p => [p.id, p]));
   const productOptions = products.map(p => {
     const dedicated = Number(p.stock_dedicated ?? 0);
+    const total = Number(p.stock_with_unassigned ?? dedicated);
     const dt = p.delivery_type || 'card_key';
     const schemaAttr = p.delivery_schema ? ` data-schema='${escHtml(JSON.stringify(p.delivery_schema))}'` : '';
-    return `<option value="${escHtml(p.id)}" data-delivery-type="${escHtml(dt)}"${schemaAttr}>${escHtml(p.title || '—')}（专属待售 ${dedicated}）</option>`;
+    return `<option value="${escHtml(p.id)}" data-delivery-type="${escHtml(dt)}"${schemaAttr}>${escHtml(p.title || '—')} · ${deliveryTypeLabel(dt)}（专属 ${dedicated} / 含兜底 ${total}）</option>`;
   }).join('');
   const productFilterOptions = products.map(p => {
     const sel = productFilter === p.id ? 'selected' : '';
     const dedicated = Number(p.stock_dedicated ?? 0);
-    return `<option value="${escHtml(p.id)}" ${sel}>${escHtml(p.title || '—')}（专属 ${dedicated}）</option>`;
+    return `<option value="${escHtml(p.id)}" ${sel}>${escHtml(p.title || '—')} · ${deliveryTypeLabel(p.delivery_type || 'card_key')}（专属 ${dedicated}）</option>`;
   }).join('');
   const inventoryRows = inventoryRes.data || [];
   const inventoryTotal = inventoryRes.total ?? 0;
@@ -3942,10 +4000,11 @@ async function renderAdminShopInventory(container) {
           <div class="form-group">
             <label class="form-label">关联商品（库存池归属）</label>
             <select class="form-input" id="shop-import-product" style="max-width:360px" onchange="updateImportUIForProduct()">
-              <option value="" data-delivery-type="card_key">通用池（任意 SKU 订单均可兜底取用）</option>
+              <option value="" data-delivery-type="card_key">通用池（邮箱 + Key 兜底池）</option>
               ${productOptions}
             </select>
-            <div class="form-hint">选择某商品 = 本批只供该 SKU 订单使用；留空 = 通用池（所有 SKU 订单的兜底，仅支持卡密格式）</div>
+            <div class="form-hint">选择某商品 = 本批只供该 SKU 优先使用；留空 = 通用池。系统会按发货模式隔离库存，避免长文本/自定义字段错拿邮箱 Key。</div>
+            <div class="form-hint" id="shop-import-dynamic-hint" style="margin-top:0.25rem"></div>
           </div>
 
           <!-- card_key 模式（默认） -->
@@ -4014,11 +4073,9 @@ async function renderAdminShopInventory(container) {
         </div>
         <div class="table-wrap">
           <table>
-            <thead><tr><th>邮箱 / Key</th><th>批次</th><th>所属商品</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
+            <thead><tr><th>发货内容</th><th>批次</th><th>所属商品</th><th>状态</th><th>关联订单</th><th>导入时间</th><th></th></tr></thead>
             <tbody>
               ${inventoryRows.length ? inventoryRows.map(item => {
-                const emailJs = JSON.stringify(item.email || '');
-                const keyJs = JSON.stringify(item.api_key || '');
                 const labelJs = JSON.stringify(item.email || item.id || '');
                 const bl = (item.batch_label || '').trim();
                 const blShow = bl ? escHtml(bl) : '<span style="color:var(--text-muted)">—</span>';
@@ -4029,8 +4086,7 @@ async function renderAdminShopInventory(container) {
                 return `
                 <tr data-shop-inventory-row>
                   <td>
-                    <div class="code-box" style="font-size:0.72rem"><span>${escHtml(item.email || '')}</span><button type="button" class="copy-btn" onclick='copyText(${emailJs})'>⧉</button></div>
-                    <div class="code-box" style="margin-top:0.35rem;font-size:0.72rem"><span>${escHtml(item.api_key || '')}</span><button type="button" class="copy-btn" onclick='copyText(${keyJs})'>⧉</button></div>
+                    ${renderInventoryGoodsCell(item)}
                   </td>
                   <td style="font-size:0.78rem;font-weight:600">${blShow}</td>
                   <td style="font-size:0.78rem">${prodShow}</td>
@@ -4162,6 +4218,18 @@ window.handleDeliveryTypeChange = function() {
   const v = $('shop-prod-delivery-type')?.value || 'card_key';
   const kvBox = $('shop-prod-schema-wrap');
   if (kvBox) kvBox.style.display = (v === 'custom_kv') ? 'block' : 'none';
+  const hint = $('shop-prod-delivery-hint');
+  if (hint) {
+    if (v === 'text') {
+      hint.innerHTML = '保存 SKU 后，请到 <strong>库存与货物</strong> 选择该 SKU，并用长文本框导入发货内容；每条用 <code>####</code> 分隔。';
+    } else if (v === 'custom_kv') {
+      hint.innerHTML = '先在下方定义字段，保存 SKU 后到 <strong>库存与货物</strong> 按字段逐条导入，系统会校验字段后再入库。';
+      const rows = document.querySelectorAll('#shop-prod-schema-rows .kv-row');
+      if (!rows.length) addKVSchemaRow('url', '链接 / 地址', '例如网盘链接、登录入口', false);
+    } else {
+      hint.innerHTML = '保存 SKU 后，请到 <strong>库存与货物</strong> 导入 <code>邮箱####登录Key</code>；通用池也只给邮箱+Key 模式兜底。';
+    }
+  }
 };
 
 window.submitAdminShopProductForm = async function() {
@@ -4282,6 +4350,7 @@ async function renderAdminShopProducts(container) {
                 <option value="text"      ${v.delivery_type==='text'?'selected':''}>长文本（适合网盘链接、激活码等）</option>
                 <option value="custom_kv" ${v.delivery_type==='custom_kv'?'selected':''}>自定义字段（URL + 口令 + 备注…）</option>
               </select>
+              <div class="form-hint" id="shop-prod-delivery-hint"></div>
             </div>
           </div>
           <div id="shop-prod-schema-wrap" style="display:${v.delivery_type==='custom_kv'?'block':'none'}">
@@ -4339,6 +4408,7 @@ async function renderAdminShopProducts(container) {
       window.addKVSchemaRow(f.key || '', f.label || '', f.hint || '', !!f.multiline);
     });
   }
+  handleDeliveryTypeChange();
 }
 
 // ─── v10：我的优惠券（用户页）────────────────────────────────
@@ -4358,6 +4428,49 @@ window.redeemMyCouponCode = async function() {
     toast('领取失败：' + (e.message || ''), 'error');
   }
 };
+
+window.redeemSVIPCode = async function() {
+  const code = ($('my-svip-code')?.value || '').trim();
+  if (!code) { toast('请输入 SVIP 激活码', 'warn'); return; }
+  try {
+    const r = await api.svipRedeem(code);
+    if (r.account) {
+      state.account = r.account;
+      localStorage.setItem('tm_account', JSON.stringify(r.account));
+      await showMainLayout();
+    } else {
+      await refreshAccountSnapshot().catch(() => null);
+    }
+    toast(r.message || 'SVIP 激活成功', 'success');
+    navigate('my-coupons');
+  } catch(e) {
+    toast('激活失败：' + (e.message || ''), 'error');
+  }
+};
+
+function renderSVIPRedeemCard() {
+  const active = accountIsSVIP();
+  const exp = state.account?.svip_expires_at ? `当前到期：${formatDate(state.account.svip_expires_at)}` : (active ? '当前为永久 SVIP' : '兑换后会立即点亮 SVIP 身份');
+  return `
+    <div class="card svip-redeem-card">
+      <div class="card-header">
+        <div class="card-title">💎 SVIP 激活码兑换</div>
+      </div>
+      <div class="card-body">
+        <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+          <div style="min-width:220px;flex:1">
+            <div style="font-size:0.86rem;color:var(--text-secondary);line-height:1.65">
+              ${escHtml(exp)}。如果您购买的是 SVIP 激活码，可在这里粘贴兑换；有限期激活码会在现有到期时间后顺延。
+            </div>
+          </div>
+          <div class="coupon-redeem-bar" style="flex:1.2;min-width:280px">
+            <input type="text" class="form-input" id="my-svip-code" placeholder="SVIP-XXXX-XXXX-XXXX" onkeydown="if(event.key==='Enter')redeemSVIPCode()" />
+            <button class="btn btn-primary" onclick="redeemSVIPCode()">激活</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
 
 window.claimExclusiveFan = async function() {
   try {
@@ -4472,6 +4585,7 @@ async function renderMyCoupons(container) {
   container.innerHTML = `
     <div style="max-width:960px;display:flex;flex-direction:column;gap:1rem">
       ${renderFanClaimCard(fanStatus)}
+      ${renderSVIPRedeemCard()}
       <div class="card">
         <div class="card-header"><div class="card-title">🎟 输入优惠码领取</div></div>
         <div class="card-body">
@@ -4489,6 +4603,150 @@ async function renderMyCoupons(container) {
         </div>
         <div class="card-body">
           ${list.length ? `<div class="coupon-grid">${cards}</div>` : `<div class="empty-state"><span class="empty-icon">🎟</span><p>${status==='available'?'暂无可用券，输入优惠码领取吧！':'暂无记录'}</p></div>`}
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+// ─── v12：SVIP 激活码管理（管理员页）────────────────────────────────
+window.adminSVIPCodesGoPage = function(p) {
+  state.adminSVIPCodesPage = Math.max(1, p);
+  navigate('admin-svip-codes');
+};
+
+window.adminSVIPCodeGenerate = async function() {
+  const count = parseInt(($('svip-code-count')?.value || '1'), 10) || 1;
+  const durationDays = parseInt(($('svip-code-duration')?.value || '30'), 10);
+  const maxUses = parseInt(($('svip-code-max-uses')?.value || '1'), 10) || 1;
+  const note = ($('svip-code-note')?.value || '').trim();
+  const expiresRaw = ($('svip-code-expires')?.value || '').trim();
+  const body = { count, duration_days: durationDays, max_uses: maxUses, note };
+  if (expiresRaw) {
+    const exp = new Date(expiresRaw);
+    if (Number.isNaN(exp.getTime())) {
+      toast('激活码有效期时间格式无效', 'warn');
+      return;
+    }
+    body.expires_at = exp.toISOString();
+  }
+  try {
+    const r = await api.admin.svipCodeGenerate(body);
+    const codes = (r.items || []).map(x => x.code).join('\n');
+    toast(`已生成 ${r.total || (r.items || []).length} 个激活码`, 'success');
+    showModal('生成成功', `
+      <div class="form-group">
+        <label class="form-label">本次生成的激活码</label>
+        <textarea class="form-input" rows="8" readonly>${escHtml(codes)}</textarea>
+        <div class="form-hint">建议复制保存后再售卖；后续也可以在列表里逐个复制。</div>
+      </div>
+      <button type="button" class="btn btn-primary" onclick='copyText(${JSON.stringify(codes)})'>复制全部</button>
+    `, null);
+    navigate('admin-svip-codes');
+  } catch(e) {
+    toast('生成失败：' + (e.message || ''), 'error');
+  }
+};
+
+window.adminSVIPCodeToggle = async function(id, enabled) {
+  try {
+    await api.admin.svipCodeToggle(id, enabled);
+    toast(enabled ? '已启用' : '已停用', 'success');
+    navigate('admin-svip-codes');
+  } catch(e) {
+    toast('操作失败：' + (e.message || ''), 'error');
+  }
+};
+
+function svipCodeDurationText(c) {
+  const d = Number(c.duration_days || 0);
+  return d <= 0 ? '永久 SVIP' : `${d} 天`;
+}
+
+async function renderAdminSVIPCodes(container) {
+  const page = state.adminSVIPCodesPage || 1;
+  const size = 30;
+  const res = await api.admin.svipCodeList(page, size).catch(e => ({ items: [], total: 0, error: e.message }));
+  const list = res.items || [];
+  const total = res.total || 0;
+  const maxPage = Math.max(1, Math.ceil(total / size));
+  container.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:1rem">
+      <div class="card">
+        <div class="card-header">
+          <div>
+            <div class="card-title">💎 生成 SVIP 激活码</div>
+            <div style="font-size:0.82rem;color:var(--text-muted);margin-top:0.25rem">生成后可复制给用户售卖；用户在“我的优惠券”页面兑换，身份会立即点亮。</div>
+          </div>
+        </div>
+        <div class="card-body">
+          <div class="form-grid">
+            <div class="form-group">
+              <label class="form-label">生成数量</label>
+              <input class="form-input" id="svip-code-count" type="number" min="1" max="200" value="10" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">SVIP 时长（天，0=永久）</label>
+              <input class="form-input" id="svip-code-duration" type="number" min="0" value="30" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">每码可用次数</label>
+              <input class="form-input" id="svip-code-max-uses" type="number" min="1" max="1000" value="1" />
+            </div>
+            <div class="form-group">
+              <label class="form-label">激活码自身有效期（可空）</label>
+              <input class="form-input" id="svip-code-expires" type="datetime-local" />
+              <div class="form-hint">留空表示激活码不过期；不是用户 SVIP 到期时间。</div>
+            </div>
+            <div class="form-group" style="grid-column:1/-1">
+              <label class="form-label">备注</label>
+              <input class="form-input" id="svip-code-note" maxlength="160" placeholder="例如：淘宝 30 天批次 / 老用户活动" />
+            </div>
+          </div>
+          <button class="btn btn-primary" onclick="adminSVIPCodeGenerate()">生成激活码</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">激活码列表</div>
+          <div style="font-size:0.82rem;color:var(--text-muted)">共 ${total} 个</div>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>激活码</th><th>时长</th><th>用量</th><th>状态</th><th>有效期</th><th>备注</th><th>创建时间</th><th></th></tr></thead>
+            <tbody>
+              ${list.length ? list.map(c => {
+                const codeJs = JSON.stringify(c.code || '');
+                const enabled = c.enabled !== false;
+                const usedUp = Number(c.used_count || 0) >= Number(c.max_uses || 1);
+                const expired = c.expires_at && new Date(c.expires_at) <= new Date();
+                const statusBadge = !enabled ? '<span class="badge badge-gray">停用</span>' : usedUp ? '<span class="badge badge-red">已用完</span>' : expired ? '<span class="badge badge-gray">已过期</span>' : '<span class="badge badge-green">可用</span>';
+                return `<tr>
+                  <td>
+                    <div class="code-box" style="font-size:0.76rem">
+                      <span>${escHtml(c.code || '')}</span>
+                      <button type="button" class="copy-btn" onclick='copyText(${codeJs})'>⧉</button>
+                    </div>
+                  </td>
+                  <td>${svipCodeDurationText(c)}</td>
+                  <td>${Number(c.used_count || 0)} / ${Number(c.max_uses || 1)}</td>
+                  <td>${statusBadge}</td>
+                  <td style="font-size:0.78rem">${c.expires_at ? formatDate(c.expires_at) : '不过期'}</td>
+                  <td style="font-size:0.78rem;max-width:220px">${escHtml(c.note || '—')}</td>
+                  <td style="font-size:0.78rem">${formatDate(c.created_at)}</td>
+                  <td style="white-space:nowrap">
+                    <button class="btn btn-ghost btn-sm" onclick="adminSVIPCodeToggle('${c.id}', ${!enabled})">${enabled ? '停用' : '启用'}</button>
+                  </td>
+                </tr>`;
+              }).join('') : '<tr><td colspan="8" style="text-align:center;color:var(--text-muted);padding:1rem">暂无激活码，先生成一批即可售卖。</td></tr>'}
+            </tbody>
+          </table>
+        </div>
+        <div style="display:flex;gap:0.5rem;align-items:center;margin:1rem 1.3rem;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" ${page <= 1 ? 'disabled' : ''} onclick="adminSVIPCodesGoPage(${page - 1})">上一页</button>
+          <span style="font-size:0.85rem;color:var(--text-muted)">第 ${page} / ${maxPage} 页</span>
+          <button class="btn btn-ghost btn-sm" ${page >= maxPage ? 'disabled' : ''} onclick="adminSVIPCodesGoPage(${page + 1})">下一页</button>
         </div>
       </div>
     </div>
@@ -4534,20 +4792,29 @@ window.adminCouponDelete = function(id, name) {
 window.adminCouponGrant = function(id, name) {
   showModal('定向派发：' + name, `
     <div class="form-group">
-      <label class="form-label">目标账户 UUID（每行一个）</label>
-      <textarea class="form-input" id="grant-account-ids" rows="6" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx&#10;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></textarea>
-      <div class="form-hint">管理员在「账户管理」可复制 UUID；每张券按 per_user_limit 去重。</div>
+      <label class="form-label">目标账户（API Key / 用户名 / UUID，每行一个）</label>
+      <textarea class="form-input" id="grant-account-ids" rows="7" placeholder="用户 API Key&#10;username123&#10;xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"></textarea>
+      <div class="form-hint">优先按 API Key 精确匹配，也支持用户名与旧 UUID；每张券仍会自动去重，避免重复派发。</div>
     </div>
   `, async () => {
     const raw = ($('grant-account-ids')?.value || '').trim();
-    if (!raw) { toast('请输入账户 UUID', 'warn'); return false; }
-    const ids = raw.split(/\s+/).filter(Boolean);
-    if (ids.length === 0) { toast('请输入账户 UUID', 'warn'); return false; }
+    if (!raw) { toast('请输入 API Key / 用户名 / UUID', 'warn'); return false; }
+    const ids = raw
+      .split(/[\n,;，；]+/)
+      .map(x => x.trim())
+      .filter(Boolean)
+      .map(x => {
+        const m = x.match(/^\s*(?:api[_\s-]*key|apikey|username|user|uid|id)\s*[:：=]\s*(.+)\s*$/i);
+        return m ? (m[1] || '').trim() : x;
+      })
+      .map(x => x.replace(/^["']|["']$/g, '').trim())
+      .filter(Boolean);
+    if (ids.length === 0) { toast('请输入 API Key / 用户名 / UUID', 'warn'); return false; }
     try {
       const r = await api.admin.couponGrant(id, ids);
       const failed = (r.results || []).filter(x => !x.ok);
       if (failed.length) {
-        toast(`成功 ${r.granted}/${r.total}；失败：${failed[0].error}`, 'warn');
+        toast(`成功 ${r.granted}/${r.total}；${failed[0].identifier || '某个账户'} 失败：${failed[0].error}`, 'warn');
       } else {
         toast(`已派发 ${r.granted} 张`, 'success');
       }

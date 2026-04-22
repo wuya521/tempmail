@@ -87,12 +87,20 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		alipayU = h.qrURL(cfg.AlipayQRFile)
 	}
 	plist, _ := h.store.ListClaudeShopProductsPublic(ctx)
+	if len(plist) == 0 {
+		if n, err := h.store.CountClaudeInventoryAvailableFor(ctx, nil); err == nil {
+			stock = n
+		}
+	}
 	stockMap, unassigned, _ := h.store.GetProductStockMap(ctx)
 	fanCfg := h.store.GetExclusiveFanConfig(ctx)
 	products := make([]gin.H, 0, len(plist))
 	for _, p := range plist {
 		ps := stockMap[p.ID.String()]
-		available := ps.Dedicated + unassigned
+		available := ps.WithUnassigned
+		if available == 0 && ps.Dedicated > 0 {
+			available = ps.Dedicated
+		}
 		row := gin.H{
 			"id":                    p.ID.String(),
 			"title":                 p.Title,
@@ -677,13 +685,15 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 		batch = time.Now().In(loc).Format("0102")
 	}
 	var prodPtr *uuid.UUID
+	var importProduct *model.ClaudeShopProduct
 	if pidStr := strings.TrimSpace(c.Query("product_id")); pidStr != "" {
 		pid, perr := parseUUID(pidStr)
 		if perr != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "product_id 无效"})
 			return
 		}
-		if _, err := h.store.GetClaudeShopProductByID(c.Request.Context(), pid, false); err != nil {
+		p, err := h.store.GetClaudeShopProductByID(c.Request.Context(), pid, false)
+		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "商品不存在"})
 				return
@@ -691,6 +701,7 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		importProduct = p
 		prodPtr = &pid
 	}
 
@@ -709,6 +720,27 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "delivery_type 必须是 text 或 custom_kv"})
 			return
 		}
+		if importProduct == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "长文本 / 自定义字段库存请先选择对应 SKU，系统会按 SKU 的发货模式安全入库"})
+			return
+		}
+		if importProduct.DeliveryType != dt {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "导入类型与所选 SKU 的发货模式不一致，请切换 SKU 或修改发货模式"})
+			return
+		}
+		allowedCustomKeys := map[string]bool{}
+		if dt == "custom_kv" {
+			for _, f := range importProduct.DeliverySchema.Fields {
+				k := strings.TrimSpace(f.Key)
+				if k != "" {
+					allowedCustomKeys[k] = true
+				}
+			}
+			if len(allowedCustomKeys) == 0 {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "所选 SKU 还没有配置自定义发货字段，请先在商品与收款里配置字段"})
+				return
+			}
+		}
 		cleaned := make([]map[string]interface{}, 0, len(req.Items))
 		for _, it := range req.Items {
 			if len(it) == 0 {
@@ -720,15 +752,25 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 					cleaned = append(cleaned, map[string]interface{}{"text": s})
 				}
 			} else {
+				filtered := map[string]interface{}{}
 				hasNonEmpty := false
-				for _, v := range it {
-					if s, ok := v.(string); ok && strings.TrimSpace(s) != "" {
+				for k, v := range it {
+					if !allowedCustomKeys[k] {
+						continue
+					}
+					if s, ok := v.(string); ok {
+						s = strings.TrimSpace(s)
+						filtered[k] = s
+						if s != "" {
+							hasNonEmpty = true
+						}
+					} else if v != nil {
+						filtered[k] = v
 						hasNonEmpty = true
-						break
 					}
 				}
 				if hasNonEmpty {
-					cleaned = append(cleaned, it)
+					cleaned = append(cleaned, filtered)
 				}
 			}
 		}
@@ -736,10 +778,14 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "没有可导入的有效项"})
 			return
 		}
-		n, err := h.store.ImportClaudeInventoryPayload(c.Request.Context(), cleaned, batch, prodPtr)
+		n, err := h.store.ImportClaudeInventoryPayload(c.Request.Context(), cleaned, batch, prodPtr, dt)
 		if err != nil {
 			if err.Error() == "invalid_batch_label" {
 				c.JSON(http.StatusBadRequest, gin.H{"error": "批次标识无效"})
+				return
+			}
+			if err.Error() == "invalid_delivery_type" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "发货模式无效"})
 				return
 			}
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
@@ -767,6 +813,10 @@ func (h *ClaudeShopHandler) AdminImportInventory(c *gin.Context) {
 	pairs, warns := store.ParseInventoryImport(string(body))
 	if len(pairs) == 0 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "没有解析到有效行", "warnings": warns})
+		return
+	}
+	if importProduct != nil && importProduct.DeliveryType != "card_key" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "所选 SKU 不是“邮箱+Key”发货模式，请在导入区使用对应的长文本 / 自定义字段表单"})
 		return
 	}
 	n, err := h.store.ImportClaudeInventory(c.Request.Context(), pairs, batch, prodPtr)
@@ -967,6 +1017,37 @@ func (h *ClaudeShopHandler) AdminConfirmOrder(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"message": "已发货", "order": o})
 }
 
+func cleanDeliverySchema(deliveryType string, schema model.DeliverySchema) (model.DeliverySchema, error) {
+	if strings.TrimSpace(deliveryType) != "custom_kv" {
+		return model.DeliverySchema{Fields: []model.DeliveryField{}}, nil
+	}
+	out := model.DeliverySchema{Fields: []model.DeliveryField{}}
+	seen := map[string]bool{}
+	for _, f := range schema.Fields {
+		key := strings.TrimSpace(f.Key)
+		label := strings.TrimSpace(f.Label)
+		hint := strings.TrimSpace(f.Hint)
+		if key == "" && label == "" {
+			continue
+		}
+		if key == "" || strings.ContainsAny(key, " \t\r\n") || len(key) > 40 {
+			return out, fmt.Errorf("invalid_delivery_schema_key")
+		}
+		if seen[key] {
+			return out, fmt.Errorf("duplicate_delivery_schema_key")
+		}
+		seen[key] = true
+		if label == "" {
+			label = key
+		}
+		out.Fields = append(out.Fields, model.DeliveryField{Key: key, Label: label, Hint: hint, Multiline: f.Multiline})
+	}
+	if len(out.Fields) == 0 {
+		return out, fmt.Errorf("delivery_schema_required")
+	}
+	return out, nil
+}
+
 // GET /api/admin/shop/products
 func (h *ClaudeShopHandler) AdminListShopProducts(c *gin.Context) {
 	ctx := c.Request.Context()
@@ -981,7 +1062,7 @@ func (h *ClaudeShopHandler) AdminListShopProducts(c *gin.Context) {
 		row := shopProductToResponse(&list[i])
 		ps := stockMap[list[i].ID.String()]
 		row["stock_dedicated"] = ps.Dedicated
-		row["stock_with_unassigned"] = ps.Dedicated + unassigned
+		row["stock_with_unassigned"] = ps.WithUnassigned
 		out = append(out, row)
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out, "stock_unassigned": unassigned})
@@ -1039,6 +1120,12 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 	if req.DeliverySchema != nil {
 		schema = *req.DeliverySchema
 	}
+	deliveryType := strings.TrimSpace(req.DeliveryType)
+	cleanSchema, err := cleanDeliverySchema(deliveryType, schema)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "自定义发货字段配置不完整：请至少保留 1 个不重复的字段 key"})
+		return
+	}
 	p := &model.ClaudeShopProduct{
 		SortOrder:           req.SortOrder,
 		Enabled:             en,
@@ -1048,8 +1135,8 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		RetailPriceCents:    rp,
 		WholesaleMinQty:     wsq,
 		WholesalePriceCents: wp,
-		DeliveryType:        strings.TrimSpace(req.DeliveryType),
-		DeliverySchema:      schema,
+		DeliveryType:        deliveryType,
+		DeliverySchema:      cleanSchema,
 		SVIPPriceCents:      svipPrice,
 	}
 	if err := h.store.InsertClaudeShopProduct(c.Request.Context(), p); err != nil {
@@ -1148,6 +1235,12 @@ func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "价格无效"})
 		return
 	}
+	cleanSchema, err := cleanDeliverySchema(cur.DeliveryType, cur.DeliverySchema)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "自定义发货字段配置不完整：请至少保留 1 个不重复的字段 key"})
+		return
+	}
+	cur.DeliverySchema = cleanSchema
 	if err := h.store.UpdateClaudeShopProduct(c.Request.Context(), cur); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "not found"})

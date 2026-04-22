@@ -202,12 +202,15 @@ CREATE TABLE claude_inventory (
     -- product_id 为 NULL 表示通用池；带 product_id 的订单优先从同 product_id 取货，
     -- 不足时兜底取通用池。见 migrate_v9.sql。
     product_id   UUID         REFERENCES claude_shop_products(id) ON DELETE SET NULL,
-    -- v10：自定义发货内容
-    payload      JSONB,                                           -- text: {"text":...}, custom_kv: {k:v,...}
-    created_at   TIMESTAMPTZ  NOT NULL DEFAULT NOW()
+    -- v10/v12：自定义发货内容；v12 起库存也记录 delivery_type，通用池按类型兜底
+    delivery_type VARCHAR(16)  NOT NULL DEFAULT 'card_key',
+    payload       JSONB,                                          -- text: {"text":...}, custom_kv: {k:v,...}
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (delivery_type IN ('card_key','text','custom_kv'))
 );
 CREATE INDEX idx_claude_inv_available ON claude_inventory (created_at ASC) WHERE status = 'available';
 CREATE INDEX idx_claude_inv_product_available ON claude_inventory (product_id, created_at ASC) WHERE status = 'available';
+CREATE INDEX idx_claude_inv_delivery_available ON claude_inventory (delivery_type, product_id, created_at ASC) WHERE status = 'available';
 
 CREATE TABLE claude_order_lines (
     id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -279,6 +282,39 @@ CREATE TABLE user_coupons (
 CREATE INDEX idx_user_coupons_account   ON user_coupons (account_id, status, acquired_at DESC);
 CREATE INDEX idx_user_coupons_coupon    ON user_coupons (coupon_id, status);
 CREATE INDEX idx_user_coupons_available ON user_coupons (account_id) WHERE status = 'available';
+
+-- ============================================================
+-- 11. SVIP activation codes (v12)
+-- ============================================================
+CREATE TABLE svip_activation_codes (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code          VARCHAR(64)  NOT NULL UNIQUE,
+    level         SMALLINT     NOT NULL DEFAULT 1,
+    duration_days INT          NOT NULL DEFAULT 30, -- 0 = permanent SVIP
+    max_uses      INT          NOT NULL DEFAULT 1,
+    used_count    INT          NOT NULL DEFAULT 0,
+    enabled       BOOLEAN      NOT NULL DEFAULT TRUE,
+    note          VARCHAR(160) NOT NULL DEFAULT '',
+    expires_at    TIMESTAMPTZ,
+    created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    updated_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    CHECK (level > 0),
+    CHECK (duration_days >= 0),
+    CHECK (max_uses > 0),
+    CHECK (used_count >= 0 AND used_count <= max_uses)
+);
+CREATE INDEX idx_svip_activation_codes_created ON svip_activation_codes (created_at DESC);
+CREATE INDEX idx_svip_activation_codes_enabled ON svip_activation_codes (enabled) WHERE enabled = TRUE;
+
+CREATE TABLE svip_activation_redemptions (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    code_id         UUID        NOT NULL REFERENCES svip_activation_codes(id) ON DELETE CASCADE,
+    account_id      UUID        NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    redeemed_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    svip_expires_at TIMESTAMPTZ,
+    UNIQUE (code_id, account_id)
+);
+CREATE INDEX idx_svip_activation_redemptions_account ON svip_activation_redemptions (account_id, redeemed_at DESC);
 
 -- ============================================================
 -- 9. 数据库性能参数（在 postgresql.conf 或 docker 环境变量中设置更佳）

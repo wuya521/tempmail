@@ -273,20 +273,28 @@ func (s *Store) CountClaudeInventoryAvailable(ctx context.Context) (int, error) 
 }
 
 // CountClaudeInventoryAvailableFor 返回某订单实际可用库存（混合池方案）。
-// productID 非空：同 product_id 专属池 + 通用池（product_id IS NULL）两部分之和（订单可兜底取用）。
-// productID 为空：仅通用池，用于无 SKU（单店模式）订单或老订单。
+// v12：通用池也按 delivery_type 区分，避免长文本 / 自定义字段 SKU 错拿“邮箱+Key”库存。
 func (s *Store) CountClaudeInventoryAvailableFor(ctx context.Context, productID *uuid.UUID) (int, error) {
 	var n int
+	deliveryType := "card_key"
 	if productID == nil {
 		err := s.pool.QueryRow(ctx,
-			`SELECT COUNT(*)::int FROM claude_inventory WHERE status = 'available' AND product_id IS NULL`,
+			`SELECT COUNT(*)::int FROM claude_inventory
+			 WHERE status = 'available' AND product_id IS NULL AND delivery_type = $1`,
+			deliveryType,
 		).Scan(&n)
 		return n, err
 	}
+	if err := s.pool.QueryRow(ctx,
+		`SELECT COALESCE(delivery_type, 'card_key') FROM claude_shop_products WHERE id = $1`,
+		*productID,
+	).Scan(&deliveryType); err != nil {
+		return 0, err
+	}
 	err := s.pool.QueryRow(ctx,
 		`SELECT COUNT(*)::int FROM claude_inventory
-		 WHERE status = 'available' AND (product_id = $1 OR product_id IS NULL)`,
-		*productID,
+		 WHERE status = 'available' AND delivery_type = $2 AND (product_id = $1 OR product_id IS NULL)`,
+		*productID, deliveryType,
 	).Scan(&n)
 	return n, err
 }
@@ -300,11 +308,39 @@ func (s *Store) GetProductStockMap(ctx context.Context) (products map[string]mod
 	).Scan(&unassigned); err != nil {
 		return nil, 0, err
 	}
-	rows, err := s.pool.Query(ctx, `
-		SELECT product_id, COUNT(*)::int
+
+	unassignedByType := map[string]int{}
+	typeRows, err := s.pool.Query(ctx, `
+		SELECT COALESCE(delivery_type, 'card_key'), COUNT(*)::int
 		FROM claude_inventory
-		WHERE status = 'available' AND product_id IS NOT NULL
-		GROUP BY product_id`)
+		WHERE status = 'available' AND product_id IS NULL
+		GROUP BY COALESCE(delivery_type, 'card_key')`)
+	if err != nil {
+		return nil, 0, err
+	}
+	for typeRows.Next() {
+		var dt string
+		var n int
+		if err = typeRows.Scan(&dt, &n); err != nil {
+			typeRows.Close()
+			return nil, 0, err
+		}
+		unassignedByType[dt] = n
+	}
+	typeRows.Close()
+	if err = typeRows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	dedicatedByProduct := map[string]int{}
+	rows, err := s.pool.Query(ctx, `
+		SELECT ci.product_id, COUNT(*)::int
+		FROM claude_inventory ci
+		JOIN claude_shop_products p ON p.id = ci.product_id
+		WHERE ci.status = 'available'
+		  AND ci.product_id IS NOT NULL
+		  AND COALESCE(ci.delivery_type, 'card_key') = COALESCE(p.delivery_type, 'card_key')
+		GROUP BY ci.product_id`)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -315,14 +351,47 @@ func (s *Store) GetProductStockMap(ctx context.Context) (products map[string]mod
 		if err = rows.Scan(&pid, &n); err != nil {
 			return nil, 0, err
 		}
+		dedicatedByProduct[pid.String()] = n
+	}
+	rows.Close()
+	if err = rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	productRows, err := s.pool.Query(ctx, `SELECT id, COALESCE(delivery_type, 'card_key') FROM claude_shop_products`)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer productRows.Close()
+	for productRows.Next() {
+		var pid uuid.UUID
+		var dt string
+		if err = productRows.Scan(&pid, &dt); err != nil {
+			return nil, 0, err
+		}
 		pidCopy := pid
+		dedicated := dedicatedByProduct[pid.String()]
 		products[pid.String()] = model.ClaudeProductStock{
-			ProductID:      &pidCopy,
-			Dedicated:      n,
-			WithUnassigned: n + unassigned,
+			ProductID:       &pidCopy,
+			Dedicated:       dedicated,
+			WithUnassigned:  dedicated + unassignedByType[dt],
+		}
+		delete(dedicatedByProduct, pid.String())
+	}
+	if err = productRows.Err(); err != nil {
+		return nil, 0, err
+	}
+	for pidStr, dedicated := range dedicatedByProduct {
+		if pid, perr := uuid.Parse(pidStr); perr == nil {
+			pidCopy := pid
+			products[pidStr] = model.ClaudeProductStock{
+				ProductID:       &pidCopy,
+				Dedicated:       dedicated,
+				WithUnassigned:  dedicated,
+			}
 		}
 	}
-	return products, unassigned, rows.Err()
+	return products, unassigned, nil
 }
 
 func (s *Store) GetClaudeInventorySummary(ctx context.Context) (*model.ClaudeInventorySummary, error) {
@@ -402,7 +471,8 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 
 	dataArgs := append(append([]interface{}{}, args...), size, offset)
 	rows, err := s.pool.Query(ctx, fmt.Sprintf(`
-		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), product_id, payload, created_at
+		SELECT id, email, api_key, status, order_id::text, COALESCE(batch_label, ''), product_id,
+		       COALESCE(delivery_type, 'card_key'), payload, created_at
 		FROM claude_inventory
 		WHERE %s
 		ORDER BY created_at DESC
@@ -420,7 +490,7 @@ func (s *Store) ListClaudeInventory(ctx context.Context, statusFilter, batchFilt
 		var orderIDText *string
 		var prodID *uuid.UUID
 		var payloadRaw []byte
-		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &prodID, &payloadRaw, &item.CreatedAt); err != nil {
+		if err := rows.Scan(&item.ID, &item.Email, &item.APIKey, &item.Status, &orderIDText, &item.BatchLabel, &prodID, &item.DeliveryType, &payloadRaw, &item.CreatedAt); err != nil {
 			return nil, 0, err
 		}
 		if orderIDText != nil && strings.TrimSpace(*orderIDText) != "" {
@@ -468,7 +538,7 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 	n := 0
 	for _, p := range pairs {
 		_, err := tx.Exec(ctx,
-			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id) VALUES ($1, $2, $3, $4)`,
+			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, delivery_type) VALUES ($1, $2, $3, $4, 'card_key')`,
 			p.Email, p.APIKey, batchLabel, productID,
 		)
 		if err != nil {
@@ -484,9 +554,13 @@ func (s *Store) ImportClaudeInventory(ctx context.Context, pairs []InventoryPair
 
 // ImportClaudeInventoryPayload v10：批量导入 text / custom_kv 模式的库存。
 // 每条 payload 作为 JSONB 写入 claude_inventory.payload；email 与 api_key 为空字符串。
-func (s *Store) ImportClaudeInventoryPayload(ctx context.Context, payloads []map[string]interface{}, batchLabel string, productID *uuid.UUID) (int, error) {
+func (s *Store) ImportClaudeInventoryPayload(ctx context.Context, payloads []map[string]interface{}, batchLabel string, productID *uuid.UUID, deliveryType string) (int, error) {
 	if len(payloads) == 0 {
 		return 0, nil
+	}
+	deliveryType = strings.TrimSpace(deliveryType)
+	if deliveryType != "text" && deliveryType != "custom_kv" {
+		return 0, fmt.Errorf("invalid_delivery_type")
 	}
 	batchLabel = strings.TrimSpace(batchLabel)
 	if len(batchLabel) > 64 {
@@ -507,8 +581,8 @@ func (s *Store) ImportClaudeInventoryPayload(ctx context.Context, payloads []map
 			return n, err
 		}
 		_, err = tx.Exec(ctx,
-			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, payload) VALUES ('', '', $1, $2, $3::jsonb)`,
-			batchLabel, productID, string(raw),
+			`INSERT INTO claude_inventory (email, api_key, batch_label, product_id, delivery_type, payload) VALUES ('', '', $1, $2, $3, $4::jsonb)`,
+			batchLabel, productID, deliveryType, string(raw),
 		)
 		if err != nil {
 			return n, err
@@ -1007,9 +1081,9 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 	if prodID != nil {
 		rows, err := tx.Query(ctx, `
 			SELECT id, email, api_key, payload FROM claude_inventory
-			WHERE status = 'available' AND product_id = $1
+			WHERE status = 'available' AND product_id = $1 AND delivery_type = $3
 			ORDER BY created_at ASC LIMIT $2 FOR UPDATE SKIP LOCKED`,
-			*prodID, qty,
+			*prodID, qty, deliveryType,
 		)
 		if err != nil {
 			return err
@@ -1029,9 +1103,9 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		rest := qty - len(picks)
 		rows, err := tx.Query(ctx, `
 			SELECT id, email, api_key, payload FROM claude_inventory
-			WHERE status = 'available' AND product_id IS NULL
+			WHERE status = 'available' AND product_id IS NULL AND delivery_type = $2
 			ORDER BY created_at ASC LIMIT $1 FOR UPDATE SKIP LOCKED`,
-			rest,
+			rest, deliveryType,
 		)
 		if err != nil {
 			return err

@@ -88,6 +88,7 @@ func main() {
 	statsH   := handler.NewStatsHandler(db)
 	couponH  := handler.NewCouponHandler(db)
 	fanH     := handler.NewFanHandler(db)
+	svipCodeH := handler.NewSVIPCodeHandler(db)
 	// v10：授予 SVIP 成功时自动发放 svip_gift 优惠券
 	handler.SetSVIPGiftHook(handler.GrantSVIPGiftsHook)
 	var ali *alipay.Client
@@ -149,6 +150,7 @@ func main() {
 		api.GET("/coupons/mine", couponH.MyList)
 		api.POST("/coupons/redeem", couponH.Redeem)
 		api.POST("/coupons/quote", couponH.Quote)
+		api.POST("/svip/redeem", svipCodeH.Redeem)
 		api.GET("/fan/status", fanH.Status)
 		api.POST("/fan/claim", fanH.Claim)
 
@@ -188,6 +190,9 @@ func main() {
 			admin.PATCH("/coupons/:id/toggle", couponH.AdminToggle)
 			admin.DELETE("/coupons/:id", couponH.AdminDelete)
 			admin.POST("/coupons/:id/grant", couponH.AdminGrant)
+			admin.GET("/svip-codes", svipCodeH.AdminList)
+			admin.POST("/svip-codes/generate", svipCodeH.AdminGenerate)
+			admin.PATCH("/svip-codes/:id/toggle", svipCodeH.AdminToggle)
 
 			admin.GET("/shop/config", shopH.AdminGetConfig)
 			admin.PUT("/shop/config", shopH.AdminPutConfig)

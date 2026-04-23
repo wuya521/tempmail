@@ -134,7 +134,6 @@ services:
       PORT: ${API_PORT}
       SMTP_SERVER_IP: ${SMTP_SERVER_IP}
       SMTP_HOSTNAME: ${SMTP_HOSTNAME}
-      INTERNAL_SECRET: ${INTERNAL_SECRET:-}
       ADMIN_KEY_FILE: /data/admin.key
       # 收款码等文件目录（默认 /data/shop，已含在 ./data 卷内）
       SHOP_ASSET_DIR: /data/shop
@@ -182,7 +181,6 @@ services:
       - "25:25"
     environment:
       DB_DSN: ${API_DB_DSN}
-      INTERNAL_SECRET: ${INTERNAL_SECRET:-}
       SMTP_HOSTNAME: ${SMTP_HOSTNAME:-mail.yahoohh.chat}
     depends_on:
       pgbouncer:

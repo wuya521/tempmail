@@ -16,6 +16,7 @@ func RateLimit(rdb *redis.Client, limit int, window int) gin.HandlerFunc {
 	windowDur := time.Duration(window) * time.Second
 
 	return func(c *gin.Context) {
+		// 使用 API Key 作为限速键
 		key := c.GetHeader("Authorization")
 		if key == "" {
 			key = c.Query("api_key")
@@ -27,29 +28,27 @@ func RateLimit(rdb *redis.Client, limit int, window int) gin.HandlerFunc {
 		redisKey := fmt.Sprintf("rl:%s", key)
 		ctx := c.Request.Context()
 
-		count, err := rdb.Incr(ctx, redisKey).Result()
+		// 使用 Redis Pipeline 减少往返（高并发优化）
+		pipe := rdb.Pipeline()
+		incr := pipe.Incr(ctx, redisKey)
+		pipe.Expire(ctx, redisKey, windowDur)
+		_, err := pipe.Exec(ctx)
+
 		if err != nil {
+			// Redis 故障时放行（fail-open）
 			c.Next()
 			return
 		}
-		if count == 1 {
-			rdb.Expire(ctx, redisKey, windowDur)
-		}
 
+		count := incr.Val()
 		remaining := int64(limit) - count
 		if remaining < 0 {
 			remaining = 0
 		}
 
-		ttl, _ := rdb.TTL(ctx, redisKey).Result()
-		resetAt := time.Now().Add(ttl).Unix()
-		if ttl <= 0 {
-			resetAt = time.Now().Add(windowDur).Unix()
-		}
-
 		c.Header("X-RateLimit-Limit", fmt.Sprintf("%d", limit))
 		c.Header("X-RateLimit-Remaining", fmt.Sprintf("%d", remaining))
-		c.Header("X-RateLimit-Reset", fmt.Sprintf("%d", resetAt))
+		c.Header("X-RateLimit-Reset", fmt.Sprintf("%d", time.Now().Add(windowDur).Unix()))
 
 		if count > int64(limit) {
 			c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{

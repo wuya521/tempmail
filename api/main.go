@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
@@ -137,6 +139,7 @@ func main() {
 	api := r.Group("/api")
 	api.Use(middleware.Auth(db))
 	api.Use(middleware.RateLimit(rdb, cfg.RateLimit, cfg.RateWindow))
+	api.Use(middleware.APICallCounter(rdb))
 	{
 		// 当前用户
 		api.GET("/me", accountH.Me)
@@ -221,11 +224,28 @@ func main() {
 			// 系统设置管理
 			admin.GET("/settings", settingH.AdminGetAll)
 			admin.PUT("/settings", settingH.AdminUpdate)
+
+			// API 调用统计
+			admin.GET("/stats/api-calls", statsH.APICallStats)
+			admin.GET("/stats/top-callers", statsH.TopCallers)
 		}
 	}
 
 	// 内部邮件投递接口（Postfix pipe 调用，仅内部网络）
 	internal := r.Group("/internal")
+	if secret := strings.TrimSpace(cfg.InternalSecret); secret != "" {
+		internal.Use(func(c *gin.Context) {
+			tok := strings.TrimSpace(c.GetHeader("X-Internal-Secret"))
+			if tok == "" {
+				tok = strings.TrimSpace(c.Query("secret"))
+			}
+			if tok != secret {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+				return
+			}
+			c.Next()
+		})
+	}
 	{
 		// 域名列表（供 Postfix 同步）
 		internal.GET("/domains", func(c *gin.Context) {
@@ -363,6 +383,40 @@ func main() {
 		}
 	}()
 
+	// ==================== API 调用统计 Redis→PG 刷入 ====================
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		log.Println("✓ API call stats flusher started (interval=5min)")
+		for {
+			<-ticker.C
+			flushAPICallStats(rdb, db)
+		}
+	}()
+
+	// ==================== 邮件自动清理（email_retention_days） ====================
+	go func() {
+		ticker := time.NewTicker(6 * time.Hour)
+		defer ticker.Stop()
+		log.Println("✓ Email retention cleaner started (interval=6h)")
+		for {
+			if daysStr, err := db.GetSetting(context.Background(), "email_retention_days"); err == nil {
+				days := 0
+				if d, e := strconv.Atoi(strings.TrimSpace(daysStr)); e == nil {
+					days = d
+				}
+				if days > 0 {
+					if n, err := db.DeleteOldEmails(context.Background(), days); err != nil {
+						log.Printf("[email-retention] error: %v", err)
+					} else if n > 0 {
+						log.Printf("[email-retention] deleted %d emails older than %d days", n, days)
+					}
+				}
+			}
+			<-ticker.C
+		}
+	}()
+
 	// ==================== 写出管理员 API Key 文件 ====================
 	go func() {
 		// 等待 DB 就绪后再读取（延迟 1 秒）
@@ -384,7 +438,11 @@ func main() {
 				log.Printf("✓ Admin API Key written to %s", keyFile)
 			}
 		}
-		log.Printf("✴ ADMIN API KEY: %s", adminKey)
+		prefix := adminKey
+		if len(prefix) > 14 {
+			prefix = prefix[:14] + "…"
+		}
+		log.Printf("✴ Admin API Key prefix: %s (full key written to %s)", prefix, keyFile)
 	}()
 
 	// ==================== 启动服务 ====================
@@ -427,6 +485,32 @@ func currentServerIP(ctx context.Context, db *store.Store, cfgIP string) string 
 		}
 	}
 	return cfgIP
+}
+
+// flushAPICallStats scans Redis for apicall:* keys and upserts totals into PG.
+func flushAPICallStats(rdb *redis.Client, db *store.Store) {
+	ctx := context.Background()
+	iter := rdb.Scan(ctx, 0, "apicall:*", 500).Iterator()
+	for iter.Next(ctx) {
+		key := iter.Val()
+		parts := strings.SplitN(key, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		accountIDStr, date := parts[1], parts[2]
+		uid, err := uuid.Parse(accountIDStr)
+		if err != nil {
+			rdb.Del(ctx, key)
+			continue
+		}
+		count, err := rdb.GetDel(ctx, key).Int()
+		if err != nil || count <= 0 {
+			continue
+		}
+		if err := db.UpsertAPICallDaily(ctx, uid, date, count); err != nil {
+			log.Printf("[api-stats-flush] upsert %s/%s error: %v", accountIDStr, date, err)
+		}
+	}
 }
 
 // currentServerHostname 返回 MX 记录应指向的 hostname：DB 的 smtp_hostname 优先，其次启动时的环境变量快照。

@@ -1,13 +1,17 @@
 package middleware
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"tempmail/model"
 	"tempmail/store"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 )
 
 const AccountKey = "account"
@@ -67,6 +71,22 @@ func AdminOnly() gin.HandlerFunc {
 			return
 		}
 		c.Next()
+	}
+}
+
+// APICallCounter records per-account daily API call counts in Redis.
+// A background goroutine should flush these to the database periodically.
+func APICallCounter(rdb *redis.Client) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		c.Next()
+		acc := GetAccount(c)
+		if acc == nil || rdb == nil {
+			return
+		}
+		today := time.Now().Format("2006-01-02")
+		key := fmt.Sprintf("apicall:%s:%s", acc.ID, today)
+		rdb.Incr(context.Background(), key)
+		rdb.Expire(context.Background(), key, 48*time.Hour)
 	}
 }
 

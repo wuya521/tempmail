@@ -115,6 +115,7 @@ INSERT INTO app_settings (key, value) VALUES ('announcement', '') ON CONFLICT DO
 INSERT INTO app_settings (key, value) VALUES ('announcement_title', '') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('announcement_level', 'info') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('site_title', 'TempMail') ON CONFLICT DO NOTHING;
+INSERT INTO app_settings (key, value) VALUES ('email_retention_days', '0') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_enabled', 'true') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_min_orders', '3') ON CONFLICT DO NOTHING;
 INSERT INTO app_settings (key, value) VALUES ('exclusive_fan_discount_bps', '9500') ON CONFLICT DO NOTHING;
@@ -315,6 +316,17 @@ CREATE TABLE svip_activation_redemptions (
     UNIQUE (code_id, account_id)
 );
 CREATE INDEX idx_svip_activation_redemptions_account ON svip_activation_redemptions (account_id, redeemed_at DESC);
+
+-- ============================================================
+-- 12. API 调用统计（v13）
+-- ============================================================
+CREATE TABLE api_call_daily (
+    account_id UUID        NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+    call_date  DATE        NOT NULL,
+    call_count INT         NOT NULL DEFAULT 0,
+    PRIMARY KEY (account_id, call_date)
+);
+CREATE INDEX idx_api_call_daily_date ON api_call_daily (call_date DESC);
 
 -- ============================================================
 -- 9. 数据库性能参数（在 postgresql.conf 或 docker 环境变量中设置更佳）

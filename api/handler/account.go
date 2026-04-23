@@ -161,19 +161,6 @@ func (h *AccountHandler) Patch(c *gin.Context) {
 // GET /api/me - 查看当前账号信息
 func (h *AccountHandler) Me(c *gin.Context) {
 	account := middleware.GetAccount(c)
-	ctx := c.Request.Context()
-
-	mailboxUsed, _ := h.store.CountMailboxes(ctx, account.ID)
-
-	quota := account.MailboxQuota
-	if quota == 0 {
-		if qStr, err := h.store.GetSetting(ctx, "max_mailboxes_per_user"); err == nil {
-			if n, e := strconv.Atoi(strings.TrimSpace(qStr)); e == nil && n > 0 {
-				quota = n
-			}
-		}
-	}
-
 	out := gin.H{
 		"id":                       account.ID,
 		"username":                 account.Username,
@@ -182,9 +169,8 @@ func (h *AccountHandler) Me(c *gin.Context) {
 		"last_seen_at":             account.LastSeenAt,
 		"svip_level":               account.SVIPLevel,
 		"svip_expires_at":          account.SVIPExpiresAt,
-		"mailbox_quota":            quota,
+		"mailbox_quota":            account.MailboxQuota,
 		"mailbox_ttl_minutes":      account.MailboxTTLMinutes,
-		"mailbox_used":             mailboxUsed,
 		"exclusive_fan_level":      account.ExclusiveFanLevel,
 		"exclusive_fan_claimed_at": account.ExclusiveFanClaimedAt,
 	}

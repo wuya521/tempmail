@@ -27,8 +27,7 @@ type Config struct {
 	RateWindow    int // seconds
 	SMTPServerIP  string // 仅从 SMTP_SERVER_IP 环境变量读取
 	SMTPHostname  string // 邮件服务器场指向的 hostname，不硬编码
-	ShopAssetDir    string // 收款码等静态文件目录
-	InternalSecret  string // Postfix→API 内部通信密钥；空=跳过验证
+	ShopAssetDir  string // 收款码等静态文件目录
 
 	// 支付宝当面付（precreate + 异步通知）；密钥仅从环境变量读取，勿写入镜像或仓库
 	AlipayAppID       string
@@ -71,8 +70,7 @@ func Load() *Config {
 		RateWindow:    rw,
 		SMTPServerIP:  os.Getenv("SMTP_SERVER_IP"),
 		SMTPHostname:  os.Getenv("SMTP_HOSTNAME"),
-		ShopAssetDir:    getEnv("SHOP_ASSET_DIR", "/data/shop"),
-		InternalSecret:  os.Getenv("INTERNAL_SECRET"),
+		ShopAssetDir:  getEnv("SHOP_ASSET_DIR", "/data/shop"),
 
 		AlipayAppID:      os.Getenv("ALIPAY_APP_ID"),
 		AlipayPrivateKey: alipayKeyFromEnvOrFile("ALIPAY_PRIVATE_KEY", "ALIPAY_PRIVATE_KEY_FILE"),

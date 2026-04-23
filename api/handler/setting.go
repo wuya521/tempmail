@@ -28,7 +28,6 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 	announce, _  := h.store.GetSetting(c.Request.Context(), "announcement")
 	announceTitle, _ := h.store.GetSetting(c.Request.Context(), "announcement_title")
 	announceLevel, _ := h.store.GetSetting(c.Request.Context(), "announcement_level")
-	emailRetention, _ := h.store.GetSetting(c.Request.Context(), "email_retention_days")
 	c.JSON(http.StatusOK, gin.H{
 		"registration_open": regOpen == "true",
 		"site_title":        siteTitle,
@@ -36,8 +35,7 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 		"smtp_hostname":     smtpHostname,
 		"announcement":      announce,
 		"announcement_title": announceTitle,
-		"announcement_level":  announceLevel,
-		"email_retention_days": emailRetention,
+		"announcement_level": announceLevel,
 	})
 }
 
@@ -72,7 +70,6 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		"mailbox_ttl_minutes":    true,
 		"announcement_title":     true,
 		"announcement_level":     true,
-		"email_retention_days":       true,
 		"exclusive_fan_enabled":      true,
 		"exclusive_fan_min_orders":   true,
 		"exclusive_fan_discount_bps": true,

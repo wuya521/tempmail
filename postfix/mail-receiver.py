@@ -20,7 +20,6 @@ import urllib.error
 #   API_URL: http://api:9000
 # 或者直接修改下面这行的默认值 "http://api:8080" → "http://api:9000"
 API_URL = os.environ.get("API_URL", "http://api:8080")
-INTERNAL_SECRET = os.environ.get("INTERNAL_SECRET", "")
 
 
 def main():
@@ -71,14 +70,10 @@ def main():
         }
     ).encode("utf-8")
 
-    headers = {"Content-Type": "application/json"}
-    if INTERNAL_SECRET:
-        headers["X-Internal-Secret"] = INTERNAL_SECRET
-
     req = urllib.request.Request(
         f"{API_URL}/internal/deliver",
         data=payload,
-        headers=headers,
+        headers={"Content-Type": "application/json"},
         method="POST",
     )
 

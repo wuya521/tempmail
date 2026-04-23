@@ -852,9 +852,6 @@ function buildMainLayout() {
         <button class="nav-item" data-page="admin-shop-orders" onclick="navigate('admin-shop-orders')">
           <span class="nav-icon">🧾</span><span>订单与发货</span>
         </button>
-        <button class="nav-item" data-page="admin-api-stats" onclick="navigate('admin-api-stats')">
-          <span class="nav-icon">📊</span><span>API 统计</span>
-        </button>
         <button class="nav-item" data-page="admin-settings" onclick="navigate('admin-settings')">
           <span class="nav-icon">⚙</span><span>系统设置</span>
         </button>
@@ -935,7 +932,6 @@ async function renderPage(page) {
     'domains-guide':  ['域名列表 & 添加指南', '查看可用域名并了解如何添加新域名'],
     'admin-accounts': ['账户管理', '创建和管理用户账户'],
     'admin-domains':  ['域名管理', '管理域名池'],
-    'admin-api-stats': ['API 统计', '用户调用量与活跃分析'],
     'admin-settings': ['系统设置', ''],
     'claude-shop':    ['自助 Claude 账号', '选购商品'],
     'claude-shop-orders': ['我的订单', '记录与发货信息'],
@@ -962,7 +958,6 @@ async function renderPage(page) {
       case 'domains-guide':  await renderDomainsGuide(container); break;
       case 'admin-accounts': await renderAdminAccounts(container); break;
       case 'admin-domains':  await renderAdminDomains(container); break;
-      case 'admin-api-stats': await renderAdminAPIStats(container); break;
       case 'admin-settings': await renderAdminSettings(container); break;
       case 'claude-shop':    await renderClaudeShop(container); break;
       case 'claude-shop-orders': await renderClaudeShopOrders(container); break;
@@ -1116,17 +1111,12 @@ window.openInbox = function(id, addr) {
 };
 
 window.createMailbox = async function() {
+  // 拉取活跃域名列表，构建选择弹窗
   let activeDomains = [];
   try {
     const all = await api.domains();
     activeDomains = (all || []).filter(d => d.is_active);
   } catch(e) { /* 获取失败时退化为随机域名 */ }
-
-  const quota = state.account ? (state.account.mailbox_quota || 0) : 0;
-  const used  = state.account ? (state.account.mailbox_used  || 0) : 0;
-  const quotaHint = quota > 0
-    ? `<div class="form-hint" style="margin-bottom:0.6rem;font-weight:500;color:${used >= quota ? 'var(--clr-danger)' : 'var(--clr-text-muted)'}">邮箱配额：${used} / ${quota}${quota === -1 ? ' (无限)' : ''}</div>`
-    : '';
 
   const old = document.querySelector('.modal-overlay');
   if (old) old.remove();
@@ -1140,7 +1130,6 @@ window.createMailbox = async function() {
     <div class="modal" style="max-width:420px">
       <div class="modal-title">+ 新建临时邮箱</div>
       <button class="modal-close" onclick="this.closest('.modal-overlay').remove()">✕</button>
-      ${quotaHint}
       <div class="form-group" style="margin-top:0.8rem">
         <label class="form-label">本地部分（@ 之前）</label>
         <input class="form-input" id="mb-address" placeholder="留空则随机生成" autocomplete="off" />
@@ -1179,7 +1168,6 @@ window.createMailbox = async function() {
       if (domain)  body.domain  = domain;
       const mb = await api.createMailbox(body);
       overlay.remove();
-      if (state.account) state.account.mailbox_used = (state.account.mailbox_used || 0) + 1;
       toast(`已创建：${mb.full_address}`, 'success');
       navigate('dashboard');
     } catch(e) {
@@ -2132,87 +2120,6 @@ window.confirmDeleteDomain = function(id, name) {
   });
 };
 
-// ─── Admin: API 统计 ─────────────────────────────────────────
-async function renderAdminAPIStats(container) {
-  const days = 7;
-  let topCallers = [];
-  let dailyData = [];
-  let total = 0;
-  try {
-    const [topRes, dailyRes] = await Promise.all([
-      apiFetch(API_BASE + '/admin/stats/top-callers?days=' + days + '&limit=20'),
-      apiFetch(API_BASE + '/admin/stats/api-calls?days=' + days + '&page=1&size=200'),
-    ]);
-    topCallers = topRes.data || [];
-    dailyData = dailyRes.data || [];
-    total = dailyRes.total || 0;
-  } catch(e) {
-    container.innerHTML = `<div class="card"><div class="card-body"><p style="color:var(--clr-danger)">加载失败：${escHtml(e.message)}</p></div></div>`;
-    return;
-  }
-
-  const userDays = {};
-  dailyData.forEach(r => {
-    if (!userDays[r.username]) userDays[r.username] = {};
-    userDays[r.username][r.call_date] = r.call_count;
-  });
-
-  const dates = [];
-  for (let i = days - 1; i >= 0; i--) {
-    const d = new Date();
-    d.setDate(d.getDate() - i);
-    dates.push(d.toISOString().split('T')[0]);
-  }
-
-  const topRows = topCallers.map((t, i) => `
-    <tr>
-      <td>${i + 1}</td>
-      <td><strong>${escHtml(t.username)}</strong></td>
-      <td style="text-align:right">${t.total_calls.toLocaleString()}</td>
-    </tr>
-  `).join('');
-
-  const heatmapUsers = Object.keys(userDays).sort((a, b) => {
-    const sumA = Object.values(userDays[a]).reduce((s, v) => s + v, 0);
-    const sumB = Object.values(userDays[b]).reduce((s, v) => s + v, 0);
-    return sumB - sumA;
-  }).slice(0, 30);
-
-  const heatRows = heatmapUsers.map(u => {
-    const cells = dates.map(d => {
-      const v = userDays[u]?.[d] || 0;
-      const opacity = v === 0 ? 0 : Math.min(0.2 + (v / 500) * 0.8, 1);
-      return `<td style="text-align:center;background:rgba(59,130,246,${opacity.toFixed(2)});color:${opacity > 0.5 ? '#fff' : 'inherit'};font-size:0.75rem;padding:0.2rem 0.4rem" title="${u} ${d}: ${v}">${v || ''}</td>`;
-    }).join('');
-    return `<tr><td style="font-size:0.8rem;white-space:nowrap">${escHtml(u)}</td>${cells}</tr>`;
-  }).join('');
-
-  const dateHeaders = dates.map(d => `<th style="font-size:0.7rem;text-align:center;padding:0.2rem">${d.slice(5)}</th>`).join('');
-
-  container.innerHTML = `
-    <div class="card" style="margin-bottom:1rem">
-      <div class="card-header"><div class="card-title">Top 调用用户（近 ${days} 天）</div></div>
-      <div class="card-body" style="padding:0">
-        ${topCallers.length === 0 ? '<p style="padding:1rem;color:var(--clr-text-muted)">暂无数据</p>' : `
-        <table class="data-table" style="width:100%">
-          <thead><tr><th>#</th><th>用户</th><th style="text-align:right">总调用</th></tr></thead>
-          <tbody>${topRows}</tbody>
-        </table>`}
-      </div>
-    </div>
-    <div class="card">
-      <div class="card-header"><div class="card-title">每日调用热力图（近 ${days} 天，共 ${total} 条记录）</div></div>
-      <div class="card-body" style="padding:0;overflow-x:auto">
-        ${heatmapUsers.length === 0 ? '<p style="padding:1rem;color:var(--clr-text-muted)">暂无数据</p>' : `
-        <table class="data-table" style="width:100%">
-          <thead><tr><th style="font-size:0.8rem">用户</th>${dateHeaders}</tr></thead>
-          <tbody>${heatRows}</tbody>
-        </table>`}
-      </div>
-    </div>
-  `;
-}
-
 // ─── Admin: 系统设置 ─────────────────────────────────────────
 async function renderAdminSettings(container) {
   let settings = {};
@@ -2228,7 +2135,6 @@ async function renderAdminSettings(container) {
   const annTitle   = settings.announcement_title    || '';
   const annLevel   = settings.announcement_level    || 'info';
   const maxMb      = settings.max_mailboxes_per_user|| '5';
-  const emailRet   = settings.email_retention_days  || '0';
   const fanEnabled = settings.exclusive_fan_enabled !== 'false';
   const fanMinOrders = settings.exclusive_fan_min_orders || '3';
   const fanDiscountFold = fanDiscountFoldFromBps(settings.exclusive_fan_discount_bps || 9500);
@@ -2317,10 +2223,6 @@ async function renderAdminSettings(container) {
 
         <!-- 每用户邮箱上限 -->
         ${inputRow('input-max-mailboxes-per-user', '每账户邮箱上限', maxMb, '每个账户同时存在的邮箱数量上限', '5')}
-        <div class="divider"></div>
-
-        <!-- 邮件自动清理 -->
-        ${inputRow('input-email-retention-days', '邮件保留天数', emailRet, '超过此天数的邮件自动删除，0 = 永久保留', '0')}
         <div class="divider"></div>
 
         <!-- 专属老粉认证 -->

@@ -27,31 +27,6 @@ func NewMailboxHandler(s *store.Store) *MailboxHandler {
 //   domain  — 指定域名（须是已激活域名），为空则随机选取
 func (h *MailboxHandler) Create(c *gin.Context) {
 	account := middleware.GetAccount(c)
-	ctx := c.Request.Context()
-
-	quota := account.MailboxQuota
-	if quota == 0 {
-		if qStr, err := h.store.GetSetting(ctx, "max_mailboxes_per_user"); err == nil {
-			if n, e := strconv.Atoi(strings.TrimSpace(qStr)); e == nil && n > 0 {
-				quota = n
-			}
-		}
-	}
-	if quota > 0 {
-		current, err := h.store.CountMailboxes(ctx, account.ID)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-			return
-		}
-		if current >= quota {
-			c.JSON(http.StatusForbidden, gin.H{
-				"error": fmt.Sprintf("已达邮箱数量上限（%d/%d），请删除旧邮箱后重试", current, quota),
-				"quota": quota,
-				"used":  current,
-			})
-			return
-		}
-	}
 
 	var req struct {
 		Address string `json:"address"`
@@ -65,7 +40,7 @@ func (h *MailboxHandler) Create(c *gin.Context) {
 	}
 	address = strings.ToLower(address)
 
-	ttlMinutes := effectiveMailboxTTL(ctx, h.store, account.MailboxTTLMinutes)
+	ttlMinutes := mailboxTTLMinutesFromStore(c.Request.Context(), h.store)
 
 	// 确定域名：指定 or 随机
 	var domainRecord *model.Domain

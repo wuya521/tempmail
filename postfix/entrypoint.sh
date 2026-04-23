@@ -22,11 +22,7 @@ cat > /usr/local/bin/sync-domains.sh << 'SCRIPT'
 # ★ 注意：这里的 api:8080 是 Docker 内部通信地址。
 # 如果你修改了 API 容器内端口（.env 的 API_PORT），
 # 需要把下面的 8080 改成对应的新端口。
-SECRET_HEADER=""
-if [ -n "$INTERNAL_SECRET" ]; then
-    SECRET_HEADER="-H X-Internal-Secret:$INTERNAL_SECRET"
-fi
-DOMAINS=$(curl -sf $SECRET_HEADER http://api:8080/internal/domains 2>/dev/null || echo "")
+DOMAINS=$(curl -sf http://api:8080/internal/domains 2>/dev/null || echo "")
 if [ -n "$DOMAINS" ]; then
     echo "$DOMAINS" | python3 -c "
 import sys, json

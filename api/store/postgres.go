@@ -501,14 +501,6 @@ func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address 
 	return &m, nil
 }
 
-// CountMailboxes returns the current number of mailboxes owned by the account.
-func (s *Store) CountMailboxes(ctx context.Context, accountID uuid.UUID) (int, error) {
-	var n int
-	err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*)::int FROM mailboxes WHERE account_id = $1`, accountID).Scan(&n)
-	return n, err
-}
-
 func (s *Store) ListMailboxes(ctx context.Context, accountID uuid.UUID, page, size int) ([]model.Mailbox, int, error) {
 	var total int
 	err := s.pool.QueryRow(ctx,
@@ -662,22 +654,6 @@ func (s *Store) GetEmail(ctx context.Context, emailID uuid.UUID, mailboxID uuid.
 	return &e, nil
 }
 
-// DeleteOldEmails deletes emails older than the given number of days.
-// Returns the count of deleted rows.
-func (s *Store) DeleteOldEmails(ctx context.Context, retentionDays int) (int64, error) {
-	if retentionDays <= 0 {
-		return 0, nil
-	}
-	tag, err := s.pool.Exec(ctx,
-		`DELETE FROM emails WHERE received_at < NOW() - ($1 || ' days')::INTERVAL`,
-		retentionDays,
-	)
-	if err != nil {
-		return 0, err
-	}
-	return tag.RowsAffected(), nil
-}
-
 func (s *Store) DeleteEmail(ctx context.Context, emailID uuid.UUID, mailboxID uuid.UUID) error {
 	tag, err := s.pool.Exec(ctx,
 		`DELETE FROM emails WHERE id = $1 AND mailbox_id = $2`, emailID, mailboxID)
@@ -688,106 +664,6 @@ func (s *Store) DeleteEmail(ctx context.Context, emailID uuid.UUID, mailboxID uu
 		return pgx.ErrNoRows
 	}
 	return nil
-}
-
-// ==================== API Call Stats ====================
-
-// UpsertAPICallDaily increments the daily call count for an account.
-func (s *Store) UpsertAPICallDaily(ctx context.Context, accountID uuid.UUID, date string, count int) error {
-	_, err := s.pool.Exec(ctx,
-		`INSERT INTO api_call_daily (account_id, call_date, call_count)
-		 VALUES ($1, $2::date, $3)
-		 ON CONFLICT (account_id, call_date) DO UPDATE SET call_count = api_call_daily.call_count + $3`,
-		accountID, date, count,
-	)
-	return err
-}
-
-// APICallDailyStat is a single day's call count for a specific account.
-type APICallDailyStat struct {
-	AccountID string `json:"account_id"`
-	Username  string `json:"username"`
-	CallDate  string `json:"call_date"`
-	CallCount int    `json:"call_count"`
-}
-
-// ListAPICallStats returns aggregated daily stats, optionally filtered by days.
-func (s *Store) ListAPICallStats(ctx context.Context, days int, page, size int) ([]APICallDailyStat, int, error) {
-	if days <= 0 {
-		days = 7
-	}
-	dateCond := fmt.Sprintf("call_date >= (CURRENT_DATE - INTERVAL '%d days')", days)
-
-	var total int
-	if err := s.pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM api_call_daily WHERE `+dateCond,
-	).Scan(&total); err != nil {
-		return nil, 0, err
-	}
-
-	rows, err := s.pool.Query(ctx,
-		`SELECT d.account_id, a.username, d.call_date::text, d.call_count
-		 FROM api_call_daily d
-		 JOIN accounts a ON a.id = d.account_id
-		 WHERE `+dateCond+`
-		 ORDER BY d.call_date DESC, d.call_count DESC
-		 LIMIT $1 OFFSET $2`,
-		size, (page-1)*size,
-	)
-	if err != nil {
-		return nil, 0, err
-	}
-	defer rows.Close()
-
-	out := []APICallDailyStat{}
-	for rows.Next() {
-		var s APICallDailyStat
-		if err := rows.Scan(&s.AccountID, &s.Username, &s.CallDate, &s.CallCount); err != nil {
-			return nil, 0, err
-		}
-		out = append(out, s)
-	}
-	return out, total, rows.Err()
-}
-
-// TopAPICallers returns top N callers in the given period.
-type TopAPICaller struct {
-	AccountID  string `json:"account_id"`
-	Username   string `json:"username"`
-	TotalCalls int    `json:"total_calls"`
-}
-
-func (s *Store) TopAPICallers(ctx context.Context, days, limit int) ([]TopAPICaller, error) {
-	if days <= 0 {
-		days = 7
-	}
-	if limit <= 0 || limit > 100 {
-		limit = 20
-	}
-	rows, err := s.pool.Query(ctx,
-		fmt.Sprintf(`SELECT d.account_id, a.username, SUM(d.call_count)::int AS total
-		 FROM api_call_daily d
-		 JOIN accounts a ON a.id = d.account_id
-		 WHERE d.call_date >= (CURRENT_DATE - INTERVAL '%d days')
-		 GROUP BY d.account_id, a.username
-		 ORDER BY total DESC
-		 LIMIT $1`, days),
-		limit,
-	)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-
-	out := []TopAPICaller{}
-	for rows.Next() {
-		var t TopAPICaller
-		if err := rows.Scan(&t.AccountID, &t.Username, &t.TotalCalls); err != nil {
-			return nil, err
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
 }
 
 // ==================== Helpers ====================

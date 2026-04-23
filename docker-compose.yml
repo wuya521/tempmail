@@ -183,6 +183,7 @@ services:
     environment:
       DB_DSN: ${API_DB_DSN}
       INTERNAL_SECRET: ${INTERNAL_SECRET:-}
+      SMTP_HOSTNAME: ${SMTP_HOSTNAME:-mail.yahoohh.chat}
     depends_on:
       pgbouncer:
         condition: service_started

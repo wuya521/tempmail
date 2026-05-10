@@ -11,10 +11,10 @@ import (
 	"github.com/google/uuid"
 )
 
-// ErrExclusiveFanNotEligible 表示当前购买次数尚未达到“专属老粉”领取门槛。
+// ErrExclusiveFanNotEligible 表示当前购买次数尚未达到"专属老粉"领取门槛。
 var ErrExclusiveFanNotEligible = errors.New("exclusive fan not eligible")
 
-// ExclusiveFanConfig “专属老粉”认证配置。
+// ExclusiveFanConfig "专属老粉"认证配置。
 //
 // DiscountBps 使用基点表示商品实付比例：
 //   - 10000 = 10 折（无折扣）
@@ -82,7 +82,46 @@ func (s *Store) CountFulfilledClaudeOrdersForAccount(ctx context.Context, accoun
 	return n, err
 }
 
-// ClaimExclusiveFan 在满足门槛时为用户领取“专属老粉”认证。
+// AdminGrantExclusiveFan 管理员直接赠送老粉认证（无需满足订单门槛）
+func (s *Store) AdminGrantExclusiveFan(ctx context.Context, accountID uuid.UUID, level int) (*model.Account, bool, error) {
+	if level <= 0 {
+		level = 1
+	}
+	acc, err := s.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return nil, false, err
+	}
+	if acc.ExclusiveFanLevel >= level {
+		return acc, false, nil
+	}
+	_, err = s.pool.Exec(ctx,
+		`UPDATE accounts
+		 SET exclusive_fan_level = $2,
+		     exclusive_fan_claimed_at = COALESCE(exclusive_fan_claimed_at, NOW()),
+		     updated_at = NOW()
+		 WHERE id = $1`,
+		accountID, level,
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	acc, err = s.GetAccountByID(ctx, accountID)
+	if err != nil {
+		return nil, false, err
+	}
+	return acc, true, nil
+}
+
+// AdminRevokeExclusiveFan 管理员撤销老粉认证
+func (s *Store) AdminRevokeExclusiveFan(ctx context.Context, accountID uuid.UUID) error {
+	_, err := s.pool.Exec(ctx,
+		`UPDATE accounts SET exclusive_fan_level = 0, exclusive_fan_claimed_at = NULL, updated_at = NOW() WHERE id = $1`,
+		accountID,
+	)
+	return err
+}
+
+// ClaimExclusiveFan 在满足门槛时为用户领取"专属老粉"认证。
 // 返回：最新账号、是否本次新领取、已完成订单笔数。
 func (s *Store) ClaimExclusiveFan(ctx context.Context, accountID uuid.UUID, minOrders int) (*model.Account, bool, int, error) {
 	if minOrders < 1 {

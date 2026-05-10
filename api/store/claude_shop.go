@@ -21,7 +21,7 @@ import (
 // productColumns v10 起 SELECT 统一列表（顺序需与 scanClaudeShopProduct 一致）
 const productColumns = `id, sort_order, enabled, title, description, tag,
 	retail_price_cents, wholesale_min_qty, wholesale_price_cents,
-	delivery_type, delivery_schema, svip_price_cents,
+	delivery_type, delivery_schema, svip_price_cents, fixed_content,
 	created_at, updated_at`
 
 // orderColumns v10 订单 SELECT 列表
@@ -1058,15 +1058,40 @@ func (s *Store) FulfillClaudeOrder(ctx context.Context, orderID uuid.UUID) error
 		return fmt.Errorf("order_not_awaiting_payment")
 	}
 
-	// 查订单商品的发货类型（订单无 SKU 时默认 card_key）
+	// 查订单商品的发货类型和固定内容
 	deliveryType := "card_key"
+	fixedContent := ""
 	if prodID != nil {
 		if err := tx.QueryRow(ctx,
-			`SELECT COALESCE(delivery_type, 'card_key') FROM claude_shop_products WHERE id = $1`,
+			`SELECT COALESCE(delivery_type, 'card_key'), COALESCE(fixed_content, '') FROM claude_shop_products WHERE id = $1`,
 			*prodID,
-		).Scan(&deliveryType); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		).Scan(&deliveryType, &fixedContent); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 			return err
 		}
+	}
+
+	// 固定发货内容模式：不消耗库存，每份订单都返回相同内容
+	if fixedContent != "" {
+		for i := 0; i < qty; i++ {
+			payloadJSON := fmt.Sprintf(`{"text":%q}`, fixedContent)
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO claude_order_lines (order_id, line_index, email, api_key, delivery_type, payload)
+				VALUES ($1, $2, '', '', $3, $4::jsonb)`,
+				orderID, i, deliveryType, payloadJSON,
+			); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.Exec(ctx, `UPDATE claude_orders SET status = 'fulfilled', fulfilled_at = NOW() WHERE id = $1`, orderID); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE user_coupons SET status = 'used', used_at = NOW() WHERE order_id = $1 AND status = 'available'`,
+			orderID,
+		); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
 	}
 
 	type pick struct {
@@ -1169,7 +1194,7 @@ func scanClaudeShopProduct(row interface{ Scan(...interface{}) error }) (*model.
 	if err := row.Scan(
 		&p.ID, &p.SortOrder, &p.Enabled, &p.Title, &p.Description, &p.Tag,
 		&p.RetailPriceCents, &p.WholesaleMinQty, &p.WholesalePriceCents,
-		&p.DeliveryType, &schemaRaw, &svipPrice,
+		&p.DeliveryType, &schemaRaw, &svipPrice, &p.FixedContent,
 		&p.CreatedAt, &p.UpdatedAt,
 	); err != nil {
 		return nil, err
@@ -1271,13 +1296,13 @@ func (s *Store) InsertClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 		INSERT INTO claude_shop_products (
 			sort_order, enabled, title, description, tag,
 			retail_price_cents, wholesale_min_qty, wholesale_price_cents,
-			delivery_type, delivery_schema, svip_price_cents
+			delivery_type, delivery_schema, svip_price_cents, fixed_content
 		)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::jsonb,$11,$12)
 		RETURNING id, created_at, updated_at`,
 		p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
 		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
-		p.DeliveryType, schemaArg, svipPrice,
+		p.DeliveryType, schemaArg, svipPrice, p.FixedContent,
 	).Scan(&p.ID, &p.CreatedAt, &p.UpdatedAt)
 }
 
@@ -1302,11 +1327,11 @@ func (s *Store) UpdateClaudeShopProduct(ctx context.Context, p *model.ClaudeShop
 		  sort_order = $2, enabled = $3, title = $4, description = $5, tag = $6,
 		  retail_price_cents = $7, wholesale_min_qty = $8, wholesale_price_cents = $9,
 		  delivery_type = $10, delivery_schema = $11::jsonb, svip_price_cents = $12,
-		  updated_at = NOW()
+		  fixed_content = $13, updated_at = NOW()
 		WHERE id = $1`,
 		p.ID, p.SortOrder, p.Enabled, p.Title, p.Description, p.Tag,
 		p.RetailPriceCents, p.WholesaleMinQty, p.WholesalePriceCents,
-		p.DeliveryType, schemaArg, svipPrice,
+		p.DeliveryType, schemaArg, svipPrice, p.FixedContent,
 	)
 	if err != nil {
 		return err

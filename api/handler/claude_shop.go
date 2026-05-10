@@ -62,6 +62,8 @@ func shopProductToResponse(p *model.ClaudeShopProduct) gin.H {
 		"wholesale_price_cents": p.WholesalePriceCents,
 		"delivery_type":         p.DeliveryType,
 		"delivery_schema":       p.DeliverySchema,
+		"fixed_content":         p.FixedContent,
+		"has_fixed_content":     p.FixedContent != "",
 		"created_at":            p.CreatedAt,
 		"updated_at":            p.UpdatedAt,
 	}
@@ -101,6 +103,10 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 		if available == 0 && ps.Dedicated > 0 {
 			available = ps.Dedicated
 		}
+		hasFixed := p.FixedContent != ""
+		if hasFixed {
+			available = 999
+		}
 		row := gin.H{
 			"id":                    p.ID.String(),
 			"title":                 p.Title,
@@ -114,6 +120,7 @@ func (h *ClaudeShopHandler) PublicSummary(c *gin.Context) {
 			"delivery_type":         p.DeliveryType,
 			"stock_dedicated":       ps.Dedicated,
 			"stock_available":       available,
+			"has_fixed_content":     hasFixed,
 		}
 		if p.SVIPPriceCents != nil {
 			row["svip_price_cents"] = *p.SVIPPriceCents
@@ -1083,6 +1090,7 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		DeliveryType       string   `json:"delivery_type"`
 		DeliverySchema     *model.DeliverySchema `json:"delivery_schema"`
 		SVIPPriceYuan      *float64 `json:"svip_price_yuan"`
+		FixedContent       *string  `json:"fixed_content"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1126,6 +1134,10 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "自定义发货字段配置不完整：请至少保留 1 个不重复的字段 key"})
 		return
 	}
+	fixedContent := ""
+	if req.FixedContent != nil {
+		fixedContent = *req.FixedContent
+	}
 	p := &model.ClaudeShopProduct{
 		SortOrder:           req.SortOrder,
 		Enabled:             en,
@@ -1138,6 +1150,7 @@ func (h *ClaudeShopHandler) AdminCreateShopProduct(c *gin.Context) {
 		DeliveryType:        deliveryType,
 		DeliverySchema:      cleanSchema,
 		SVIPPriceCents:      svipPrice,
+		FixedContent:        fixedContent,
 	}
 	if err := h.store.InsertClaudeShopProduct(c.Request.Context(), p); err != nil {
 		if err.Error() == "invalid_delivery_type" {
@@ -1179,10 +1192,14 @@ func (h *ClaudeShopHandler) AdminUpdateShopProduct(c *gin.Context) {
 		DeliverySchema     *model.DeliverySchema `json:"delivery_schema"`
 		SVIPPriceYuan      *float64 `json:"svip_price_yuan"`
 		ClearSVIPPrice     *bool    `json:"clear_svip_price"`
+		FixedContent       *string  `json:"fixed_content"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	if req.FixedContent != nil {
+		cur.FixedContent = *req.FixedContent
 	}
 	if req.SortOrder != nil {
 		cur.SortOrder = *req.SortOrder

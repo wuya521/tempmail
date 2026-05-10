@@ -13,6 +13,33 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// checkMailboxQuota 判断用户是否还能创建邮箱（配额 -1=无限，0=用全局默认，正数=专属上限）
+func checkMailboxQuota(ctx *gin.Context, s *store.Store, account *model.Account) (bool, string) {
+	quota := account.MailboxQuota
+	if quota == -1 {
+		return true, ""
+	}
+	if quota == 0 {
+		globalStr, err := s.GetSetting(ctx.Request.Context(), "max_mailboxes_per_user")
+		if err == nil && strings.TrimSpace(globalStr) != "" {
+			if n, e := strconv.Atoi(strings.TrimSpace(globalStr)); e == nil && n > 0 {
+				quota = n
+			}
+		}
+	}
+	if quota <= 0 {
+		return true, ""
+	}
+	current, err := s.CountMailboxesForAccount(ctx.Request.Context(), account.ID)
+	if err != nil {
+		return false, "检查配额失败"
+	}
+	if current >= quota {
+		return false, fmt.Sprintf("已达邮箱上限 %d 个，无法继续创建", quota)
+	}
+	return true, ""
+}
+
 type MailboxHandler struct {
 	store *store.Store
 }
@@ -27,6 +54,11 @@ func NewMailboxHandler(s *store.Store) *MailboxHandler {
 //   domain  — 指定域名（须是已激活域名），为空则随机选取
 func (h *MailboxHandler) Create(c *gin.Context) {
 	account := middleware.GetAccount(c)
+
+	if ok, msg := checkMailboxQuota(c, h.store, account); !ok {
+		c.JSON(http.StatusForbidden, gin.H{"error": msg})
+		return
+	}
 
 	var req struct {
 		Address string `json:"address"`

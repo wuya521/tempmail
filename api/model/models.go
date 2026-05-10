@@ -100,6 +100,7 @@ type ClaudeShopProduct struct {
 	DeliveryType     string          `json:"delivery_type"`             // card_key | text | custom_kv
 	DeliverySchema   DeliverySchema  `json:"delivery_schema"`           // custom_kv 时字段定义
 	SVIPPriceCents   *int            `json:"svip_price_cents,omitempty"` // NULL=不设
+	FixedContent     string          `json:"fixed_content,omitempty"`   // 非空=固定发货内容（永久有货，不消耗库存）
 	CreatedAt        time.Time       `json:"created_at"`
 	UpdatedAt        time.Time       `json:"updated_at"`
 }

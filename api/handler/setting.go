@@ -28,6 +28,13 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 	announce, _  := h.store.GetSetting(c.Request.Context(), "announcement")
 	announceTitle, _ := h.store.GetSetting(c.Request.Context(), "announcement_title")
 	announceLevel, _ := h.store.GetSetting(c.Request.Context(), "announcement_level")
+	popupEnabled, _ := h.store.GetSetting(c.Request.Context(), "popup_enabled")
+	popupTitle, _ := h.store.GetSetting(c.Request.Context(), "popup_title")
+	popupContent, _ := h.store.GetSetting(c.Request.Context(), "popup_content")
+	popupImageURL, _ := h.store.GetSetting(c.Request.Context(), "popup_image_url")
+	popupLinkURL, _ := h.store.GetSetting(c.Request.Context(), "popup_link_url")
+	popupLinkText, _ := h.store.GetSetting(c.Request.Context(), "popup_link_text")
+	popupID, _ := h.store.GetSetting(c.Request.Context(), "popup_id")
 	c.JSON(http.StatusOK, gin.H{
 		"registration_open": regOpen == "true",
 		"site_title":        siteTitle,
@@ -36,6 +43,13 @@ func (h *SettingHandler) GetPublic(c *gin.Context) {
 		"announcement":      announce,
 		"announcement_title": announceTitle,
 		"announcement_level": announceLevel,
+		"popup_enabled":     popupEnabled == "true",
+		"popup_title":       popupTitle,
+		"popup_content":     popupContent,
+		"popup_image_url":   popupImageURL,
+		"popup_link_url":    popupLinkURL,
+		"popup_link_text":   popupLinkText,
+		"popup_id":          popupID,
 	})
 }
 
@@ -73,6 +87,14 @@ func (h *SettingHandler) AdminUpdate(c *gin.Context) {
 		"exclusive_fan_enabled":      true,
 		"exclusive_fan_min_orders":   true,
 		"exclusive_fan_discount_bps": true,
+		"email_retention_days":       true,
+		"popup_enabled":             true,
+		"popup_title":               true,
+		"popup_content":             true,
+		"popup_image_url":           true,
+		"popup_link_url":            true,
+		"popup_link_text":           true,
+		"popup_id":                  true,
 	}
 
 	for k, v := range req {

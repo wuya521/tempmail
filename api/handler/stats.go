@@ -26,3 +26,18 @@ func (h *StatsHandler) Get(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, stats)
 }
+
+// GET /api/admin/dashboard — 管理员数据仪表盘
+func (h *StatsHandler) AdminDashboard(c *gin.Context) {
+	ctx := c.Request.Context()
+	dash, err := h.store.GetDashboardStats(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	recent, _ := h.store.GetRecentUsers(ctx, 10)
+	c.JSON(http.StatusOK, gin.H{
+		"stats":        dash,
+		"recent_users": recent,
+	})
+}

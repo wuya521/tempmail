@@ -23,7 +23,7 @@ func fanDiscountFold(discountBps int) float64 {
 }
 
 // GET /api/fan/status
-// 返回当前用户“专属老粉”认证领取状态与门槛。
+// 返回当前用户"专属老粉"认证领取状态与门槛。
 func (h *FanHandler) Status(c *gin.Context) {
 	acc := middleware.GetAccount(c)
 	ctx := c.Request.Context()
@@ -48,7 +48,7 @@ func (h *FanHandler) Status(c *gin.Context) {
 }
 
 // POST /api/fan/claim
-// 用户在满足购买次数后自行领取“专属老粉”认证，并自动领取 fan_gift 优惠券。
+// 用户在满足购买次数后自行领取"专属老粉"认证，并自动领取 fan_gift 优惠券。
 func (h *FanHandler) Claim(c *gin.Context) {
 	acc := middleware.GetAccount(c)
 	ctx := c.Request.Context()
@@ -92,5 +92,56 @@ func (h *FanHandler) Claim(c *gin.Context) {
 		"fulfilled_orders":           doneOrders,
 		"exclusive_fan_discount_bps":  cfg.DiscountBps,
 		"exclusive_fan_discount_fold": fanDiscountFold(cfg.DiscountBps),
+	})
+}
+
+// POST /api/admin/accounts/:id/fan  body: { "level": 1 }  level<=0 撤销
+func (h *FanHandler) AdminGrant(c *gin.Context) {
+	id, err := parseUUID(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid account id"})
+		return
+	}
+	var req struct {
+		Level int `json:"level"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	ctx := c.Request.Context()
+
+	if req.Level <= 0 {
+		if err := h.store.AdminRevokeExclusiveFan(ctx, id); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+			return
+		}
+		acc, _ := h.store.GetAccountByID(ctx, id)
+		c.JSON(http.StatusOK, gin.H{"message": "老粉认证已撤销", "account": acc})
+		return
+	}
+
+	acc, newlyGranted, err := h.store.AdminGrantExclusiveFan(ctx, id, req.Level)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	gifted := 0
+	if newlyGranted {
+		if n, gerr := h.store.GrantAutoGifts(ctx, acc.ID, "fan"); gerr == nil {
+			gifted = n
+		}
+	}
+
+	msg := "已经是老粉"
+	if newlyGranted {
+		msg = "老粉认证已赠送"
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"message":        msg,
+		"account":        acc,
+		"newly_granted":  newlyGranted,
+		"gifted_coupons": gifted,
 	})
 }

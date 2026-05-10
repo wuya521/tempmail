@@ -140,6 +140,93 @@ func (h *SVIPCodeHandler) AdminGenerate(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"items": items, "total": len(items)})
 }
 
+// POST /api/admin/svip-codes/generate-and-list
+// 批量生成 SVIP 兑换码并作为库存上架到指定商品
+func (h *SVIPCodeHandler) AdminGenerateAndList(c *gin.Context) {
+	var req struct {
+		Count        int     `json:"count"`
+		DurationDays int     `json:"duration_days"`
+		MaxUses      int     `json:"max_uses"`
+		Note         string  `json:"note"`
+		ExpiresAt    *string `json:"expires_at"`
+		ProductID    string  `json:"product_id" binding:"required"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Count <= 0 {
+		req.Count = 1
+	}
+	if req.MaxUses <= 0 {
+		req.MaxUses = 1
+	}
+
+	pid, perr := parseUUID(strings.TrimSpace(req.ProductID))
+	if perr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "product_id 无效"})
+		return
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresAt != nil && strings.TrimSpace(*req.ExpiresAt) != "" {
+		t, err := time.Parse(time.RFC3339, strings.TrimSpace(*req.ExpiresAt))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "expires_at 必须是 RFC3339 时间"})
+			return
+		}
+		expiresAt = &t
+	}
+
+	ctx := c.Request.Context()
+	items, err := h.store.GenerateSVIPActivationCodes(ctx, store.SVIPActivationCodeCreateOptions{
+		Count:        req.Count,
+		Level:        1,
+		DurationDays: req.DurationDays,
+		MaxUses:      req.MaxUses,
+		Note:         req.Note,
+		ExpiresAt:    expiresAt,
+	})
+	if err != nil {
+		switch err.Error() {
+		case "invalid_count":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "生成数量需在 1-200 之间"})
+		case "invalid_duration_days":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "有效期天数不能小于 0"})
+		case "invalid_max_uses":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "每码可用次数需在 1-1000 之间"})
+		case "invalid_note":
+			c.JSON(http.StatusBadRequest, gin.H{"error": "备注最长 160 字符"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		}
+		return
+	}
+
+	payloads := make([]map[string]interface{}, 0, len(items))
+	for _, item := range items {
+		payloads = append(payloads, map[string]interface{}{
+			"text": "SVIP兑换码: " + item.Code,
+		})
+	}
+	batch := "svip-" + time.Now().Format("0102-150405")
+	n, importErr := h.store.ImportClaudeInventoryPayload(ctx, payloads, batch, &pid, "text")
+	if importErr != nil {
+		c.JSON(http.StatusOK, gin.H{
+			"items":        items,
+			"total":        len(items),
+			"import_error": importErr.Error(),
+		})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"items":    items,
+		"total":    len(items),
+		"imported": n,
+		"batch":    batch,
+	})
+}
+
 // PATCH /api/admin/svip-codes/:id/toggle  body: { "enabled": true }
 func (h *SVIPCodeHandler) AdminToggle(c *gin.Context) {
 	id, err := parseUUID(c.Param("id"))

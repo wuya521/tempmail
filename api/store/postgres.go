@@ -280,6 +280,14 @@ func (s *Store) SetMailboxQuota(ctx context.Context, accountID uuid.UUID, quota 
 	return err
 }
 
+// CountMailboxesForAccount 统计某账户当前邮箱总数（含未过期的）
+func (s *Store) CountMailboxesForAccount(ctx context.Context, accountID uuid.UUID) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM mailboxes WHERE account_id = $1`, accountID).Scan(&n)
+	return n, err
+}
+
 // SetMailboxTTLMinutes 设置账户专属邮箱 TTL（NULL=默认，0=永不过期，正数=分钟）
 func (s *Store) SetMailboxTTLMinutes(ctx context.Context, accountID uuid.UUID, ttlMinutes *int) error {
 	_, err := s.pool.Exec(ctx,
@@ -474,6 +482,90 @@ func (s *Store) GetStats(ctx context.Context) (*model.Stats, error) {
 	return &st, nil
 }
 
+// ==================== Dashboard ====================
+
+type DashboardStats struct {
+	TodayNewUsers     int `json:"today_new_users"`
+	WeekNewUsers      int `json:"week_new_users"`
+	MonthNewUsers     int `json:"month_new_users"`
+	TodayActiveUsers  int `json:"today_active_users"`
+	WeekActiveUsers   int `json:"week_active_users"`
+	MonthActiveUsers  int `json:"month_active_users"`
+	TotalOrders       int `json:"total_orders"`
+	TodayOrders       int `json:"today_orders"`
+	PendingOrders     int `json:"pending_orders"`
+	TotalRevenueCents int `json:"total_revenue_cents"`
+	SVIPUsers         int `json:"svip_users"`
+	FanUsers          int `json:"fan_users"`
+	TotalAccounts     int `json:"total_accounts"`
+	TotalMailboxes    int `json:"total_mailboxes"`
+	TotalEmails       int `json:"total_emails"`
+}
+
+func (s *Store) GetDashboardStats(ctx context.Context) (*DashboardStats, error) {
+	var d DashboardStats
+	err := s.pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT COUNT(*) FROM accounts WHERE created_at >= CURRENT_DATE)::int,
+		  (SELECT COUNT(*) FROM accounts WHERE created_at >= CURRENT_DATE - INTERVAL '7 days')::int,
+		  (SELECT COUNT(*) FROM accounts WHERE created_at >= CURRENT_DATE - INTERVAL '30 days')::int,
+		  (SELECT COUNT(*) FROM accounts WHERE last_seen_at >= CURRENT_DATE)::int,
+		  (SELECT COUNT(*) FROM accounts WHERE last_seen_at >= CURRENT_DATE - INTERVAL '7 days')::int,
+		  (SELECT COUNT(*) FROM accounts WHERE last_seen_at >= CURRENT_DATE - INTERVAL '30 days')::int,
+		  (SELECT COUNT(*) FROM claude_orders WHERE status = 'fulfilled')::int,
+		  (SELECT COUNT(*) FROM claude_orders WHERE created_at >= CURRENT_DATE)::int,
+		  (SELECT COUNT(*) FROM claude_orders WHERE status = 'awaiting_payment')::int,
+		  COALESCE((SELECT SUM(total_cents) FROM claude_orders WHERE status = 'fulfilled'), 0)::int,
+		  (SELECT COUNT(*) FROM accounts WHERE svip_level > 0 AND (svip_expires_at IS NULL OR svip_expires_at > NOW()))::int,
+		  (SELECT COUNT(*) FROM accounts WHERE exclusive_fan_level > 0)::int,
+		  (SELECT COUNT(*) FROM accounts WHERE is_active = TRUE)::int,
+		  (SELECT COUNT(*) FROM mailboxes)::int,
+		  (SELECT COUNT(*) FROM emails)::int
+	`).Scan(
+		&d.TodayNewUsers, &d.WeekNewUsers, &d.MonthNewUsers,
+		&d.TodayActiveUsers, &d.WeekActiveUsers, &d.MonthActiveUsers,
+		&d.TotalOrders, &d.TodayOrders, &d.PendingOrders,
+		&d.TotalRevenueCents,
+		&d.SVIPUsers, &d.FanUsers,
+		&d.TotalAccounts, &d.TotalMailboxes, &d.TotalEmails,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &d, nil
+}
+
+type RecentUser struct {
+	ID        uuid.UUID  `json:"id"`
+	Username  string     `json:"username"`
+	CreatedAt time.Time  `json:"created_at"`
+	LastSeen  *time.Time `json:"last_seen_at"`
+	SVIPLevel int        `json:"svip_level"`
+	FanLevel  int        `json:"exclusive_fan_level"`
+}
+
+func (s *Store) GetRecentUsers(ctx context.Context, limit int) ([]RecentUser, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	rows, err := s.pool.Query(ctx,
+		`SELECT id, username, created_at, last_seen_at, svip_level, exclusive_fan_level
+		 FROM accounts ORDER BY created_at DESC LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var users []RecentUser
+	for rows.Next() {
+		var u RecentUser
+		if err := rows.Scan(&u.ID, &u.Username, &u.CreatedAt, &u.LastSeen, &u.SVIPLevel, &u.FanLevel); err != nil {
+			return nil, err
+		}
+		users = append(users, u)
+	}
+	return users, nil
+}
+
 // ==================== Mailbox ====================
 
 func (s *Store) CreateMailbox(ctx context.Context, accountID uuid.UUID, address string, domainID int, fullAddress string, ttlMinutes int) (*model.Mailbox, error) {
@@ -568,6 +660,21 @@ func (s *Store) GetMailboxByFullAddress(ctx context.Context, fullAddress string)
 // DeleteExpiredMailboxes 刪除已过期的邮箱（及其所有邮件）
 func (s *Store) DeleteExpiredMailboxes(ctx context.Context) (int64, error) {
 	tag, err := s.pool.Exec(ctx, `DELETE FROM mailboxes WHERE expires_at IS NOT NULL AND expires_at < NOW()`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// DeleteOldEmails 删除超过 retentionDays 天的邮件（0=不清理）
+func (s *Store) DeleteOldEmails(ctx context.Context, retentionDays int) (int64, error) {
+	if retentionDays <= 0 {
+		return 0, nil
+	}
+	tag, err := s.pool.Exec(ctx,
+		`DELETE FROM emails WHERE received_at < NOW() - ($1 || ' days')::INTERVAL`,
+		retentionDays,
+	)
 	if err != nil {
 		return 0, err
 	}

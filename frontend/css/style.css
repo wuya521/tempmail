@@ -1859,3 +1859,7 @@ tr:hover td { background: rgba(184,92,56,0.04); }
   margin-right: 0.35rem;
   font-weight: 500;
 }
+
+/* 弹窗动画 */
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes slideUp { from { opacity: 0; transform: translateY(30px) scale(0.95); } to { opacity: 1; transform: translateY(0) scale(1); } }

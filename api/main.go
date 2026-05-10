@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -174,14 +175,16 @@ func main() {
 		admin := api.Group("/admin")
 		admin.Use(middleware.AdminOnly())
 		{
+			admin.GET("/dashboard", statsH.AdminDashboard)
 			admin.POST("/accounts", accountH.Create)
 			admin.GET("/accounts", accountH.List)
 			admin.PATCH("/accounts/:id", accountH.Patch)
 			admin.DELETE("/accounts/:id", accountH.Delete)
 			admin.POST("/accounts/:id/rotate-key", accountH.AdminRotateKey)
-			// v10：SVIP 授权 + 账户配额
+			// v10：SVIP 授权 + 账户配额 + 老粉赠送
 			admin.POST("/accounts/:id/svip", accountH.GrantSVIP)
 			admin.POST("/accounts/:id/quota", accountH.SetQuota)
+			admin.POST("/accounts/:id/fan", fanH.AdminGrant)
 
 			// v10：优惠券管理
 			admin.GET("/coupons", couponH.AdminList)
@@ -192,6 +195,7 @@ func main() {
 			admin.POST("/coupons/:id/grant", couponH.AdminGrant)
 			admin.GET("/svip-codes", svipCodeH.AdminList)
 			admin.POST("/svip-codes/generate", svipCodeH.AdminGenerate)
+			admin.POST("/svip-codes/generate-and-list", svipCodeH.AdminGenerateAndList)
 			admin.PATCH("/svip-codes/:id/toggle", svipCodeH.AdminToggle)
 
 			admin.GET("/shop/config", shopH.AdminGetConfig)
@@ -340,6 +344,29 @@ func main() {
 					}
 				}
 			}
+		}
+	}()
+
+	// ==================== 邮件自动清除（每小时一次） ====================
+	go func() {
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		log.Println("✓ Email retention cleaner started (interval=1h)")
+		for {
+			retDays := 30
+			if s, err := db.GetSetting(context.Background(), "email_retention_days"); err == nil {
+				if n, e := strconv.Atoi(strings.TrimSpace(s)); e == nil && n >= 0 {
+					retDays = n
+				}
+			}
+			if retDays > 0 {
+				if n, err := db.DeleteOldEmails(context.Background(), retDays); err != nil {
+					log.Printf("[email-retention] error: %v", err)
+				} else if n > 0 {
+					log.Printf("[email-retention] deleted %d emails older than %d days", n, retDays)
+				}
+			}
+			<-ticker.C
 		}
 	}()
 

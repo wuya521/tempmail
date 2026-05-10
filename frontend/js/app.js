@@ -459,9 +459,12 @@ const api = {
     createAccount: body => apiFetch(API_BASE + '/admin/accounts', { method: 'POST', body: JSON.stringify(body) }),
     deleteAccount: id   => apiFetch(API_BASE + '/admin/accounts/' + id, { method: 'DELETE' }),
     rotateAccountKey: id => apiFetch(API_BASE + '/admin/accounts/' + id + '/rotate-key', { method: 'POST', body: '{}' }),
-    // v10：SVIP 授权/撤销 + 配额
+    // v10：SVIP 授权/撤销 + 配额 + 老粉赠送
     grantSVIP:    (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id + '/svip',  { method: 'POST', body: JSON.stringify(body || {}) }),
     setAccountQuota: (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id + '/quota', { method: 'POST', body: JSON.stringify(body || {}) }),
+    grantFan:     (id, body) => apiFetch(API_BASE + '/admin/accounts/' + id + '/fan', { method: 'POST', body: JSON.stringify(body || { level: 1 }) }),
+    getDashboard: () => apiFetch(API_BASE + '/admin/dashboard'),
+    svipCodeGenerateAndList: body => apiFetch(API_BASE + '/admin/svip-codes/generate-and-list', { method: 'POST', body: JSON.stringify(body || {}) }),
     // v10：优惠券管理
     couponList:   (status='', q='', page=1, size=20) => {
       let u = API_BASE + '/admin/coupons?page='+page+'&size='+size;
@@ -828,6 +831,9 @@ function buildMainLayout() {
         </button>
         ${isAdmin ? `
         <div class="nav-section">管理</div>
+        <button class="nav-item" data-page="admin-dashboard" onclick="navigate('admin-dashboard')">
+          <span class="nav-icon">📊</span><span>数据概览</span>
+        </button>
         <button class="nav-item" data-page="admin-accounts" onclick="navigate('admin-accounts')">
           <span class="nav-icon">👥</span><span>账户管理</span>
         </button>
@@ -956,6 +962,7 @@ async function renderPage(page) {
       case 'inbox':          await renderInbox(container); break;
       case 'email-view':     await renderEmailView(container); break;
       case 'domains-guide':  await renderDomainsGuide(container); break;
+      case 'admin-dashboard': await renderAdminDashboard(container); break;
       case 'admin-accounts': await renderAdminAccounts(container); break;
       case 'admin-domains':  await renderAdminDomains(container); break;
       case 'admin-settings': await renderAdminSettings(container); break;
@@ -1017,6 +1024,15 @@ async function renderDashboard(container) {
   const annLevel   = (pub.announcement_level || 'info').trim();
   const annTitle   = (pub.announcement_title || '').trim();
   const annHtml    = buildAnnouncementHtml(annContent, annLevel, annTitle);
+
+  // 弹窗检查
+  if (pub.popup_enabled && pub.popup_title) {
+    const popupId = pub.popup_id || 'default';
+    const dismissed = localStorage.getItem('popup_dismissed_' + popupId);
+    if (!dismissed) {
+      showPopupModal(pub.popup_title, pub.popup_content, pub.popup_image_url, pub.popup_link_url, pub.popup_link_text, popupId);
+    }
+  }
 
   container.innerHTML = `
     ${buildIdentityHero()}
@@ -1750,6 +1766,90 @@ function renderAccountBadges(a) {
   return parts.join(' ');
 }
 
+async function renderAdminDashboard(container) {
+  let data = {};
+  try { data = await api.admin.getDashboard(); } catch(e) {
+    container.innerHTML = '<div class="card"><div class="card-body"><p>加载仪表盘失败: ' + escHtml(e.message) + '</p></div></div>';
+    return;
+  }
+  const s = data.stats || {};
+  const users = data.recent_users || [];
+  const revenueYuan = (s.total_revenue_cents / 100).toFixed(2);
+
+  function statCard(icon, label, value, color) {
+    return `<div class="stat-card" style="background:linear-gradient(135deg,${color}15,${color}05);border:1px solid ${color}20;border-radius:12px;padding:1rem;text-align:center">
+      <div style="font-size:1.5rem;margin-bottom:0.3rem">${icon}</div>
+      <div style="font-size:1.6rem;font-weight:700;color:${color}">${value}</div>
+      <div style="font-size:0.78rem;color:var(--text-muted);margin-top:0.2rem">${label}</div>
+    </div>`;
+  }
+
+  container.innerHTML = `
+    <div class="page" style="max-width:900px">
+      <div class="card">
+        <div class="card-header"><div class="card-title">📊 数据概览</div></div>
+        <div class="card-body">
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:0.8rem;margin-bottom:1.5rem">
+            ${statCard('👥','总用户', s.total_accounts, '#6366f1')}
+            ${statCard('📬','总邮箱', s.total_mailboxes, '#06b6d4')}
+            ${statCard('✉️','总邮件', s.total_emails, '#8b5cf6')}
+            ${statCard('💰','总营收', '¥'+revenueYuan, '#f59e0b')}
+            ${statCard('💎','SVIP', s.svip_users, '#ec4899')}
+            ${statCard('⭐','老粉', s.fan_users, '#10b981')}
+          </div>
+
+          <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:1rem;margin-bottom:1.5rem">
+            <div class="card" style="margin:0;border:1px solid var(--border)">
+              <div class="card-body" style="padding:0.8rem">
+                <div style="font-weight:600;margin-bottom:0.5rem">📈 新注册</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;text-align:center">
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#6366f1">${s.today_new_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">今日</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#8b5cf6">${s.week_new_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">7天</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#a78bfa">${s.month_new_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">30天</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="card" style="margin:0;border:1px solid var(--border)">
+              <div class="card-body" style="padding:0.8rem">
+                <div style="font-weight:600;margin-bottom:0.5rem">🟢 活跃用户</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;text-align:center">
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#10b981">${s.today_active_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">今日</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#059669">${s.week_active_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">7天</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#047857">${s.month_active_users}</div><div style="font-size:0.72rem;color:var(--text-muted)">30天</div></div>
+                </div>
+              </div>
+            </div>
+            <div class="card" style="margin:0;border:1px solid var(--border)">
+              <div class="card-body" style="padding:0.8rem">
+                <div style="font-weight:600;margin-bottom:0.5rem">🧾 订单</div>
+                <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:0.5rem;text-align:center">
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#f59e0b">${s.today_orders}</div><div style="font-size:0.72rem;color:var(--text-muted)">今日</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#d97706">${s.total_orders}</div><div style="font-size:0.72rem;color:var(--text-muted)">总发货</div></div>
+                  <div><div style="font-size:1.2rem;font-weight:700;color:#ea580c">${s.pending_orders}</div><div style="font-size:0.72rem;color:var(--text-muted)">待确认</div></div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style="font-weight:600;margin-bottom:0.5rem">🕐 最近注册</div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>用户名</th><th>注册时间</th><th>最后活跃</th><th>身份</th></tr></thead>
+              <tbody>
+                ${users.map(u => `<tr>
+                  <td><strong>${escHtml(u.username)}</strong></td>
+                  <td>${fmtTime(u.created_at)}</td>
+                  <td>${u.last_seen_at ? fmtTime(u.last_seen_at) : '<span style="color:var(--text-muted)">从未</span>'}</td>
+                  <td>${u.svip_level > 0 ? '<span class="svip-badge svip-badge-sm">SVIP</span>' : ''}${u.exclusive_fan_level > 0 ? '<span class="fan-badge fan-badge-sm">老粉</span>' : ''}</td>
+                </tr>`).join('')}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
 async function renderAdminAccounts(container) {
   const page = state.adminAccountsPage || 1;
   const q = state.adminAccountsQ || '';
@@ -1817,6 +1917,8 @@ async function renderAdminAccounts(container) {
                   ${!a.is_admin && a.is_active === false ? `<button class="btn btn-success btn-sm" onclick='toggleBanAccount("${a.id}", ${uJs}, false)'>解除</button>` : ''}
                   ${!a.is_admin ? `<button class="btn ${svip?'btn-primary':'btn-ghost'} btn-sm" onclick='showGrantSVIPModal("${a.id}", ${uJs}, ${a.svip_level||0}, ${JSON.stringify(a.svip_expires_at||'')})'>✦ ${svipLbl}</button>` : ''}
                   ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='showQuotaModal("${a.id}", ${uJs}, ${a.mailbox_quota||0}, ${a.mailbox_ttl_minutes === null || a.mailbox_ttl_minutes === undefined ? 'null' : a.mailbox_ttl_minutes})'>配额</button>` : ''}
+                  ${!a.is_admin && !(a.exclusive_fan_level > 0) ? `<button class="btn btn-ghost btn-sm" onclick='adminGrantFan("${a.id}", ${uJs})' title="赠送老粉认证">⭐ 赠老粉</button>` : ''}
+                  ${!a.is_admin && (a.exclusive_fan_level > 0) ? `<button class="btn btn-ghost btn-sm" onclick='adminRevokeFan("${a.id}", ${uJs})' title="撤销老粉认证" style="color:var(--clr-warn)">⭐ 撤老粉</button>` : ''}
                   ${!a.is_admin ? `<button class="btn btn-ghost btn-sm" onclick='adminRotateAccountKey("${a.id}", ${uJs})' title="重置该账户的 API Key，旧 Key 立即失效">⟳ Key</button>` : ''}
                   ${!a.is_admin ? `<button class="btn btn-danger btn-sm" onclick='confirmDeleteAccount("${a.id}", ${uJs})'>删除</button>` : ''}
                 </td>
@@ -2135,6 +2237,14 @@ async function renderAdminSettings(container) {
   const annTitle   = settings.announcement_title    || '';
   const annLevel   = settings.announcement_level    || 'info';
   const maxMb      = settings.max_mailboxes_per_user|| '5';
+  const emailRetDays = settings.email_retention_days || '30';
+  const popupEnabled = settings.popup_enabled === 'true' || settings.popup_enabled === true;
+  const popupTitle = settings.popup_title || '';
+  const popupContent = settings.popup_content || '';
+  const popupImageURL = settings.popup_image_url || '';
+  const popupLinkURL = settings.popup_link_url || '';
+  const popupLinkText = settings.popup_link_text || '';
+  const popupIdVal = settings.popup_id || '';
   const fanEnabled = settings.exclusive_fan_enabled !== 'false';
   const fanMinOrders = settings.exclusive_fan_min_orders || '3';
   const fanDiscountFold = fanDiscountFoldFromBps(settings.exclusive_fan_discount_bps || 9500);
@@ -2225,6 +2335,38 @@ async function renderAdminSettings(container) {
         ${inputRow('input-max-mailboxes-per-user', '每账户邮箱上限', maxMb, '每个账户同时存在的邮箱数量上限', '5')}
         <div class="divider"></div>
 
+        <!-- 邮件保留天数 -->
+        ${inputRow('input-email-retention-days', '邮件保留天数', emailRetDays, '超过天数的邮件自动清除（0=永不清除），每小时扫描一次', '30')}
+        <div class="divider"></div>
+
+        <!-- 弹窗配置 -->
+        <div class="form-group">
+          <label class="form-label">🎉 弹窗公告</label>
+          <div class="toggle-wrap" style="margin-bottom:0.8rem">
+            <label class="toggle">
+              <input type="checkbox" id="popup-enabled" ${popupEnabled ? 'checked' : ''} onchange="saveSetting(null,'popup_enabled',this.checked?'true':'false')">
+              <span class="toggle-slider"></span>
+            </label>
+            <div>
+              <div class="toggle-label">启用弹窗</div>
+              <span class="toggle-desc">登录后首页弹出精美公告弹窗，可配置图片和跳转链接</span>
+            </div>
+          </div>
+          ${inputRow('input-popup-title', '弹窗标题', popupTitle, '', '如「限时活动」', 'popup_title')}
+          <div class="form-group">
+            <label class="form-label">弹窗内容</label>
+            <div style="display:flex;gap:0.5rem">
+              <textarea class="form-input" id="input-popup-content" rows="3" placeholder="弹窗正文内容" style="flex:1;resize:vertical">${escHtml(popupContent)}</textarea>
+              <button class="btn btn-primary btn-sm" onclick="saveSetting('input-popup-content','popup_content')" style="align-self:flex-start">✓ 保存</button>
+            </div>
+          </div>
+          ${inputRow('input-popup-image-url', '弹窗图片 URL', popupImageURL, '可选，显示在弹窗顶部', 'https://example.com/banner.jpg', 'popup_image_url')}
+          ${inputRow('input-popup-link-url', '跳转链接', popupLinkURL, '可选，弹窗底部显示跳转按钮', 'https://example.com', 'popup_link_url')}
+          ${inputRow('input-popup-link-text', '按钮文字', popupLinkText, '', '了解更多', 'popup_link_text')}
+          ${inputRow('input-popup-id', '弹窗版本 ID', popupIdVal, '修改此 ID 后已关闭的弹窗会重新弹出（每个版本独立记忆关闭状态）', 'v1', 'popup_id')}
+        </div>
+        <div class="divider"></div>
+
         <!-- 专属老粉认证 -->
         <div class="form-group">
           <label class="form-label">💎 专属老粉认证</label>
@@ -2281,9 +2423,14 @@ async function renderAdminSettings(container) {
 }
 
 // 通用保存
-window.saveSetting = async function(inputId, settingKey) {
-  const el2 = document.getElementById(inputId);
-  const val = el2 ? (el2.tagName === 'TEXTAREA' ? el2.value : el2.value.trim()) : '';
+window.saveSetting = async function(inputId, settingKey, directValue) {
+  let val;
+  if (directValue !== undefined) {
+    val = directValue;
+  } else {
+    const el2 = document.getElementById(inputId);
+    val = el2 ? (el2.tagName === 'TEXTAREA' ? el2.value : el2.value.trim()) : '';
+  }
   try {
     await api.admin.saveSettings({ [settingKey]: val });
     // server_ip / hostname 由后台 goroutine 的 DB 优先逻辑热更新，30 秒内对下一轮 MX 巡检生效
@@ -5031,6 +5178,54 @@ async function init() {
   } else {
     showAuthPage();
     applySiteBranding();
+  }
+}
+
+// ─── 精美弹窗 ───────────────────────────────────────────
+function showPopupModal(title, content, imageUrl, linkUrl, linkText, popupId) {
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(6px);animation:fadeIn .3s ease';
+
+  const linkBtn = linkUrl ? `<a href="${escHtml(linkUrl)}" target="_blank" rel="noopener" class="btn btn-primary" style="width:100%;text-align:center;margin-top:0.6rem">${escHtml(linkText || '了解更多')}</a>` : '';
+  const imgBlock = imageUrl ? `<div style="margin:-1rem -1.5rem 1rem;overflow:hidden;border-radius:16px 16px 0 0"><img src="${escHtml(imageUrl)}" style="width:100%;display:block;max-height:240px;object-fit:cover" alt="" /></div>` : '';
+
+  overlay.innerHTML = `
+    <div style="background:var(--card-bg,#fff);border-radius:16px;max-width:420px;width:92%;box-shadow:0 20px 60px rgba(0,0,0,0.3);padding:1.5rem;position:relative;animation:slideUp .4s ease">
+      <button onclick="this.closest('.modal-overlay').remove()" style="position:absolute;top:0.8rem;right:0.8rem;background:none;border:none;font-size:1.2rem;cursor:pointer;color:var(--text-muted);z-index:1">✕</button>
+      ${imgBlock}
+      <h3 style="margin:0 0 0.6rem;font-size:1.2rem;font-weight:700">${escHtml(title)}</h3>
+      ${content ? `<div style="font-size:0.88rem;color:var(--text-secondary);line-height:1.7;margin-bottom:0.6rem">${escHtml(content)}</div>` : ''}
+      ${linkBtn}
+      <div style="margin-top:0.8rem;text-align:center">
+        <button onclick="localStorage.setItem('popup_dismissed_${popupId}',Date.now());this.closest('.modal-overlay').remove()" class="btn btn-ghost btn-sm">今日不再显示</button>
+      </div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+  overlay.addEventListener('click', e => { if (e.target === overlay) overlay.remove(); });
+}
+
+// ─── 管理员赠送老粉（账户管理页面使用） ───────
+async function adminGrantFan(accountId, username) {
+  if (!confirm('确定要赠送老粉认证给 ' + username + '？')) return;
+  try {
+    const res = await api.admin.grantFan(accountId, { level: 1 });
+    toast(res.message || '老粉认证已赠送');
+    navigate('admin-accounts');
+  } catch(e) {
+    toast(e.message || '操作失败', 'error');
+  }
+}
+
+async function adminRevokeFan(accountId, username) {
+  if (!confirm('确定要撤销 ' + username + ' 的老粉认证？')) return;
+  try {
+    const res = await api.admin.grantFan(accountId, { level: 0 });
+    toast(res.message || '老粉认证已撤销');
+    navigate('admin-accounts');
+  } catch(e) {
+    toast(e.message || '操作失败', 'error');
   }
 }
 

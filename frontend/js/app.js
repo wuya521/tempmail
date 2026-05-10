@@ -188,6 +188,23 @@ function fmtTime(s) {
   return formatDate(s);
 }
 
+function normalizePopupText(v) {
+  return String(v || '').trim();
+}
+
+function buildPopupDismissKey(popupId, title, content, imageUrl, linkUrl, linkText) {
+  const explicit = normalizePopupText(popupId);
+  if (explicit) return 'popup_dismissed_' + explicit;
+  const fingerprint = [
+    normalizePopupText(title),
+    normalizePopupText(content),
+    normalizePopupText(imageUrl),
+    normalizePopupText(linkUrl),
+    normalizePopupText(linkText),
+  ].join('|');
+  return 'popup_dismissed_' + fingerprint;
+}
+
 function accountIsSVIP(a = state.account) {
   if (!a || (a.svip_level || 0) <= 0) return false;
   if (a.svip_expires_at && new Date(a.svip_expires_at) < new Date()) return false;
@@ -1031,11 +1048,11 @@ async function renderDashboard(container) {
   const annHtml    = buildAnnouncementHtml(annContent, annLevel, annTitle);
 
   // 弹窗检查
-  if (pub.popup_enabled && pub.popup_title) {
-    const popupId = pub.popup_id || 'default';
-    const dismissed = localStorage.getItem('popup_dismissed_' + popupId);
+  if (pub.popup_enabled && (pub.popup_title || pub.popup_content || pub.popup_image_url)) {
+    const dismissKey = buildPopupDismissKey(pub.popup_id, pub.popup_title, pub.popup_content, pub.popup_image_url, pub.popup_link_url, pub.popup_link_text);
+    const dismissed = localStorage.getItem(dismissKey);
     if (!dismissed) {
-      showPopupModal(pub.popup_title, pub.popup_content, pub.popup_image_url, pub.popup_link_url, pub.popup_link_text, popupId);
+      showPopupModal(pub.popup_title, pub.popup_content, pub.popup_image_url, pub.popup_link_url, pub.popup_link_text, dismissKey);
     }
   }
 
@@ -5187,23 +5204,22 @@ async function init() {
 }
 
 // ─── 精美弹窗 ───────────────────────────────────────────
-function showPopupModal(title, content, imageUrl, linkUrl, linkText, popupId) {
+function showPopupModal(title, content, imageUrl, linkUrl, linkText, dismissKey) {
   const overlay = document.createElement('div');
-  overlay.className = 'modal-overlay';
-  overlay.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5);backdrop-filter:blur(6px);animation:fadeIn .3s ease';
+  overlay.className = 'modal-overlay popup-overlay';
 
   const linkBtn = linkUrl ? `<a href="${escHtml(linkUrl)}" target="_blank" rel="noopener" class="btn btn-primary" style="width:100%;text-align:center;margin-top:0.6rem">${escHtml(linkText || '了解更多')}</a>` : '';
-  const imgBlock = imageUrl ? `<div style="margin:-1rem -1.5rem 1rem;overflow:hidden;border-radius:16px 16px 0 0"><img src="${escHtml(imageUrl)}" style="width:100%;display:block;max-height:240px;object-fit:cover" alt="" /></div>` : '';
+  const imgBlock = imageUrl ? `<div class="popup-media"><img src="${escHtml(imageUrl)}" alt="" /></div>` : '';
 
   overlay.innerHTML = `
-    <div style="background:var(--card-bg,#fff);border-radius:16px;max-width:420px;width:92%;box-shadow:0 20px 60px rgba(0,0,0,0.3);padding:1.5rem;position:relative;animation:slideUp .4s ease">
-      <button onclick="this.closest('.modal-overlay').remove()" style="position:absolute;top:0.8rem;right:0.8rem;background:none;border:none;font-size:1.2rem;cursor:pointer;color:var(--text-muted);z-index:1">✕</button>
+    <div class="popup-modal">
+      <button onclick="this.closest('.modal-overlay').remove()" class="popup-close">✕</button>
       ${imgBlock}
-      <h3 style="margin:0 0 0.6rem;font-size:1.2rem;font-weight:700">${escHtml(title)}</h3>
-      ${content ? `<div style="font-size:0.88rem;color:var(--text-secondary);line-height:1.7;margin-bottom:0.6rem">${escHtml(content)}</div>` : ''}
+      ${title ? `<h3 class="popup-title">${escHtml(title)}</h3>` : ''}
+      ${content ? `<div class="popup-content">${escHtml(content)}</div>` : ''}
       ${linkBtn}
-      <div style="margin-top:0.8rem;text-align:center">
-        <button onclick="localStorage.setItem('popup_dismissed_${popupId}',Date.now());this.closest('.modal-overlay').remove()" class="btn btn-ghost btn-sm">今日不再显示</button>
+      <div class="popup-actions">
+        <button onclick="localStorage.setItem('${escHtml(dismissKey)}',Date.now());this.closest('.modal-overlay').remove()" class="btn btn-ghost btn-sm">今日不再显示</button>
       </div>
     </div>`;
 

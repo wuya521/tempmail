@@ -183,6 +183,11 @@ function formatDate(s) {
   return d.toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
 }
 
+// 兼容旧调用：数据概览仍在使用 fmtTime
+function fmtTime(s) {
+  return formatDate(s);
+}
+
 function accountIsSVIP(a = state.account) {
   if (!a || (a.svip_level || 0) <= 0) return false;
   if (a.svip_expires_at && new Date(a.svip_expires_at) < new Date()) return false;
